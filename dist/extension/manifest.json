@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Bilibili 桌面网页抗卡",
+  "version": "1.0.0",
+  "description": "直播连续缓冲与视频 720P/2× 缓冲增强",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://api.live.bilibili.com/*",
+    "https://*.bilivideo.com/*"
+  ],
+  "action": {
+    "default_title": "Bilibili 抗卡设置",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://live.bilibili.com/*",
+        "https://www.bilibili.com/video/*"
+      ],
+      "js": [
+        "main-bridge.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://live.bilibili.com/*",
+        "https://www.bilibili.com/video/*"
+      ],
+      "js": [
+        "controller.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "ISOLATED"
+    }
+  ]
+}

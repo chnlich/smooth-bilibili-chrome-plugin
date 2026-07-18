@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bilibili 抗卡</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>Bilibili 抗卡</h1>
+      <label class="switch-row">
+        <span>直播增强</span>
+        <input type="checkbox" data-preference="liveEnabled">
+      </label>
+      <label class="switch-row">
+        <span>视频增强</span>
+        <input type="checkbox" data-preference="vodEnabled">
+      </label>
+      <p class="hint">开关在下次刷新页面后生效。当前页面请使用面板里的“停用”。</p>
+      <p class="status" data-status role="status"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

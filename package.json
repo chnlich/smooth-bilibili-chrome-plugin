@@ -1,0 +1,25 @@
+{
+  "name": "smooth-bilibili-chrome-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bilibili dual-mode Manifest V3 buffering controller",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test:unit": "node --test test/unit.test.mjs test/extension-unit.test.mjs",
+    "test:contract": "node test/build-contract.mjs",
+    "test:e2e": "node scripts/browser-e2e.mjs",
+    "smoke:external": "node scripts/smoke-external.mjs",
+    "test": "npm run build && npm run test:unit && npm run test:contract && npm run test:e2e"
+  },
+  "dependencies": {
+    "hls.js": "1.5.17"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9",
+    "playwright": "1.55.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
