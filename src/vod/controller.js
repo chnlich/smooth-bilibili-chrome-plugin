@@ -133,9 +133,10 @@ export class VodController {
     this.userPaused = false;
     this.scriptPaused = false;
     this.scriptPauseEvent = false;
-    this.scriptPauseEpoch;
+    this.pendingScriptPause;
     this.userPauseGuard = false;
     this.pendingPlayGuards = [];
+    this.retiredPlayGuards = [];
     this.startupComplete = false;
     this.stableBufferSupported = true;
     this.pausedSchedulingSupported = true;
@@ -160,7 +161,6 @@ export class VodController {
     this.seekPlaybackOwner = 'none';
     this.seekResumePending = false;
     this.seekTargetTime;
-    this.seekPauseSuppressed = false;
     this.playbackAttemptToken = 0;
     this.lastKnownPlaying = this.video.paused !== true;
   }
@@ -192,10 +192,9 @@ export class VodController {
       this.setPlaybackRate();
     };
     const onPause = () => {
-      const scriptPauseEpoch = this.scriptPauseEpoch;
-      this.scriptPauseEpoch = undefined;
-      this.scriptPauseEvent = false;
-      if (scriptPauseEpoch === this.seekEpoch) {
+      if (this.pendingScriptPause !== undefined) {
+        this.pendingScriptPause = undefined;
+        this.scriptPauseEvent = false;
         this.lastKnownPlaying = false;
         return;
       }
@@ -204,40 +203,42 @@ export class VodController {
         this.lastKnownPlaying = false;
         return;
       }
-      if (this.seekPauseSuppressed) {
-        this.lastKnownPlaying = false;
-        return;
-      }
       this.lastKnownPlaying = false;
       this.scriptPaused = false;
       this.userPaused = true;
       this.seekResumePending = false;
       this.playbackAttemptToken += 1;
+      this.invalidatePendingPlayGuards();
     };
     const onPlay = () => {
       this.lastKnownPlaying = true;
-      const guard = this.pendingPlayGuards.shift();
-      if (guard !== undefined) {
-        guard.playEventSeen = true;
-        if (guard.epoch !== this.seekEpoch || guard.token !== this.playbackAttemptToken) {
-          if (this.userPaused) {
-            this.enforceUserPause();
-          }
-          this.finalizePlayGuard(guard);
-          return;
-        }
-        this.finalizePlayGuard(guard);
-        return;
-      }
       if (!this.enabled) {
+        this.pendingScriptPause = undefined;
+        this.scriptPauseEvent = false;
         this.scriptPaused = false;
         this.userPaused = false;
         return;
       }
+      const guard = this.currentPlayGuard();
+      if (guard !== undefined) {
+        guard.playEventSeen = true;
+        this.finalizePlayGuard(guard);
+        return;
+      }
+      const retiredGuard = this.consumeRetiredPlayGuard();
+      if (retiredGuard !== undefined) {
+        if (this.userPaused) {
+          this.enforceUserPause();
+        }
+        return;
+      }
+      this.invalidatePendingPlayGuards();
       this.playbackAttemptToken += 1;
       this.seekResumePending = false;
       this.userPaused = false;
       this.scriptPaused = false;
+      this.pendingScriptPause = undefined;
+      this.scriptPauseEvent = false;
     };
     const onSeeking = () => this.handleSeeking();
     const onSeeked = () => this.handleSeeked();
@@ -245,8 +246,9 @@ export class VodController {
       this.ended = true;
       this.seekEpoch += 1;
       this.playbackAttemptToken += 1;
-      this.pendingPlayGuards = [];
-      this.scriptPauseEpoch = undefined;
+      this.invalidatePendingPlayGuards();
+      this.retiredPlayGuards = [];
+      this.pendingScriptPause = undefined;
       this.scriptPauseEvent = false;
       this.scriptPaused = false;
       this.seekActive = false;
@@ -257,7 +259,6 @@ export class VodController {
       this.seekPlaybackOwner = 'none';
       this.seekResumePending = false;
       this.seekTargetTime = undefined;
-      this.seekPauseSuppressed = false;
       this.lastKnownPlaying = false;
       this.updateStatus();
     };
@@ -326,7 +327,7 @@ export class VodController {
       return;
     }
     this.scriptPaused = true;
-    this.scriptPauseEpoch = this.seekEpoch;
+    this.pendingScriptPause = { epoch: this.seekEpoch };
     this.scriptPauseEvent = true;
     this.lastKnownPlaying = false;
     this.video.pause();
@@ -407,10 +408,8 @@ export class VodController {
           : 'paused';
     this.seekEpoch += 1;
     this.playbackAttemptToken += 1;
-    this.scriptPauseEpoch = undefined;
-    this.scriptPauseEvent = false;
+    this.invalidatePendingPlayGuards();
     this.userPauseGuard = false;
-    this.seekPauseSuppressed = true;
     this.seekActive = true;
     this.seekTargetTime = this.video.currentTime;
     this.seekClassification = this.remainingDuration() <= this.config.startupBufferSeconds ? 'short' : 'long';
@@ -442,14 +441,12 @@ export class VodController {
       this.currentCore.stale === true ||
       currentMediaSource(this.video) !== this.currentSrc
     ) {
-      this.seekPauseSuppressed = false;
       if (this.started) {
         void this.reconcile();
       }
       return;
     }
     const epoch = this.seekEpoch;
-    this.seekPauseSuppressed = false;
     const inventory = this.readInventory(this.currentCore);
     if (epoch !== this.seekEpoch || this.destroyed || !this.enabled) {
       return;
@@ -475,8 +472,7 @@ export class VodController {
   invalidateSeekCallbacksForRebuild() {
     this.seekEpoch += 1;
     this.playbackAttemptToken += 1;
-    this.scriptPauseEpoch = undefined;
-    this.scriptPauseEvent = false;
+    this.invalidatePendingPlayGuards();
     this.userPauseGuard = false;
   }
 
@@ -489,7 +485,6 @@ export class VodController {
     this.seekPlaybackOwner = 'none';
     this.seekResumePending = false;
     this.seekTargetTime = undefined;
-    this.seekPauseSuppressed = false;
   }
 
   async reconcile() {
@@ -654,9 +649,49 @@ export class VodController {
     }
   }
 
+  invalidatePendingPlayGuards() {
+    for (const guard of this.pendingPlayGuards) {
+      guard.invalidated = true;
+      this.retirePlayGuard(guard);
+    }
+    this.pendingPlayGuards = [];
+  }
+
+  currentPlayGuard(epoch = this.seekEpoch) {
+    return this.pendingPlayGuards.find(
+      (guard) => !guard.invalidated && guard.epoch === epoch && guard.token === this.playbackAttemptToken,
+    );
+  }
+
+  retirePlayGuard(guard) {
+    if (guard.playEventSeen || guard.retired) {
+      return;
+    }
+    guard.retired = true;
+    this.retiredPlayGuards.push(guard);
+  }
+
+  removeRetiredPlayGuard(guard) {
+    const index = this.retiredPlayGuards.indexOf(guard);
+    if (index >= 0) {
+      this.retiredPlayGuards.splice(index, 1);
+    }
+  }
+
+  consumeRetiredPlayGuard() {
+    const guard = this.retiredPlayGuards.find((candidate) => !candidate.playEventSeen);
+    if (guard === undefined) {
+      return undefined;
+    }
+    guard.playEventSeen = true;
+    this.removeRetiredPlayGuard(guard);
+    return guard;
+  }
+
   finalizePlayGuard(guard) {
     if (guard.promiseSettled && guard.playEventSeen) {
       this.removePendingPlayGuard(guard);
+      this.removeRetiredPlayGuard(guard);
     }
   }
 
@@ -671,7 +706,7 @@ export class VodController {
     ) {
       return;
     }
-    if (this.pendingPlayGuards.length > 0) {
+    if (this.currentPlayGuard(epoch) !== undefined) {
       return;
     }
     const token = this.playbackAttemptToken + 1;
@@ -682,6 +717,8 @@ export class VodController {
       releasesScriptPause: this.scriptPaused,
       promiseSettled: false,
       playEventSeen: false,
+      invalidated: false,
+      retired: false,
     };
     this.pendingPlayGuards.push(guard);
     let playPromise;
@@ -698,9 +735,11 @@ export class VodController {
           !this.enabled ||
           this.userPaused ||
           this.ended ||
+          guard.invalidated ||
           epoch !== this.seekEpoch ||
           token !== this.playbackAttemptToken
         ) {
+          this.retirePlayGuard(guard);
           if (this.userPaused) {
             this.enforceUserPause();
           }
@@ -716,11 +755,13 @@ export class VodController {
       })
       .catch((error) => {
         this.removePendingPlayGuard(guard);
+        this.removeRetiredPlayGuard(guard);
         if (
           this.destroyed ||
           !this.enabled ||
           this.userPaused ||
           this.ended ||
+          guard.invalidated ||
           epoch !== this.seekEpoch ||
           token !== this.playbackAttemptToken
         ) {

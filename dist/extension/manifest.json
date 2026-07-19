@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Bilibili 桌面网页抗卡",
   "version": "1.0.0",
-  "description": "直播连续缓冲与视频 720P/2× 缓冲增强",
+  "description": "直播连续缓冲与视频 2× 缓冲增强",
   "minimum_chrome_version": "120",
   "permissions": [
     "storage"

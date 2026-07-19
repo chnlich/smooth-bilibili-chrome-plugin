@@ -2537,17 +2537,31 @@ async function runVodQualityReadScenario(context, qualityMode) {
       assert.equal(initial.pageQ, expectedQn);
     }
     const manualQuality = qualityMode === 'unknown' ? 16 : qualityMode === 'qn16' ? 64 : 16;
-    await fixture.page.evaluate((value) => window.__fakeVodPolicy.setManualQuality(value), manualQuality);
+    await fixture.page.evaluate((value) => {
+      window.__fakeVodPolicy.setManualQuality(value);
+      window.__fakeVodPolicy.replaceCore(`vod-policy-source-quality-${value}`);
+      window.__fakeVodPolicy.beginSeek(180);
+      window.__fakeVodPolicy.browserPauseForSeek();
+      window.__fakeVodPolicy.finishSeek(180);
+    }, manualQuality);
     await fixture.popup.waitForFunction(
       (value) => document.querySelector('[data-status-field="quality"]')?.textContent.includes(`qn${value}`),
       manualQuality,
       { timeout: 10000 },
     );
+    await fixture.page.waitForFunction(
+      () => document.documentElement.dataset.bilibiliBufferVodPaused === 'false',
+      undefined,
+      { timeout: 10000 },
+    );
     const result = await readVodPolicyFixture(fixture.page);
     assert.equal(result.panel.speed, '2×');
+    assert.equal(result.panel.state, 'VOD_READY');
     assert.match(result.panel.quality, new RegExp(`qn${manualQuality}`));
     assert.deepEqual(result.qualityWrites, [], 'manual page quality changes must remain read-only to the extension');
     assert.equal(result.playbackRate, 2);
+    assert.equal(result.currentTime, 180);
+    assert.equal(result.paused, false, 'manual quality rebuild and seek must preserve playing ownership');
     const diagnostics = {
       page: assertDiagnostics(fixture.diagnostics),
       popup: assertDiagnostics(fixture.popupDiagnostics),

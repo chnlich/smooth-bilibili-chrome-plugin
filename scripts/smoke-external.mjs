@@ -363,10 +363,11 @@ function evaluateSnapshot(snapshot, mode) {
       reason: 'media was not synchronously muted with zero volume',
     };
   }
-  if (mode === '点播' && !/qn64 已生效/.test(status.quality || '')) {
+  const qualityStatus = (status.quality || '').trim();
+  if (mode === '点播' && !/^(?:qn\d+|当前画质未知)/.test(qualityStatus)) {
     return {
-      status: 'BLOCKED',
-      reason: 'anonymous VOD page did not confirm qn64',
+      status: 'FAIL',
+      reason: `VOD readonly quality diagnostic was invalid: ${qualityStatus || 'missing'}`,
     };
   }
   if (mode === '直播') {

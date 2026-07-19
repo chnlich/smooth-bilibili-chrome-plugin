@@ -307,6 +307,7 @@ function createVodRuntimeFixture({
   videoInventory = 200,
   audioInventory = 200,
   deferredPlay = false,
+  deferredPause = false,
   scheduleSupported = true,
 } = {}) {
   const listeners = new Map();
@@ -315,6 +316,7 @@ function createVodRuntimeFixture({
     videoInventory,
     audioInventory,
     pendingPlays: [],
+    pendingPauses: [],
     core: undefined,
   };
   const emit = (name) => {
@@ -352,7 +354,11 @@ function createVodRuntimeFixture({
     pause() {
       this.pauseCalls += 1;
       this.paused = true;
-      emit('pause');
+      if (deferredPause) {
+        state.pendingPauses.push(() => emit('pause'));
+      } else {
+        emit('pause');
+      }
     },
     play() {
       this.playCalls += 1;
@@ -409,6 +415,9 @@ function createVodRuntimeFixture({
     video.currentTime = targetTime;
     video.dispatchEvent({ type: 'seeking' });
   };
+  state.browserPauseForSeek = () => {
+    video.paused = true;
+  };
   state.seeked = () => video.dispatchEvent({ type: 'seeked' });
   state.resolvePlay = ({ emitPlay = true } = {}) => {
     const pending = state.pendingPlays.shift();
@@ -423,6 +432,11 @@ function createVodRuntimeFixture({
     const pending = state.pendingPlays.shift();
     assert.ok(pending !== undefined, 'no pending VOD play promise');
     pending.reject(new Error('deterministic VOD play rejection'));
+  };
+  state.resolvePause = () => {
+    const pending = state.pendingPauses.shift();
+    assert.ok(pending !== undefined, 'no pending VOD pause event');
+    pending();
   };
   return { controller, video, core, state, models };
 }
@@ -2774,6 +2788,101 @@ test('VOD user pause wins when a play promise settles before its late play event
   controller.destroy();
 });
 
+test('VOD permits manual play after consuming a stale play event', async () => {
+  const { controller, video, state } = createVodRuntimeFixture({ deferredPlay: true });
+  video.paused = true;
+  await controller.reconcile();
+  state.resolvePlay({ emitPlay: false });
+  await Promise.resolve();
+  video.pause();
+  assert.equal(controller.userPaused, true);
+
+  video.paused = false;
+  video.dispatchEvent({ type: 'play' });
+  assert.equal(controller.userPaused, true);
+  assert.equal(video.paused, true);
+
+  video.paused = false;
+  video.dispatchEvent({ type: 'play' });
+  assert.equal(controller.userPaused, false);
+  assert.equal(video.paused, false);
+  controller.destroy();
+});
+
+test('VOD retries the current seek epoch when an old play promise never settles', async () => {
+  const { controller, video, state } = createVodRuntimeFixture({ deferredPlay: true });
+  video.paused = true;
+  await controller.reconcile();
+  assert.equal(video.playCalls, 1);
+  assert.equal(state.pendingPlays.length, 1);
+
+  state.seek(300);
+  state.browserPauseForSeek();
+  state.seeked();
+
+  assert.equal(video.playCalls, 2, 'the old unresolved play guard must not block the current seek epoch');
+  assert.equal(state.pendingPlays.length, 2);
+  controller.destroy();
+});
+
+test('VOD records a genuine user pause during seek as user-owned', async () => {
+  const { controller, video, state } = createVodRuntimeFixture();
+  state.seek(300);
+  video.pause();
+  state.seeked();
+  await Promise.resolve();
+
+  assert.equal(controller.userPaused, true);
+  assert.equal(controller.seekPlaybackOwner, 'playing');
+  assert.equal(video.paused, true);
+  assert.equal(video.playCalls, 0);
+  controller.destroy();
+});
+
+test('VOD treats an unguarded play after a user pause as manual intent', () => {
+  const { controller, video } = createVodRuntimeFixture();
+  video.pause();
+  assert.equal(controller.userPaused, true);
+
+  video.play();
+
+  assert.equal(controller.userPaused, false);
+  assert.equal(controller.scriptPaused, false);
+  assert.equal(video.paused, false);
+  controller.destroy();
+});
+
+test('VOD retains a delayed script pause through a seek-time core rebuild until it resumes at refill', async () => {
+  const { controller, video, state } = createVodRuntimeFixture({
+    videoInventory: 29,
+    audioInventory: 29,
+    deferredPause: true,
+  });
+  controller.startupComplete = true;
+  controller.enforceStartupAndRefill(state.core);
+  assert.equal(controller.scriptPaused, true);
+  assert.equal(controller.scriptPauseEvent, true);
+  assert.equal(video.paused, true);
+
+  state.setInventory(0, 0);
+  state.seek(200);
+  state.core = { ...state.core };
+  video.currentSrc = 'vod-source-2';
+  await controller.reconcile();
+  state.setInventory(120, 120);
+  state.seeked();
+  await Promise.resolve();
+  assert.equal(video.playCalls, 1);
+  assert.equal(controller.scriptPaused, false);
+
+  state.resolvePause();
+  assert.equal(controller.userPaused, false);
+  assert.equal(controller.scriptPaused, false);
+  assert.equal(controller.scriptPauseEvent, false);
+  assert.equal(video.paused, false);
+  controller.destroy();
+});
+
 test('VOD preserves script pause ownership through a seek-time core/source rebuild', async () => {
   const { controller, video, state } = createVodRuntimeFixture({ videoInventory: 29, audioInventory: 29 });
   controller.startupComplete = true;
@@ -2781,13 +2890,7 @@ test('VOD preserves script pause ownership through a seek-time core/source rebui
   assert.equal(controller.scriptPaused, true);
   state.setInventory(0, 0);
   state.seek(200);
-  const replacementCore = {
-    ...state.core,
-    getBufferedRanges: () => ({
-      video: { length: 0, start() { throw new Error('no range'); }, end() { throw new Error('no range'); } },
-      audio: { length: 0, start() { throw new Error('no range'); }, end() { throw new Error('no range'); } },
-    }),
-  };
+  const replacementCore = { ...state.core };
   state.core = replacementCore;
   video.currentSrc = 'vod-source-2';
   await controller.reconcile();

@@ -12,6 +12,7 @@ const manifest = JSON.parse(await fs.readFile(path.join(extensionDirectory, 'man
 const bridge = await fs.readFile(path.join(extensionDirectory, 'main-bridge.js'), 'utf8');
 const controller = await fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8');
 const popup = await fs.readFile(path.join(extensionDirectory, 'popup.js'), 'utf8');
+const externalSmoke = await fs.readFile(path.join(root, 'scripts', 'smoke-external.mjs'), 'utf8');
 const productSource = await readTree(path.join(root, 'src'));
 const productOutput = `${bridge}\n${controller}\n${popup}`;
 
@@ -55,6 +56,8 @@ assert.deepEqual(manifest.content_scripts, [
 assert.equal(manifest.background, undefined);
 assert.equal(manifest.options_page, undefined);
 assert.equal(manifest.action.default_popup, 'popup.html');
+assert.doesNotMatch(manifest.description, /720P/);
+assert.doesNotMatch(externalSmoke, /qn64 已生效/);
 assert.deepEqual(
   (await fs.readdir(extensionDirectory)).sort(),
   ['controller.js', 'main-bridge.js', 'manifest.json', 'popup.css', 'popup.html', 'popup.js'],
