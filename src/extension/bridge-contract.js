@@ -17,7 +17,10 @@ export const BRIDGE_PLAYER_METHODS = Object.freeze([
   'setAutoSyncProgressCfg',
   'setAutoDiscardFrameCfg',
   'pause',
+  'requestQuality',
 ]);
+
+export const BRIDGE_PLAYER_CAPABILITIES = Object.freeze([...BRIDGE_PLAYER_METHODS]);
 
 export const BRIDGE_CORE_SYNC_METHODS = Object.freeze([
   'getQuality',

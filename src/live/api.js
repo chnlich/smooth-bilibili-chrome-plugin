@@ -49,7 +49,7 @@ async function requestPlayInfo(url, fetchImpl, signal, timeoutMilliseconds) {
   const timeout = setTimeout(() => {
     timedOut = true;
     requestController.abort();
-    timeoutReject(new BufferScriptError('REQUEST_TIMEOUT', `播放 API 请求超时: ${url}`));
+    timeoutReject(new BufferScriptError('REQUEST_TIMEOUT', `播放 API 请求超时: ${new URL(url).host}`));
   }, timeoutMilliseconds);
   try {
     const response = await Promise.race([
@@ -73,7 +73,7 @@ async function requestPlayInfo(url, fetchImpl, signal, timeoutMilliseconds) {
       throw abortError();
     }
     if (timedOut) {
-      throw new BufferScriptError('PLAY_INFO_TEMPORARY_ERROR', `播放 API 请求超时: ${url}`, error);
+      throw new BufferScriptError('PLAY_INFO_TEMPORARY_ERROR', `播放 API 请求超时: ${new URL(url).host}`, error);
     }
     throw error;
   } finally {
@@ -116,6 +116,11 @@ export async function fetchRoomPlayInfo(
       ) {
         throw error;
       }
+      options.onRetry?.({
+        kind: 'play-info',
+        attempt: attempt + 1,
+        hosts: ['api.live.bilibili.com'],
+      });
       await sleep(backoffMilliseconds[Math.min(attempt, backoffMilliseconds.length - 1)], options.signal);
       attempt += 1;
     }
@@ -142,9 +147,28 @@ export function extractLiveTrack(payload, requestedQualityNumber = 10000, prefer
     fail('LIVE_FMP4_MISSING', '播放 API 没有 fMP4 流');
   }
   const codecs = formats.flatMap((format) => format.codec || []);
-  const preferred = codecs.find((codec) => codec.codec_name === preferredCodec);
-  const codec = preferred || codecs.find((candidate) => candidate.codec_name === 'avc');
+  const hasTrackCodecs = (codec) =>
+    typeof codec.video_codecs?.base === 'string' &&
+    codec.video_codecs.base.trim().length > 0 &&
+    typeof codec.audio_codecs?.base === 'string' &&
+    codec.audio_codecs.base.trim().length > 0;
+  const preferred = codecs.find((codec) => codec.codec_name === preferredCodec && hasTrackCodecs(codec));
+  const codec = preferred || codecs.find((candidate) => candidate.codec_name === 'avc' && hasTrackCodecs(candidate));
   if (codec === undefined) {
+    const preferredWithoutAudio = codecs.find((candidate) => candidate.codec_name === preferredCodec);
+    if (
+      preferredWithoutAudio !== undefined &&
+      (typeof preferredWithoutAudio.audio_codecs?.base !== 'string' || preferredWithoutAudio.audio_codecs.base.trim() === '')
+    ) {
+      fail('LIVE_AUDIO_CODEC_MISSING', '播放 API 没有返回直播音频 codec');
+    }
+    const preferredWithoutVideo = codecs.find((candidate) => candidate.codec_name === preferredCodec);
+    if (
+      preferredWithoutVideo !== undefined &&
+      (typeof preferredWithoutVideo.video_codecs?.base !== 'string' || preferredWithoutVideo.video_codecs.base.trim() === '')
+    ) {
+      fail('LIVE_VIDEO_CODEC_MISSING', '播放 API 没有返回直播视频 codec');
+    }
     fail('LIVE_CODEC_MISSING', `播放 API 没有可用 codec: ${preferredCodec}`);
   }
   const qualityNumber = Number(codec.current_qn);
@@ -154,13 +178,24 @@ export function extractLiveTrack(payload, requestedQualityNumber = 10000, prefer
   const baseUrl = requireValue(codec.base_url, 'PLAYBACK_BASE_URL_MISSING', '播放轨道缺少 base_url');
   const urlInfo = requireValue(codec.url_info, 'PLAYBACK_CDN_MISSING', '播放轨道缺少 url_info');
   const candidates = buildCdnCandidates({ baseUrl, urlInfo });
+  const qualityDescription = [
+    codec.description,
+    codec.desc,
+    codec.display_name,
+    codec.quality_name,
+    codec.qn_desc,
+    codec.name,
+  ].find((value) => typeof value === 'string' && value.trim().length > 0);
   return {
     roomId,
     requestedQualityNumber,
     qualityNumber,
+    qualityDescription,
     formatName: 'fmp4',
     codecName: codec.codec_name,
-    codecString: [codec.video_codecs?.base, codec.audio_codecs?.base].filter(Boolean).join(', '),
+    videoCodecString: codec.video_codecs.base,
+    audioCodecString: codec.audio_codecs.base,
+    codecString: `${codec.video_codecs.base}, ${codec.audio_codecs.base}`,
     session: requireValue(codec.session, 'LIVE_SESSION_MISSING', '播放轨道缺少 stream session'),
     baseUrl,
     urlInfo,

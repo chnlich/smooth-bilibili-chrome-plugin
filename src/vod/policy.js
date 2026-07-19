@@ -1,6 +1,30 @@
 import { VOD_CONFIG } from '../constants.js';
 import { fail, requireValue } from '../errors.js';
 
+export function coreSupports(core, method) {
+  requireValue(core, 'VOD_CORE_MISSING', '点播内核为空');
+  if (typeof core.supports === 'function') {
+    return core.supports(method) === true;
+  }
+  if (core.capabilities?.core !== undefined && Object.prototype.hasOwnProperty.call(core.capabilities.core, method)) {
+    return core.capabilities.core[method] === true;
+  }
+  return typeof core[method] === 'function';
+}
+
+function playerSupports(player, method) {
+  if (player === undefined || player === null) {
+    return false;
+  }
+  if (typeof player.supports === 'function') {
+    return player.supports(method) === true;
+  }
+  if (player.capabilities !== undefined && Object.prototype.hasOwnProperty.call(player.capabilities, method)) {
+    return player.capabilities[method] === true;
+  }
+  return typeof player[method] === 'function';
+}
+
 export class VodBufferPolicy {
   constructor(config = VOD_CONFIG) {
     this.config = config;
@@ -11,20 +35,46 @@ export class VodBufferPolicy {
 
   apply(core) {
     requireValue(core, 'VOD_CORE_MISSING', '点播内核为空');
-    const previous = this.applied.get(core);
-    if (previous === this.targetSeconds) {
-      return { changed: false, targetSeconds: this.targetSeconds };
+    const previous = this.applied.get(core) || {};
+    const result = {
+      changed: false,
+      targetSeconds: this.targetSeconds,
+      stableBufferSupported: coreSupports(core, 'setStableBufferTime'),
+      pausedSchedulingSupported: coreSupports(core, 'setScheduleWhilePaused'),
+      warnings: [],
+    };
+    if (!result.stableBufferSupported) {
+      result.warnings.push('当前内核不支持稳定缓冲设置，保持 Bilibili 默认值');
+    } else if (previous.stableBufferTime !== this.targetSeconds) {
+      try {
+        core.setStableBufferTime(this.targetSeconds);
+        previous.stableBufferTime = this.targetSeconds;
+        result.changed = true;
+      } catch (error) {
+        if (!['BRIDGE_METHOD_UNAVAILABLE', 'VOD_STABLE_BUFFER_UNAVAILABLE'].includes(error?.code)) {
+          throw error;
+        }
+        result.stableBufferSupported = false;
+        result.warnings.push('当前内核不支持稳定缓冲设置，保持 Bilibili 默认值');
+      }
     }
-    if (typeof core.setStableBufferTime !== 'function') {
-      fail('VOD_STABLE_BUFFER_UNAVAILABLE', '点播内核没有 setStableBufferTime');
+    if (!result.pausedSchedulingSupported) {
+      result.warnings.push('当前内核不支持暂停时继续下载，低库存时保持播放');
+    } else if (previous.scheduleWhilePaused !== true) {
+      try {
+        core.setScheduleWhilePaused(true);
+        previous.scheduleWhilePaused = true;
+        result.changed = true;
+      } catch (error) {
+        if (!['BRIDGE_METHOD_UNAVAILABLE', 'VOD_PAUSED_SCHEDULE_UNAVAILABLE'].includes(error?.code)) {
+          throw error;
+        }
+        result.pausedSchedulingSupported = false;
+        result.warnings.push('当前内核不支持暂停时继续下载，低库存时保持播放');
+      }
     }
-    if (typeof core.setScheduleWhilePaused !== 'function') {
-      fail('VOD_PAUSED_SCHEDULE_UNAVAILABLE', '点播内核没有 setScheduleWhilePaused');
-    }
-    core.setStableBufferTime(this.targetSeconds);
-    core.setScheduleWhilePaused(true);
-    this.applied.set(core, this.targetSeconds);
-    return { changed: true, targetSeconds: this.targetSeconds };
+    this.applied.set(core, previous);
+    return result;
   }
 
   handleQuota(core) {
@@ -45,15 +95,25 @@ export class VodBufferPolicy {
   }
 }
 
-export async function callQualityMethod(_player, core, qualityNumber) {
-  if (typeof core.requestQuality !== 'function') {
-    fail('VOD_QUALITY_UNAVAILABLE', `当前播放器内核没有权限感知的 qn${qualityNumber} 请求接口`);
+export async function callQualityMethod(player, core, qualityNumber) {
+  if (!Number.isInteger(qualityNumber) || qualityNumber <= 0) {
+    fail('VOD_QUALITY_ARGUMENT_INVALID', `qn${qualityNumber} 不是正整数清晰度`);
   }
-  const result = await core.requestQuality(qualityNumber);
+  let method;
+  if (coreSupports(core, 'requestQuality')) {
+    method = 'core.requestQuality';
+  } else if (playerSupports(player, 'requestQuality')) {
+    method = 'player.requestQuality';
+  } else {
+    fail('VOD_QUALITY_UNAVAILABLE', `当前播放器没有权限感知的 qn${qualityNumber} 请求接口`);
+  }
+  const result = method === 'core.requestQuality'
+    ? await core.requestQuality(qualityNumber)
+    : await player.requestQuality(qualityNumber);
   if (result === false) {
     fail('VOD_QUALITY_REJECTED', `服务端或播放器拒绝 qn${qualityNumber}`);
   }
-  return { method: 'requestQuality', qualityNumber };
+  return { method, qualityNumber };
 }
 
 function qualityNumberFromValue(value) {
@@ -105,7 +165,7 @@ export function readQualitySnapshot(core) {
   let value;
   let getter;
   for (const name of ['getQuality', 'getCurrentQuality', 'getCurrentQn']) {
-    if (typeof core[name] === 'function') {
+    if (coreSupports(core, name)) {
       getter = name;
       value = core[name]();
       break;
@@ -133,10 +193,10 @@ export function readQualitySnapshot(core) {
       }
     }
   }
-  if (typeof core.getSupportedQualityList === 'function') {
+  if (coreSupports(core, 'getSupportedQualityList')) {
     collectQualityNumbers(core.getSupportedQualityList(), availableQns);
   }
-  if (typeof core.getQualityList === 'function') {
+  if (coreSupports(core, 'getQualityList')) {
     collectQualityNumbers(core.getQualityList('video'), availableQns);
   }
   return {
@@ -150,7 +210,7 @@ export function readQualitySnapshot(core) {
 export function readMediaBitrate(core) {
   const getters = ['getMediaInfo', 'getCurrentMediaInfo', 'getQualityInfo'];
   for (const getter of getters) {
-    if (typeof core[getter] !== 'function') {
+    if (!coreSupports(core, getter)) {
       continue;
     }
     const info = core[getter]();

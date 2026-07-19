@@ -1,8 +1,8 @@
 # Bilibili 桌面网页抗卡
 
-这是一个双模式 Manifest V3 Chrome 扩展：直播页使用连续的 HLS/fMP4 缓冲管线，视频页使用 Bilibili 当前播放器内核的公开/观察到的 `requestQuality(64)`、2× 播放和连续前向缓冲策略。直播与点播是互斥入口，同一个标签页不会同时运行两个控制器。
+这是一个双模式 Manifest V3 Chrome 扩展：直播页使用连续的 HLS/fMP4 缓冲管线，点播页使用 Bilibili 当前播放器内核的公开/观察到的 `requestQuality(64)`、2× 播放和连续前向缓冲策略。直播与点播是互斥入口，同一个标签页不会同时运行两个控制器。
 
-固定 userscript 行为合同迁移自已审核版本的 `src/live/*`、`src/vod/*`、`src/constants.js`、`src/errors.js`、`src/ui/*` 及对应测试；扩展新增的执行边界在 `src/extension/`。扩展不再读取 userscript 资源、不执行运行时字符串代码，也不修改原 userscript 仓库。
+固定 userscript 行为合同迁移自已审核版本的 `src/live/*`、`src/vod/*`、`src/constants.js`、`src/errors.js`、`src/ui/*` 及对应测试；扩展新增的执行边界在 `src/extension/`。扩展不读取 userscript 资源、不执行运行时字符串代码，也不修改原 userscript 仓库。
 
 ## 构建和加载
 
@@ -13,40 +13,47 @@ npm ci
 npm run build
 ```
 
-构建结果是已提交的 `dist/extension/`。在 Chrome 地址栏打开 `chrome://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，直接选择 `dist/extension`，不需要先运行本地服务器，也不需要 zip 文件。
+构建结果是已提交的 `dist/extension/`。在 Chrome 地址栏打开 `chrome://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，直接选择 `dist/extension`，不需要本地服务器或 zip 文件。代码或构建结果更新后，在扩展管理页点击“重新加载”，再刷新已经打开的 Bilibili 页面。
 
-代码或构建结果更新后，在扩展管理页点击“重新加载”，然后刷新已经打开的 Bilibili 页面。弹窗开关只影响下一次页面刷新；当前页面可使用面板里的“停用”立即停止当前控制器，再次点击“启用”恢复当前页的控制器活动。
+工具栏 popup 是唯一的状态和动作界面。页面本身不会插入状态面板、host、Shadow DOM、徽章或样式。popup 每 500ms 查询当前活动标签页，并显示模式、状态、连续库存、延迟、画质、速度、倍率、阶段、消息和当前可见动作；没有可信值时显示 `未提供`。关闭 popup 只停止轮询，控制器继续运行；重新打开会读取当前状态，多个标签页的瞬时状态互不共享。
 
-弹窗提供两个独立开关：
-
-- `直播增强`：仅控制 `live.bilibili.com` 页面。
-- `视频增强`：仅控制 `www.bilibili.com/video/` 页面。
-
-首次安装没有存储值时两项均视为开启。扩展只在 `chrome.storage.local` 保存这两个布尔偏好，不保存媒体、账号、Cookie、页面内容或播放历史。卸载时，在 `chrome://extensions` 找到本扩展并点击“移除”；卸载会同时删除扩展自身的本地偏好。
+popup 的 `直播增强` 和 `视频增强` 是下次刷新页面的默认值，不会立即重建当前页面管线。popup 同时提供当前页面的 `启用/停用` 动作；它只控制当前页面，不把偏好开关当作即时重建操作。首次安装没有存储值时两项均视为开启。扩展只在 `chrome.storage.local` 保存这两个布尔偏好，不保存媒体、账号、Cookie、页面内容、播放历史或指标。
 
 ## 直播模式
 
-直播从当前直播边缘以 1× 开始，不预先等待 60 秒，不自动追赶、前跳、回到直播、变速、跳过序号或丢弃尚未连续消费的延迟片段。每个必需序号按 init/media 的严格连续顺序进入 MSE，同一清晰度的 CDN 候选在每一轮并发竞速，暂时性网络错误、超时、5xx 和签名失效会重试同一个序号。停顿后连续前向库存达到 15 秒才恢复，并向约 60 秒积极填充。
+直播从当前直播边缘以 1× 开始，不预先等待 60 秒，不自动追赶、前跳、回到直播、变速、跳过序号或丢弃尚未连续消费的延迟片段。每个必需序号按 init/media 的严格连续顺序进入扩展拥有的 MSE，同一清晰度的 CDN 候选在每一轮并发竞速；暂时性网络错误、超时、5xx 和签名失效会重试同一个序号。停顿后连续前向库存达到 15 秒才恢复，并向约 60 秒积极填充。
 
-清单回退、变体/媒体片段滑出、精确变体或 map 变化、永久 404、MSE append/remove 错误、队列冻结以及页面夺回媒体 source 都会进入 `GAP_UNRECOVERABLE`。此时面板提供“跨过缺口”和“回到直播”；任何定时器都不会自动点击这些按钮。普通清单 503/超时保持可恢复。手动“回到直播”会取消旧请求，获取同清晰度的新边缘，重建 MSE 并恢复播放。延迟超过 3 秒时会隐藏弹幕/聊天节点，恢复时会保留原节点和原显示状态；覆盖 `danmaku`、`.chat-history-panel`、`#chat-history-list`、`#chat-items` 及动态重建节点。
+popup 会报告 `等待 video`、`配置播放器`、`播放信息`、`manifest`、`MSE`、`init`、`库存形成` 等阶段，以及尝试轮次和脱敏后的候选主机名。直播画质同时显示 Bilibili 当前的人类可读描述、qn 和 codec。延迟只有在 program-date-time 或连续 MSE 库存与当前清单边缘之间存在有效映射时才显示；没有锚点时显示 `未提供`，不会用未锚定的 `0.0 秒` 冒充实时延迟。下载倍率来自内存中的成功 manifest/init/segment 请求，使用实际字节数、媒体时长、完成时间以及 30/60 秒窗口；库存已满时显示 `库存已满`。
 
-面板常见状态包括 `STARTING`、`LIVE`、`STALL`、`RECOVERING`、`DELAYED`、`USER_PAUSED`、`GAP_UNRECOVERABLE` 和 `ERROR`。`回到直播`会在不可恢复缺口、延迟、用户暂停和真实恢复积压时显示。
+零库存的 `STARTING`/`RECOVERING` 代际共用一个绝对 45 秒 watchdog。库存形成后立即取消；换代、停用、手动重试、跨过缺口或回到直播也会取消旧计时器。45 秒到期仍无可解码连续库存时，popup 显示带阶段、脱敏主机、codec 的明确 GAP/错误和人工动作，不会无限停留在启动或恢复中。清单回退、变体/media segment 滑出、精确 codec/profile/session 或 map/init 变化、永久 404、MSE append/remove 错误、队列冻结以及页面夺回媒体 source 都会进入 `GAP_UNRECOVERABLE`；popup 会按当前可见性提供“跨过缺口”和“回到直播”。定时器不会自动点击这些动作。手动“回到直播”会取消旧请求，获取同清晰度的新边缘，重建 MSE 并恢复播放；延迟超过 3 秒时隐藏弹幕/聊天节点，恢复时保留原节点和显示状态。
 
-## 视频模式
+直播的扩展-owned fMP4 必须同时声明非空 video/audio codec，init segment 也必须同时包含 video/audio track；muxed fMP4 合法，但不会为了补音频而偷偷建立第二条网络管线。缺少音频、组合 codec 不支持或无法形成可解码库存都报告为产品错误/GAP，静音视频不算成功。
 
-视频模式只通过 MAIN world 的版本化桥接访问当前 `player.__core()`，桥接只传递可序列化的播放器/内核白名单字段和事件；fetch、定时器、HLS、MSE、状态机和 Shadow DOM 面板都由 ISOLATED world 控制器拥有。扩展不会读取或覆盖页面的 `window.Hls`，也不调用隐藏的 `setQuality`、`setQn` 或 `setVideoQuality`。
+## 点播模式
 
-扩展只调用 `requestQuality(64)` 请求 720P，并通过真实 getter/事件确认结果。面板会区分已确认、拒绝、不可用和超时；确认后的同一 BVID/分 P/内核/资源出现真实 qn32 漂移时，会创建新观察并再次请求 qn64。初始和补水目标为 120 秒或短视频剩余时长，连续前向库存低于 30 秒才会为补水暂停；用户主动暂停不会被自动恢复。播放速度固定为 2×，稳定缓冲目标为 180 秒；MSE 配额按 180→120→90 秒降级，并在同一 BVID/分 P 的内核、资源和画质重建后保留。
+点播首次形成任意连续库存（包括 0、5 或 20 秒）时立即应用 2×，让 Bilibili 原生播放器在后台向 120 秒（短视频则为剩余时长）下载；脚本不会把用户第一次播放重新暂停。只有初始后台填充已经完成、之后连续前向库存降到 30 秒以下，且当前内核明确支持 paused scheduling，才允许脚本暂停进行中途补水；缺少该能力时保持播放并显示降级提示，不制造下载死锁。用户主动暂停不会被自动恢复，最后 30 秒不脚本暂停，独立 audio/video 尾部相差 0.05–1 秒时让浏览器自然进入 `ended`。
 
-视频页面板状态通常为 `VOD_READY`、`REFILLING`、`USER_PAUSED` 或 `ERROR`，画质文字只有在真实确认后才显示 `qn64 已生效`。扩展不绕过登录、会员、地区、版权、DRM 或任何 Bilibili 授权；手动验证 720P 时，请使用已登录且有权限的普通 Bilibili 视频，在弹窗打开“视频增强”，刷新页面，确认面板显示 `720P/qn64 已生效` 和 `2×`，并观察页面实际播放质量。若当前账号或视频不可用 720P，面板必须显示真实失败原因。
+点播只通过 MAIN world 的版本化桥接访问当前播放器和 `player.__core()` 的实际能力快照。稳定缓冲、paused scheduling、质量 getter/list、`requestQuality`、buffer/media info 和 core events 分别判断；一个可选 API 缺失不会阻塞 2×、指标、画质或其他可用控制。稳定缓冲目标按现有的 180→120→90 秒 quota 会话策略逐级降级并保持每个内核幂等。
+
+扩展只向实际可用的权限感知 `requestQuality(64)` 请求 720P：优先当前 core，core 没有时才使用当前页面播放器，一次观察不会同时调用两条路径。只有真实 getter/event 观察确认 qn64 后才报告成功；权限拒绝、路径不可用或确认超时会保留实际/原始画质，继续 2×、库存、指标和已支持的缓冲控制，并提示 `请在 Bilibili 播放器手动选择 720P`。不会调用隐藏的 `setQuality`、`setQn` 或 `setVideoQuality`，也不会绕过登录、会员、地区、版权或 DRM 授权。
+
+产品代码从不设置 `HTMLMediaElement.muted` 或 `volume`，也不替换 Bilibili 原生点播 video/audio source；点播继续观察页面可能分离的原生音视频轨。自动化只为安全测试在 document-start 安装静音守卫，并使用 headless、临时 profile、`--mute-audio`，在每次测试 `play()` 前断言所有 media 为 `muted=true`、`volume=0`。这不是用户可听效果的通过证明。
 
 ## 权限、隐私和限制
 
 Manifest 是 MV3，最低 Chrome 版本为 120，没有 service worker、options page、代理、服务器、持久 DVR 或第三种页面模式。内容脚本只匹配 `https://live.bilibili.com/*` 和 `https://www.bilibili.com/video/*` 的顶层页面，并在 `document_start` 执行。
 
-扩展请求 `storage`，以及实现产品 fetch 所需的 `https://api.live.bilibili.com/*` 和 Bilibili CDN `https://*.bilivideo.com/*`。这些权限只用于官方播放信息、HLS 清单和媒体片段请求，所有产品请求都使用 `credentials: omit`。没有 Cookie/profile 读取，没有遥测、分析 SDK、外部字体、远程可执行代码或媒体持久化；媒体只存在于当前页面的内存 MSE 中。
+扩展请求 `storage`，以及实现产品 fetch 所需的 `https://api.live.bilibili.com/*` 和 `https://*.bilivideo.com/*`。没有 `tabs`、`activeTab` 或其他额外权限；popup 使用既有 content-script 消息通道读取当前活动页。所有产品请求都使用 `credentials: omit`，没有 Cookie/profile 读取、遥测、分析 SDK、外部字体、远程可执行代码、媒体持久化或全局 fetch/XHR/MediaSource/SourceBuffer 原型 patch。媒体只存在于当前页面的内存 MSE 中。
 
-可用带宽、浏览器编解码器、Bilibili 登录状态、会员/地区授权和官方 CDN 状态都会限制效果。扩展不会承诺超过当前网络带宽，也不会将授权失败伪装成成功。Linux 自动化若缺少 H.264 编解码器，外部直播 smoke 可以是 `BLOCKED`；这不等同于真实 Bilibili 通过，确定性实际媒体加载测试仍必须通过。
+可用带宽、浏览器编解码器、Bilibili 登录状态、会员/地区授权和官方 CDN 状态都会限制效果。扩展不会承诺超过当前网络带宽，也不会把授权失败伪装成成功。Linux 自动化若缺少 H.264 编解码器，外部直播 smoke 可以是 `BLOCKED`；这不等同于真实 Bilibili 通过。
+
+## 普通 Chrome 手工听音 checkpoint
+
+自动化明确保持静音，下面的可听检查必须由用户在普通 Chrome 中完成，README 不宣称它已经通过：
+
+1. 用目标 Chrome 加载 `dist/extension`，打开一个有权限的点播视频；在 popup 开启“视频增强”，刷新页面，确认声音正常、速度为 2×，并在 popup 观察画质/库存。
+2. 打开一个直播间，在 popup 开启“直播增强”，刷新页面，确认直播声音正常、画面和声音持续推进，并观察库存、延迟、画质和倍率。
+3. 记录听感和播放行为后，在 popup 对当前页面点击“停用”，再刷新或按页面正常方式播放；比较停用前后的声音连续性、画质和卡顿。不要把自动化的静音结果当作这一步的人工通过。
 
 ## 测试和验证
 
@@ -62,8 +69,8 @@ npm audit --omit=dev --json
 npm run smoke:external
 ```
 
-`test:unit` 包含固定源的 53 个媒体回归和扩展桥接/Manifest 测试。`test:contract` 检查 MV3、最小 Chrome 版本、精确 match/top-frame/document-start/world、权限、固定 `hls.js@1.5.17`、popup 资源、source/dist 禁止项和生成结果一致性。`test:e2e` 使用 Playwright `launchPersistentContext` 加载提交的 `dist/extension`，验证扩展 runtime id、MAIN↔ISOLATED 桥接、弹窗/storage、默认开启、刷新语义、直播/点播路由、实际静音视频的 `currentSrc`/`readyState`/播放进度、点播 2× 和直播 Fake MSE 的并发 CDN/连续 append。每次浏览器运行都使用新的临时 profile、headless、`--mute-audio`，并在每次测试播放前同步断言所有 audio/video 为 `muted=true`、`volume=0`；测试结束清理 profile 和临时库。
+`test:e2e` 使用 Playwright `1.55.1` 的 headless 临时 profile 加载已构建的 `dist/extension`，驱动真实扩展 entrypoint、真实 `LiveController`、Fake `MediaSource`/`SourceBuffer`、受控 API/manifest/segment 路由和 popup。它覆盖点播 2×/质量/quota/SPA、桥接能力与 stale session、直播阶段、音频+视频 init、并发同序号恢复、GAP、回到直播、SRI、unsafeWindow/page-world bridge、popup 新鲜度和静音守卫。每次测试结束清理 profile 与临时库。
 
-`smoke:external` 使用新的匿名临时 profile 访问批准的 VOD URL 和房间 6363772；若该房间离线，只选官方推荐列表中当前 `live_status=1` 的房间。每个子测试严格报告 `PASS`、`BLOCKED` 或 `FAIL`，任何 `BLOCKED`/`FAIL` 都以非零退出；反爬、匿名页面没有播放器、网络环境或编解码器缺失只能报告 `BLOCKED`，不能宣称真实页面通过。产品断言、桥接错误、扩展错误和错误状态均为 `FAIL`。报告写入被忽略的 `reports/`，不会提交到仓库。
+`test:contract` 检查 MV3、最小 Chrome 版本、精确 match/top-frame/document-start/world、权限、固定 `hls.js@1.5.17`、popup 资源、source/dist 禁止项和生成结果一致性。`smoke:external` 使用匿名、headless、全新临时 profile 访问批准的 VOD URL 和房间 6363772；若房间离线，只从官方推荐列表选择当前 `live_status=1` 的房间。它严格报告 `PASS`、`BLOCKED` 或 `FAIL`，任何 `BLOCKED`/`FAIL` 都以非零退出；反爬、匿名页面没有播放器、网络环境或编解码器缺失只能报告 `BLOCKED`，不能宣称真实页面通过。报告写入被忽略的 `reports/`，不会提交到仓库。
 
-Windows 已安装 Chrome 的手工/自动化尝试必须仍使用新的临时 profile、headless、静音和 document-start 静音守卫；若 Chrome 版本拒绝命令行加载解压扩展，应记录为自动化限制，不得使用个人 profile、Cookie 或策略绕过。正式使用前请在目标 Chrome 中通过“加载已解压的扩展程序”加载 `dist/extension`，分别手动验证直播和一个已登录、确实授权 720P 的点播视频。
+Windows 已安装 Chrome 的加载路径仍是 `E:\workspace\smooth-bilibili-chrome-plugin\dist\extension`；不需要在 Windows 重新 npm/build。不要使用个人 Chrome profile、Cookie、凭据或登录状态运行自动化。

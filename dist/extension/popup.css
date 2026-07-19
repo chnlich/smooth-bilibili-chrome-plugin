@@ -4,41 +4,113 @@
 }
 
 body {
-  width: 230px;
+  width: 300px;
   margin: 0;
-  padding: 16px;
+  padding: 14px;
   background: #111827;
   color: #f3f4f6;
 }
 
 h1 {
-  margin: 0 0 14px;
+  margin: 0 0 10px;
   font-size: 16px;
 }
 
-.switch-row {
+.preferences,
+.snapshot {
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 9px 10px;
+}
+
+.snapshot {
+  margin-top: 10px;
+}
+
+.switch-row,
+.title-row,
+dl div {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 0;
-  font-size: 14px;
+  gap: 12px;
+}
+
+.switch-row {
+  padding: 4px 0;
+  font-size: 13px;
 }
 
 .switch-row input {
-  width: 18px;
-  height: 18px;
+  width: 17px;
+  height: 17px;
   accent-color: #38bdf8;
 }
 
-.hint,
-.status {
-  margin: 12px 0 0;
-  color: #a7b1c2;
+.title-row {
+  margin-bottom: 7px;
+  font-weight: 700;
+}
+
+.title-row strong {
+  color: #8bd5ff;
+  text-align: right;
+}
+
+dl {
+  display: grid;
+  gap: 3px;
+  margin: 0;
   font-size: 12px;
-  line-height: 1.45;
+}
+
+dt {
+  color: #aeb9c7;
+}
+
+dd {
+  max-width: 205px;
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.hint,
+.status,
+.message {
+  margin: 8px 0 0;
+  color: #a7b1c2;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.message {
+  color: #ffd38b;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+button {
+  border: 1px solid #5a6c83;
+  border-radius: 5px;
+  padding: 4px 7px;
+  background: #243247;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+
+button:hover {
+  background: #30435e;
 }
 
 .status {
-  min-height: 17px;
+  min-height: 15px;
   color: #86efac;
 }

@@ -6,6 +6,14 @@ function report(onWarning, message, error) {
   }
 }
 
+export function candidateHost(url) {
+  try {
+    return new URL(url).host;
+  } catch (error) {
+    throw new BufferScriptError('PLAYBACK_CDN_INVALID', 'CDN URL 无效', error);
+  }
+}
+
 function request(url, fetchImpl, signal) {
   return fetchImpl(url, {
     method: 'GET',
@@ -51,7 +59,7 @@ function sleep(milliseconds, signal) {
   });
 }
 
-async function readCandidate(url, fetchImpl, signal, timeoutMilliseconds, readBody) {
+async function readCandidate(url, fetchImpl, signal, timeoutMilliseconds, readBody, nowMilliseconds) {
   const requestController = new AbortController();
   const forwardAbort = () => requestController.abort();
   if (signal?.aborted === true) {
@@ -63,7 +71,7 @@ async function readCandidate(url, fetchImpl, signal, timeoutMilliseconds, readBo
   const timeout = setTimeout(() => {
     timedOut = true;
     requestController.abort();
-    timeoutReject(new BufferScriptError('REQUEST_TIMEOUT', `媒体请求超时: ${url}`));
+    timeoutReject(new BufferScriptError('REQUEST_TIMEOUT', `媒体请求超时: ${candidateHost(url)}`));
   }, timeoutMilliseconds);
   const timeoutPromise = new Promise((_, reject) => {
     timeoutReject = reject;
@@ -74,13 +82,19 @@ async function readCandidate(url, fetchImpl, signal, timeoutMilliseconds, readBo
       timeoutPromise,
     ]);
     if (response.ok) {
-      const bytes = await Promise.race([readBody(response), timeoutPromise]);
-      return { kind: 'SUCCESS', value: { bytes, url }, url };
+      const body = await Promise.race([readBody(response), timeoutPromise]);
+      const bytes = body?.bytes === undefined ? body : body.bytes;
+      const byteLength = body?.byteLength === undefined ? bytes.byteLength : body.byteLength;
+      return {
+        kind: 'SUCCESS',
+        value: { bytes, byteLength, url, completedAtMilliseconds: nowMilliseconds() },
+        url,
+      };
     }
     const kind = classifyResponse(response);
     return {
       kind,
-      error: new BufferScriptError(kind, `媒体请求 ${response.status}: ${url}`),
+      error: new BufferScriptError(kind, `媒体请求 ${response.status}: ${candidateHost(url)}`),
       url,
     };
   } catch (error) {
@@ -88,7 +102,7 @@ async function readCandidate(url, fetchImpl, signal, timeoutMilliseconds, readBo
       throw abortError();
     }
     if (timedOut) {
-      throw new BufferScriptError('REQUEST_TIMEOUT', `媒体请求超时: ${url}`, error);
+      throw new BufferScriptError('REQUEST_TIMEOUT', `媒体请求超时: ${candidateHost(url)}`, error);
     }
     throw error;
   } finally {
@@ -131,7 +145,14 @@ function runCandidateRound(candidates, options, readBody) {
     }
     signal?.addEventListener('abort', onAbort, { once: true });
     for (const url of candidates) {
-      void readCandidate(url, fetchImpl, roundController.signal, timeoutMilliseconds, readBody)
+      void readCandidate(
+        url,
+        fetchImpl,
+        roundController.signal,
+        timeoutMilliseconds,
+        readBody,
+        options.nowMilliseconds,
+      )
         .then((result) => {
           if (settled) {
             return;
@@ -199,12 +220,17 @@ async function fetchFromCandidates(candidates, options, readBody, kind) {
     ...options,
     requestTimeoutMilliseconds: options.requestTimeoutMilliseconds ?? 5000,
     retryBackoffMilliseconds: options.retryBackoffMilliseconds ?? [1000, 2000, 4000, 8000, 15000, 30000],
+    nowMilliseconds: options.nowMilliseconds || (() => Date.now()),
   };
   validateOptions(normalized);
   let attempt = 0;
   while (true) {
     const result = await runCandidateRound(candidates, normalized, readBody);
     if (result.value !== undefined) {
+      options.onSuccess?.({
+        kind,
+        ...result.value,
+      });
       return result.value;
     }
     if (allOfKind(result.failures, 'NOT_FOUND')) {
@@ -218,8 +244,17 @@ async function fetchFromCandidates(candidates, options, readBody, kind) {
       fail('SIGNATURE_EXPIRED', `${kind === 'segment' ? '媒体' : '清单'}候选出现 401/403，需要续期签名`);
     }
     for (const failure of result.failures) {
-      report(normalized.onWarning, `${kind} 候选 ${failure.url} 第 ${attempt + 1} 轮失败`, failure.error);
+      report(
+        normalized.onWarning,
+        `${kind} 候选 ${candidateHost(failure.url)} 第 ${attempt + 1} 轮失败`,
+        failure.error,
+      );
     }
+    normalized.onRetry?.({
+      kind,
+      attempt: attempt + 1,
+      hosts: candidates.map((url) => candidateHost(url)),
+    });
     await sleep(nextBackoff(normalized.retryBackoffMilliseconds, attempt), normalized.signal);
     attempt += 1;
   }
@@ -238,8 +273,16 @@ export async function fetchTextFromCandidates(candidates, options = {}) {
   const result = await fetchFromCandidates(
     candidates,
     options,
-    async (response) => response.text(),
+    async (response) => {
+      const bytes = await response.arrayBuffer();
+      return { bytes: new TextDecoder().decode(bytes), byteLength: bytes.byteLength };
+    },
     'manifest',
   );
-  return { text: result.bytes, url: result.url };
+  return {
+    text: result.bytes,
+    url: result.url,
+    byteLength: result.byteLength,
+    completedAtMilliseconds: result.completedAtMilliseconds,
+  };
 }

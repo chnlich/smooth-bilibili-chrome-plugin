@@ -36,9 +36,12 @@
     playbackRate: 1,
     segmentConcurrency: 3,
     requestTimeoutMilliseconds: 5e3,
+    mseWaitTimeoutMilliseconds: 5e3,
+    zeroInventoryWatchdogMilliseconds: 45e3,
     retryBackoffMilliseconds: Object.freeze([1e3, 2e3, 4e3, 8e3, 15e3, 3e4]),
     manifestRefreshMilliseconds: 1e3,
-    statusRefreshMilliseconds: 500
+    statusRefreshMilliseconds: 500,
+    metricsWindowsSeconds: Object.freeze([30, 60])
   });
   var VOD_CONFIG = Object.freeze({
     qualityNumber: 64,
@@ -255,11 +258,11 @@
       segments
     };
   }
-  function parseHlsPlaylist(text2, manifestUrl) {
-    if (typeof text2 !== "string" || !text2.startsWith("#EXTM3U")) {
+  function parseHlsPlaylist(text, manifestUrl) {
+    if (typeof text !== "string" || !text.startsWith("#EXTM3U")) {
       fail("MANIFEST_HEADER_MISSING", "响应不是 HLS 清单");
     }
-    const lines = text2.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     if (lines.length === 0 || lines[0] !== "#EXTM3U") {
       fail("MANIFEST_HEADER_MISSING", "HLS 清单头无效");
     }
@@ -387,7 +390,7 @@
     const timeout = setTimeout(() => {
       timedOut = true;
       requestController.abort();
-      timeoutReject(new BufferScriptError("REQUEST_TIMEOUT", `播放 API 请求超时: ${url}`));
+      timeoutReject(new BufferScriptError("REQUEST_TIMEOUT", `播放 API 请求超时: ${new URL(url).host}`));
     }, timeoutMilliseconds);
     try {
       const response = await Promise.race([
@@ -411,7 +414,7 @@
         throw abortError();
       }
       if (timedOut) {
-        throw new BufferScriptError("PLAY_INFO_TEMPORARY_ERROR", `播放 API 请求超时: ${url}`, error);
+        throw new BufferScriptError("PLAY_INFO_TEMPORARY_ERROR", `播放 API 请求超时: ${new URL(url).host}`, error);
       }
       throw error;
     } finally {
@@ -445,6 +448,11 @@
         if (error?.code !== void 0 && !["PLAY_INFO_TEMPORARY_HTTP_ERROR", "PLAY_INFO_TEMPORARY_ERROR", "REQUEST_TIMEOUT"].includes(error.code)) {
           throw error;
         }
+        options.onRetry?.({
+          kind: "play-info",
+          attempt: attempt + 1,
+          hosts: ["api.live.bilibili.com"]
+        });
         await sleep(backoffMilliseconds[Math.min(attempt, backoffMilliseconds.length - 1)], options.signal);
         attempt += 1;
       }
@@ -469,9 +477,18 @@
       fail("LIVE_FMP4_MISSING", "播放 API 没有 fMP4 流");
     }
     const codecs = formats.flatMap((format2) => format2.codec || []);
-    const preferred = codecs.find((codec2) => codec2.codec_name === preferredCodec);
-    const codec = preferred || codecs.find((candidate) => candidate.codec_name === "avc");
+    const hasTrackCodecs = (codec2) => typeof codec2.video_codecs?.base === "string" && codec2.video_codecs.base.trim().length > 0 && typeof codec2.audio_codecs?.base === "string" && codec2.audio_codecs.base.trim().length > 0;
+    const preferred = codecs.find((codec2) => codec2.codec_name === preferredCodec && hasTrackCodecs(codec2));
+    const codec = preferred || codecs.find((candidate) => candidate.codec_name === "avc" && hasTrackCodecs(candidate));
     if (codec === void 0) {
+      const preferredWithoutAudio = codecs.find((candidate) => candidate.codec_name === preferredCodec);
+      if (preferredWithoutAudio !== void 0 && (typeof preferredWithoutAudio.audio_codecs?.base !== "string" || preferredWithoutAudio.audio_codecs.base.trim() === "")) {
+        fail("LIVE_AUDIO_CODEC_MISSING", "播放 API 没有返回直播音频 codec");
+      }
+      const preferredWithoutVideo = codecs.find((candidate) => candidate.codec_name === preferredCodec);
+      if (preferredWithoutVideo !== void 0 && (typeof preferredWithoutVideo.video_codecs?.base !== "string" || preferredWithoutVideo.video_codecs.base.trim() === "")) {
+        fail("LIVE_VIDEO_CODEC_MISSING", "播放 API 没有返回直播视频 codec");
+      }
       fail("LIVE_CODEC_MISSING", `播放 API 没有可用 codec: ${preferredCodec}`);
     }
     const qualityNumber = Number(codec.current_qn);
@@ -481,13 +498,24 @@
     const baseUrl = requireValue(codec.base_url, "PLAYBACK_BASE_URL_MISSING", "播放轨道缺少 base_url");
     const urlInfo = requireValue(codec.url_info, "PLAYBACK_CDN_MISSING", "播放轨道缺少 url_info");
     const candidates = buildCdnCandidates({ baseUrl, urlInfo });
+    const qualityDescription = [
+      codec.description,
+      codec.desc,
+      codec.display_name,
+      codec.quality_name,
+      codec.qn_desc,
+      codec.name
+    ].find((value) => typeof value === "string" && value.trim().length > 0);
     return {
       roomId,
       requestedQualityNumber,
       qualityNumber,
+      qualityDescription,
       formatName: "fmp4",
       codecName: codec.codec_name,
-      codecString: [codec.video_codecs?.base, codec.audio_codecs?.base].filter(Boolean).join(", "),
+      videoCodecString: codec.video_codecs.base,
+      audioCodecString: codec.audio_codecs.base,
+      codecString: `${codec.video_codecs.base}, ${codec.audio_codecs.base}`,
       session: requireValue(codec.session, "LIVE_SESSION_MISSING", "播放轨道缺少 stream session"),
       baseUrl,
       urlInfo,
@@ -521,6 +549,13 @@
   function report(onWarning, message, error) {
     if (onWarning !== void 0) {
       onWarning(message, error);
+    }
+  }
+  function candidateHost(url) {
+    try {
+      return new URL(url).host;
+    } catch (error) {
+      throw new BufferScriptError("PLAYBACK_CDN_INVALID", "CDN URL 无效", error);
     }
   }
   function request(url, fetchImpl, signal) {
@@ -563,7 +598,7 @@
       signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
-  async function readCandidate(url, fetchImpl, signal, timeoutMilliseconds, readBody) {
+  async function readCandidate(url, fetchImpl, signal, timeoutMilliseconds, readBody, nowMilliseconds) {
     const requestController = new AbortController();
     const forwardAbort = () => requestController.abort();
     if (signal?.aborted === true) {
@@ -575,7 +610,7 @@
     const timeout = setTimeout(() => {
       timedOut = true;
       requestController.abort();
-      timeoutReject(new BufferScriptError("REQUEST_TIMEOUT", `媒体请求超时: ${url}`));
+      timeoutReject(new BufferScriptError("REQUEST_TIMEOUT", `媒体请求超时: ${candidateHost(url)}`));
     }, timeoutMilliseconds);
     const timeoutPromise = new Promise((_, reject) => {
       timeoutReject = reject;
@@ -586,13 +621,19 @@
         timeoutPromise
       ]);
       if (response.ok) {
-        const bytes = await Promise.race([readBody(response), timeoutPromise]);
-        return { kind: "SUCCESS", value: { bytes, url }, url };
+        const body = await Promise.race([readBody(response), timeoutPromise]);
+        const bytes = body?.bytes === void 0 ? body : body.bytes;
+        const byteLength = body?.byteLength === void 0 ? bytes.byteLength : body.byteLength;
+        return {
+          kind: "SUCCESS",
+          value: { bytes, byteLength, url, completedAtMilliseconds: nowMilliseconds() },
+          url
+        };
       }
       const kind = classifyResponse(response);
       return {
         kind,
-        error: new BufferScriptError(kind, `媒体请求 ${response.status}: ${url}`),
+        error: new BufferScriptError(kind, `媒体请求 ${response.status}: ${candidateHost(url)}`),
         url
       };
     } catch (error) {
@@ -600,7 +641,7 @@
         throw abortError2();
       }
       if (timedOut) {
-        throw new BufferScriptError("REQUEST_TIMEOUT", `媒体请求超时: ${url}`, error);
+        throw new BufferScriptError("REQUEST_TIMEOUT", `媒体请求超时: ${candidateHost(url)}`, error);
       }
       throw error;
     } finally {
@@ -641,7 +682,14 @@
       }
       signal?.addEventListener("abort", onAbort, { once: true });
       for (const url of candidates) {
-        void readCandidate(url, fetchImpl, roundController.signal, timeoutMilliseconds, readBody).then((result) => {
+        void readCandidate(
+          url,
+          fetchImpl,
+          roundController.signal,
+          timeoutMilliseconds,
+          readBody,
+          options.nowMilliseconds
+        ).then((result) => {
           if (settled) {
             return;
           }
@@ -701,13 +749,18 @@
     const normalized = {
       ...options,
       requestTimeoutMilliseconds: options.requestTimeoutMilliseconds ?? 5e3,
-      retryBackoffMilliseconds: options.retryBackoffMilliseconds ?? [1e3, 2e3, 4e3, 8e3, 15e3, 3e4]
+      retryBackoffMilliseconds: options.retryBackoffMilliseconds ?? [1e3, 2e3, 4e3, 8e3, 15e3, 3e4],
+      nowMilliseconds: options.nowMilliseconds || (() => Date.now())
     };
     validateOptions(normalized);
     let attempt = 0;
     while (true) {
       const result = await runCandidateRound(candidates, normalized, readBody);
       if (result.value !== void 0) {
+        options.onSuccess?.({
+          kind,
+          ...result.value
+        });
         return result.value;
       }
       if (allOfKind(result.failures, "NOT_FOUND")) {
@@ -721,8 +774,17 @@
         fail("SIGNATURE_EXPIRED", `${kind === "segment" ? "媒体" : "清单"}候选出现 401/403，需要续期签名`);
       }
       for (const failure of result.failures) {
-        report(normalized.onWarning, `${kind} 候选 ${failure.url} 第 ${attempt + 1} 轮失败`, failure.error);
+        report(
+          normalized.onWarning,
+          `${kind} 候选 ${candidateHost(failure.url)} 第 ${attempt + 1} 轮失败`,
+          failure.error
+        );
       }
+      normalized.onRetry?.({
+        kind,
+        attempt: attempt + 1,
+        hosts: candidates.map((url) => candidateHost(url))
+      });
       await sleep2(nextBackoff(normalized.retryBackoffMilliseconds, attempt), normalized.signal);
       attempt += 1;
     }
@@ -739,10 +801,18 @@
     const result = await fetchFromCandidates(
       candidates,
       options,
-      async (response) => response.text(),
+      async (response) => {
+        const bytes = await response.arrayBuffer();
+        return { bytes: new TextDecoder().decode(bytes), byteLength: bytes.byteLength };
+      },
       "manifest"
     );
-    return { text: result.bytes, url: result.url };
+    return {
+      text: result.bytes,
+      url: result.url,
+      byteLength: result.byteLength,
+      completedAtMilliseconds: result.completedAtMilliseconds
+    };
   }
 
   // src/live/queue.js
@@ -1012,27 +1082,99 @@
   };
 
   // src/live/mse.js
-  function waitForEvent(target, eventName, errorName) {
+  function waitForEvent(target, eventName, errorName, runtimeObject, timeoutMilliseconds) {
     return new Promise((resolve, reject) => {
-      const onEvent = () => {
+      let timer;
+      const cleanup = () => {
         target.removeEventListener(eventName, onEvent);
         target.removeEventListener(errorName, onError);
+        if (timer !== void 0) {
+          runtimeObject.clearTimeout(timer);
+        }
+      };
+      const onEvent = () => {
+        cleanup();
         resolve();
       };
       const onError = (event) => {
-        target.removeEventListener(eventName, onEvent);
-        target.removeEventListener(errorName, onError);
-        reject(new Error(`MSE 事件 ${errorName}: ${event?.message || "未知错误"}`));
+        cleanup();
+        reject(new BufferScriptError("MSE_EVENT_ERROR", `MSE 事件 ${errorName}: ${event?.message || "未知错误"}`));
+      };
+      const onTimeout = () => {
+        cleanup();
+        reject(new BufferScriptError("MSE_WAIT_TIMEOUT", `等待 MSE ${eventName} 事件超时`));
       };
       target.addEventListener(eventName, onEvent, { once: true });
       target.addEventListener(errorName, onError, { once: true });
+      timer = runtimeObject.setTimeout(onTimeout, timeoutMilliseconds);
     });
   }
+  function ascii(bytes, start, length) {
+    return String.fromCharCode(...bytes.subarray(start, start + length));
+  }
+  function visitBoxes(bytes, start, end, tracks) {
+    let offset = start;
+    while (offset < end) {
+      if (offset + 8 > end) {
+        fail("LIVE_INIT_INVALID", "fMP4 初始化片段包含截断 box");
+      }
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const declaredSize = view.getUint32(offset, false);
+      const type = ascii(bytes, offset + 4, 4);
+      let headerSize = 8;
+      let boxSize = declaredSize;
+      if (declaredSize === 1) {
+        if (offset + 16 > end) {
+          fail("LIVE_INIT_INVALID", "fMP4 初始化片段缺少扩展 box 大小");
+        }
+        const largeSize = view.getBigUint64(offset + 8, false);
+        if (largeSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+          fail("LIVE_INIT_INVALID", "fMP4 初始化片段 box 大小超出安全范围");
+        }
+        boxSize = Number(largeSize);
+        headerSize = 16;
+      } else if (declaredSize === 0) {
+        boxSize = end - offset;
+      }
+      if (boxSize < headerSize || offset + boxSize > end) {
+        fail("LIVE_INIT_INVALID", `fMP4 初始化片段 box ${type} 大小无效`);
+      }
+      const payloadStart = offset + headerSize;
+      const boxEnd = offset + boxSize;
+      if (type === "hdlr" && payloadStart + 12 <= boxEnd) {
+        const handler = ascii(bytes, payloadStart + 8, 4);
+        if (handler === "vide" || handler === "soun") {
+          tracks.add(handler);
+        }
+      }
+      if (["moov", "trak", "mdia", "minf", "stbl", "mvex", "edts", "dinf"].includes(type)) {
+        visitBoxes(bytes, payloadStart, boxEnd, tracks);
+      }
+      offset = boxEnd;
+    }
+  }
+  function validateInitSegmentTracks(bytes) {
+    if (Object.prototype.toString.call(bytes) !== "[object ArrayBuffer]") {
+      fail("LIVE_INIT_INVALID", "fMP4 初始化片段不是 ArrayBuffer");
+    }
+    const view = new Uint8Array(bytes);
+    const tracks = /* @__PURE__ */ new Set();
+    visitBoxes(view, 0, view.byteLength, tracks);
+    if (!tracks.has("vide")) {
+      fail("LIVE_VIDEO_TRACK_MISSING", "fMP4 初始化片段没有 video track 声明");
+    }
+    if (!tracks.has("soun")) {
+      fail("LIVE_AUDIO_TRACK_MISSING", "fMP4 初始化片段没有 audio track 声明");
+    }
+    return { video: true, audio: true };
+  }
   var MseAppendPipeline = class {
-    constructor(video, mediaSourceFactory = globalThis.MediaSource, urlApi = globalThis.URL) {
+    constructor(video, mediaSourceFactory = globalThis.MediaSource, urlApi = globalThis.URL, runtimeObject = globalThis, waitTimeoutMilliseconds = 5e3) {
       this.video = requireValue(video, "MSE_VIDEO_MISSING", "MSE 管线缺少 video 元素");
       this.mediaSourceFactory = mediaSourceFactory;
       this.urlApi = urlApi;
+      this.runtimeObject = runtimeObject;
+      this.waitTimeoutMilliseconds = waitTimeoutMilliseconds;
       this.mediaSource;
       this.sourceBuffer;
       this.objectUrl;
@@ -1050,7 +1192,13 @@
       this.objectUrl = this.urlApi.createObjectURL(this.mediaSource);
       this.video.src = this.objectUrl;
       if (this.mediaSource.readyState !== "open") {
-        await waitForEvent(this.mediaSource, "sourceopen", "error");
+        await waitForEvent(
+          this.mediaSource,
+          "sourceopen",
+          "error",
+          this.runtimeObject,
+          this.waitTimeoutMilliseconds
+        );
       }
       try {
         this.sourceBuffer = this.mediaSource.addSourceBuffer(mime);
@@ -1065,7 +1213,7 @@
         fail("MSE_INVALID_BYTES", "MSE 追加数据不是 ArrayBuffer");
       }
       if (this.sourceBuffer.updating) {
-        await waitForEvent(this.sourceBuffer, "updateend", "error");
+        await waitForEvent(this.sourceBuffer, "updateend", "error", this.runtimeObject, this.waitTimeoutMilliseconds);
       }
       try {
         this.sourceBuffer.appendBuffer(bytes);
@@ -1075,7 +1223,7 @@
       }
       if (this.sourceBuffer.updating) {
         try {
-          await waitForEvent(this.sourceBuffer, "updateend", "error");
+          await waitForEvent(this.sourceBuffer, "updateend", "error", this.runtimeObject, this.waitTimeoutMilliseconds);
         } catch (error) {
           throw toBufferScriptError(error, "MSE_APPEND_ERROR", "MSE 追加异步失败");
         }
@@ -1090,7 +1238,7 @@
     async removeBefore(seconds) {
       requireValue(this.sourceBuffer, "MSE_NOT_OPEN", "MSE 管线尚未打开");
       if (this.sourceBuffer.updating) {
-        await waitForEvent(this.sourceBuffer, "updateend", "error");
+        await waitForEvent(this.sourceBuffer, "updateend", "error", this.runtimeObject, this.waitTimeoutMilliseconds);
       }
       if (seconds <= 0) {
         return;
@@ -1101,7 +1249,7 @@
         throw toBufferScriptError(error, "MSE_REMOVE_ERROR", "MSE 清理旧缓冲失败");
       }
       if (this.sourceBuffer.updating) {
-        await waitForEvent(this.sourceBuffer, "updateend", "error");
+        await waitForEvent(this.sourceBuffer, "updateend", "error", this.runtimeObject, this.waitTimeoutMilliseconds);
       }
     }
     close() {
@@ -1292,6 +1440,18 @@
     const match = ranges.find((range) => range.start <= currentTime && currentTime <= range.end);
     return match === void 0 ? 0 : Math.max(0, match.end - currentTime);
   }
+  function supportsBufferedRanges(core) {
+    if (core === void 0 || core === null) {
+      return false;
+    }
+    if (typeof core.supports === "function") {
+      return core.supports("getBufferedRanges") === true;
+    }
+    if (core.capabilities?.core !== void 0 && Object.prototype.hasOwnProperty.call(core.capabilities.core, "getBufferedRanges")) {
+      return core.capabilities.core.getBufferedRanges === true;
+    }
+    return typeof core.getBufferedRanges === "function";
+  }
   function computeForwardInventory(currentTime, tracks) {
     if (!Number.isFinite(currentTime)) {
       fail("VOD_CURRENT_TIME_INVALID", `currentTime 无效: ${currentTime}`);
@@ -1303,7 +1463,7 @@
     return Math.min(...inventories);
   }
   function bufferedTracksFromVideo(video, core) {
-    const coreRanges = typeof core.getBufferedRanges === "function" ? core.getBufferedRanges() : void 0;
+    const coreRanges = supportsBufferedRanges(core) ? core.getBufferedRanges() : void 0;
     if (coreRanges !== void 0) {
       const tracks = [];
       if (coreRanges.video !== void 0) {
@@ -1394,8 +1554,8 @@
         try {
           await player[name](config);
         } catch (error) {
-          if (error?.code === "PLAYER_UNAVAILABLE") {
-            logger3.warn(`页面播放器尚未就绪，跳过 ${name}`, error);
+          if (error?.code === "PLAYER_UNAVAILABLE" || error?.code === "BRIDGE_METHOD_UNAVAILABLE") {
+            logger3.warn(`页面播放器 ${name} 能力在调用时不可用，继续接管`, error);
           } else {
             logger3.error(`调用 ${name} 失败`, error);
           }
@@ -1405,7 +1565,7 @@
         try {
           await player.pause();
         } catch (error) {
-          logger3.warn("调用页面播放器 pause 失败，继续接管 video", error);
+          logger3.warn("页面播放器 pause 能力在调用时不可用，继续接管 video", error);
         }
       }
     }
@@ -1417,10 +1577,10 @@
     return computeForwardInventory(video.currentTime, [copyTimeRanges(video.buffered)]);
   }
   function buildMime(track) {
-    if (track.codecString.length === 0) {
-      fail("LIVE_CODEC_MISSING", "播放 API 没有返回可用于 MSE 的 codec 字符串");
+    if (typeof track.videoCodecString !== "string" || track.videoCodecString.trim().length === 0 || typeof track.audioCodecString !== "string" || track.audioCodecString.trim().length === 0) {
+      fail("LIVE_CODEC_MISSING", "播放 API 没有同时返回 video 和 audio codec 字符串");
     }
-    return `video/mp4; codecs="${track.codecString}"`;
+    return `video/mp4; codecs="${track.videoCodecString}, ${track.audioCodecString}"`;
   }
   function requiresManifestContinuityGap(error) {
     return [
@@ -1431,7 +1591,15 @@
     ].includes(error?.code);
   }
   function requiresUnrecoverableGap(error) {
-    return requiresManifestContinuityGap(error) || ["MANIFEST_PERMANENT_404", "MSE_APPEND_ERROR", "MSE_REMOVE_ERROR", "MSE_QUOTA_EXCEEDED"].includes(error?.code) || error?.code?.startsWith("GAP_") || error?.code?.startsWith("LIVE_SESSION_");
+    return requiresManifestContinuityGap(error) || ["MANIFEST_PERMANENT_404", "MSE_APPEND_ERROR", "MSE_REMOVE_ERROR", "MSE_QUOTA_EXCEEDED"].includes(error?.code) || error?.code?.startsWith("GAP_") || error?.code?.startsWith("LIVE_SESSION_") || [
+      "LIVE_AUDIO_CODEC_MISSING",
+      "LIVE_VIDEO_CODEC_MISSING",
+      "LIVE_CODEC_MISSING",
+      "LIVE_AUDIO_TRACK_MISSING",
+      "LIVE_VIDEO_TRACK_MISSING",
+      "LIVE_INIT_INVALID",
+      "MSE_WAIT_TIMEOUT"
+    ].includes(error?.code);
   }
   function requiresStartupGap(error) {
     return requiresUnrecoverableGap(error) || error?.code === "SEGMENT_PERMANENT_404";
@@ -1481,7 +1649,13 @@
       this.stateMachine = new LiveStateMachine();
       this.queue = new OrderedSegmentQueue();
       this.danmaku = new DanmakuVisibilityController(documentObject);
-      this.pipeline = new MseAppendPipeline(video, this.mediaSourceFactory, this.urlApi);
+      this.pipeline = new MseAppendPipeline(
+        video,
+        this.mediaSourceFactory,
+        this.urlApi,
+        this.runtimeObject,
+        this.config.mseWaitTimeoutMilliseconds
+      );
       this.track;
       this.manifest;
       this.manifestCandidates;
@@ -1508,6 +1682,12 @@
       this.rebuildingSource = false;
       this.rebuildingGeneration;
       this.failureMessage;
+      this.stage = "等待 video";
+      this.retryMessage = "";
+      this.requestMetrics = [];
+      this.watchdogTimer;
+      this.watchdogGeneration;
+      this.watchdogStartedAtMilliseconds;
       this.boundEvents = [];
     }
     isGenerationCurrent(generation) {
@@ -1519,6 +1699,7 @@
       }
     }
     beginNewGeneration() {
+      this.cancelZeroInventoryWatchdog();
       this.generation += 1;
       this.segmentAbort?.abort();
       this.segmentAbort = new AbortController();
@@ -1526,6 +1707,94 @@
       this.rebuildingSource = false;
       this.rebuildingGeneration = void 0;
       return this.generation;
+    }
+    setStage(stage, message = stage) {
+      this.stage = stage;
+      this.retryMessage = "";
+      this.panel.setModel({ mode: "直播", state: this.starting ? "STARTING" : this.stateMachine.state, stage, message });
+    }
+    reportRetry({ kind, attempt, hosts }) {
+      const uniqueHosts = [...new Set(hosts)];
+      this.retryMessage = `临时${kind}失败，重试第 ${attempt} 轮：${uniqueHosts.join("、")}`;
+      this.panel.setMessage(this.retryMessage);
+    }
+    recordRequest(kind, loaded, mediaDuration) {
+      if (!Number.isFinite(loaded?.byteLength) || loaded.byteLength < 0) {
+        fail("LIVE_METRIC_BYTES_INVALID", `${kind} 请求没有有效实际字节数`);
+      }
+      if (!Number.isFinite(loaded?.completedAtMilliseconds)) {
+        fail("LIVE_METRIC_TIME_INVALID", `${kind} 请求没有有效完成时间`);
+      }
+      if (!Number.isFinite(mediaDuration) || mediaDuration < 0) {
+        fail("LIVE_METRIC_DURATION_INVALID", `${kind} 请求没有有效媒体时长`);
+      }
+      this.requestMetrics.push({
+        kind,
+        byteLength: loaded.byteLength,
+        mediaDuration,
+        completedAtMilliseconds: loaded.completedAtMilliseconds
+      });
+      const cutoff = loaded.completedAtMilliseconds - 6e4;
+      this.requestMetrics = this.requestMetrics.filter((entry) => entry.completedAtMilliseconds >= cutoff);
+    }
+    cancelZeroInventoryWatchdog() {
+      if (this.watchdogTimer !== void 0) {
+        this.runtimeObject.clearTimeout(this.watchdogTimer);
+        this.watchdogTimer = void 0;
+      }
+      this.watchdogGeneration = void 0;
+      this.watchdogStartedAtMilliseconds = void 0;
+    }
+    candidateHosts() {
+      return [...new Set((this.track?.candidates || this.manifestCandidates || []).map((url) => new URL(url).host))];
+    }
+    startZeroInventoryWatchdog(generation = this.generation) {
+      if (this.destroyed || !this.enabled || this.watchdogGeneration === generation || this.starting === false && this.stateMachine.state !== LIVE_STATE.RECOVERING) {
+        return;
+      }
+      this.cancelZeroInventoryWatchdog();
+      this.watchdogGeneration = generation;
+      this.watchdogStartedAtMilliseconds = Date.now();
+      this.watchdogTimer = this.runtimeObject.setTimeout(() => {
+        this.watchdogTimer = void 0;
+        if (!this.isGenerationCurrent(generation) || this.watchdogGeneration !== generation) {
+          return;
+        }
+        this.watchdogGeneration = void 0;
+        if (this.readInventory() > 0) {
+          return;
+        }
+        const stage = this.stage || "未提供";
+        const hosts = this.candidateHosts().join("、") || "未提供";
+        const codec = this.track?.codecString || "未提供";
+        this.enterGap(
+          new BufferScriptError(
+            "LIVE_ZERO_INVENTORY_TIMEOUT",
+            `直播 ${stage} 阶段在 45 秒内没有形成连续可解码库存；候选 ${hosts}；codec ${codec}`
+          )
+        );
+      }, this.config.zeroInventoryWatchdogMilliseconds);
+    }
+    refreshZeroInventoryWatchdog(inventory = this.readInventory()) {
+      if (inventory > 0) {
+        this.cancelZeroInventoryWatchdog();
+        return;
+      }
+      if (this.starting || this.stateMachine.state === LIVE_STATE.RECOVERING) {
+        this.startZeroInventoryWatchdog(this.generation);
+      }
+    }
+    installRuntimeTimers() {
+      if (this.refreshTimer === void 0) {
+        this.refreshTimer = this.runtimeObject.setInterval(() => {
+          void this.refreshManifest();
+        }, this.config.manifestRefreshMilliseconds);
+      }
+      if (this.statusTimer === void 0) {
+        this.statusTimer = this.runtimeObject.setInterval(() => {
+          this.updateStatus();
+        }, this.config.statusRefreshMilliseconds);
+      }
     }
     async start() {
       if (this.destroyed) {
@@ -1540,21 +1809,26 @@
       const generation = this.generation;
       const pipeline = this.pipeline;
       this.starting = true;
+      this.setStage("配置播放器", "正在配置播放器");
+      this.startZeroInventoryWatchdog(generation);
       try {
         await configureOuterPlayer(this.windowObject, this.video, this.logger);
         this.ensureGenerationCurrent(generation);
         this.installVideoGuards();
         this.segmentAbort = new AbortController();
+        this.setStage("播放信息", "正在读取播放信息");
         const payload = await fetchRoomPlayInfo(this.roomId, 1e4, this.fetchImpl, {
           requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
-          signal: this.segmentAbort?.signal
+          signal: this.segmentAbort?.signal,
+          onRetry: (retry) => this.reportRetry(retry)
         });
         this.ensureGenerationCurrent(generation);
         this.track = extractLiveTrack(payload, 1e4, "avc");
         if (this.track.roomId !== this.roomId) {
           fail("LIVE_ROOM_CHANGED", "播放 API 返回了不同直播间");
         }
+        this.setStage("manifest", "正在读取直播 manifest");
         const loaded = await this.loadInitialMediaManifest(generation);
         this.ensureGenerationCurrent(generation);
         this.manifest = loaded.manifest;
@@ -1562,12 +1836,15 @@
         this.variantIdentity = loaded.variantIdentity;
         this.liveEdge = this.manifest.segments[this.manifest.segments.length - 1];
         this.queue.initialize(this.manifest, true);
+        this.setStage("MSE", "正在打开 MSE 管线");
         await pipeline.open(buildMime(this.track));
         this.ensureGenerationCurrent(generation);
+        this.setStage("init", "正在校验并追加音视频 init");
         await this.appendInitSegment(generation, pipeline);
         this.ensureGenerationCurrent(generation);
         pipeline.assertOwnsVideoSource();
         this.started = true;
+        this.setStage("库存形成", "正在形成连续可解码库存");
       } catch (error) {
         if (!this.isGenerationCurrent(generation)) {
           pipeline.close();
@@ -1588,12 +1865,7 @@
         pipeline.close();
         return;
       }
-      this.refreshTimer = this.runtimeObject.setInterval(() => {
-        void this.refreshManifest();
-      }, this.config.manifestRefreshMilliseconds);
-      this.statusTimer = this.runtimeObject.setInterval(() => {
-        this.updateStatus();
-      }, this.config.statusRefreshMilliseconds);
+      this.installRuntimeTimers();
       this.scheduleDownloads();
       void this.pumpDelivery();
       this.updateStatus();
@@ -1612,7 +1884,8 @@
           const track = await renewLiveTrack(this.track, this.fetchImpl, {
             requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
             retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
-            signal
+            signal,
+            onRetry: (retry) => this.reportRetry(retry)
           });
           this.ensureGenerationCurrent(generation);
           this.track = track;
@@ -1626,10 +1899,12 @@
         requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal,
-        onWarning: (message, error) => this.logger.warn(message, error)
+        onWarning: (message, error) => this.logger.warn(message, error),
+        onRetry: (retry) => this.reportRetry(retry)
       });
       this.ensureGenerationCurrent(generation);
       let parsed = parseHlsPlaylist(loaded.text, loaded.url);
+      let manifestLoaded = loaded;
       let candidates = track.candidates;
       let variantIdentity;
       if (parsed.type === "master") {
@@ -1645,10 +1920,12 @@
           requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal,
-          onWarning: (message, error) => this.logger.warn(message, error)
+          onWarning: (message, error) => this.logger.warn(message, error),
+          onRetry: (retry) => this.reportRetry(retry)
         });
         this.ensureGenerationCurrent(generation);
         parsed = parseHlsPlaylist(variantLoaded.text, variantLoaded.url);
+        manifestLoaded = variantLoaded;
       }
       if (parsed.type !== "media") {
         fail("MANIFEST_MEDIA_MISSING", "HLS 主清单没有解析出媒体清单");
@@ -1656,6 +1933,11 @@
       if (enforceVariant && this.variantIdentity !== void 0 && variantIdentity !== this.variantIdentity) {
         fail("GAP_MANIFEST_VARIANT_CHANGED", "自动恢复时 HLS 主清单不再提供原有变体");
       }
+      this.recordRequest(
+        "manifest",
+        manifestLoaded,
+        parsed.segments.reduce((sum, segment) => sum + segment.duration, 0)
+      );
       return { manifest: parsed, candidates, variantIdentity };
     }
     applyRefreshedManifest(loaded) {
@@ -1681,14 +1963,17 @@
             requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
             retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
             signal,
-            onWarning: (message, error) => this.logger.warn(message, error)
+            onWarning: (message, error) => this.logger.warn(message, error),
+            onRetry: (retry) => this.reportRetry(retry)
           });
           this.ensureGenerationCurrent(generation);
           if (pipeline !== this.pipeline) {
             fail("LIVE_GENERATION_STALE", "直播初始化片段对应的 MSE 管线已被替换");
           }
+          validateInitSegmentTracks(loaded.bytes);
           await pipeline.append(loaded.bytes);
           this.ensureGenerationCurrent(generation);
+          this.recordRequest("init", loaded, 0);
           return;
         } catch (error) {
           if (error?.code !== "SIGNATURE_EXPIRED") {
@@ -1745,6 +2030,7 @@
       this.logger.warn(`直播媒体事件: ${reason}`);
       this.stateMachine.onStall();
       this.stateMachine.onRecovering();
+      this.refreshZeroInventoryWatchdog();
       this.pauseForRecovery();
       this.updateStatus();
     }
@@ -1793,12 +2079,14 @@
               requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
               retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
               signal: this.segmentAbort.signal,
-              onWarning: (message, error) => this.logger.warn(message, error)
+              onWarning: (message, error) => this.logger.warn(message, error),
+              onRetry: (retry) => this.reportRetry(retry)
             });
             if (generation !== this.generation) {
               this.logger.warn(`丢弃已取消的片段下载 ${segment.sn}`);
               return;
             }
+            this.recordRequest("segment", loaded, currentSegment.duration);
             this.queue.markDownloaded(segment.sn, loaded.bytes);
             void this.pumpDelivery();
             return;
@@ -1865,6 +2153,7 @@
           if (this.stateMachine.state === LIVE_STATE.STALL || this.stateMachine.state === LIVE_STATE.RECOVERING) {
             this.stateMachine.onRecovering();
           }
+          this.refreshZeroInventoryWatchdog();
         }
         if (this.video.currentTime > 30) {
           await pipeline.removeBefore(this.video.currentTime - 30);
@@ -1941,7 +2230,8 @@
         const next = await renewLiveTrack(this.track, this.fetchImpl, {
           requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
-          signal
+          signal,
+          onRetry: (retry) => this.reportRetry(retry)
         });
         this.ensureGenerationCurrent(generation);
         const loaded = await this.loadMediaManifest(next, { generation, signal });
@@ -1964,24 +2254,55 @@
     }
     estimateDelay() {
       if (this.liveEdge === void 0) {
-        return 0;
+        return void 0;
       }
       if (this.timelineOriginMilliseconds !== void 0 && this.liveEdge.programDateTime !== void 0) {
         const liveEdgeMilliseconds = this.liveEdge.programDateTime + this.liveEdge.duration * 1e3;
         const playbackMilliseconds = this.timelineOriginMilliseconds + this.video.currentTime * 1e3;
         return Math.max(0, (liveEdgeMilliseconds - playbackMilliseconds) / 1e3);
       }
-      let delay2 = 0;
+      const inventory = this.readInventory();
+      if (inventory <= 0 || this.queue.lastDelivered === void 0) {
+        return void 0;
+      }
+      let pendingDuration = 0;
       for (let sequence = this.queue.expectedSn; sequence <= this.liveEdge.sn; sequence += 1) {
         const segment = this.queue.getSegment(sequence);
-        if (segment !== void 0) {
-          delay2 += segment.duration;
+        if (segment === void 0) {
+          return void 0;
         }
+        pendingDuration += segment.duration;
       }
-      return delay2;
+      return inventory + pendingDuration;
+    }
+    liveMultiplier(inventory) {
+      if (inventory >= this.config.aggressiveBufferSeconds && this.inFlight.size === 0) {
+        return "库存已满";
+      }
+      const nowMilliseconds = Date.now();
+      const windows = this.config.metricsWindowsSeconds.map((windowSeconds) => {
+        const cutoff = nowMilliseconds - windowSeconds * 1e3;
+        const entries = this.requestMetrics.filter((entry) => entry.completedAtMilliseconds >= cutoff);
+        const bytes = entries.reduce((sum, entry) => sum + entry.byteLength, 0);
+        const mediaDuration = entries.reduce((sum, entry) => sum + entry.mediaDuration, 0);
+        if (bytes <= 0 || mediaDuration <= 0) {
+          return void 0;
+        }
+        const downloadBps = bytes * 8 / windowSeconds;
+        const mediaBps = bytes * 8 / mediaDuration;
+        return downloadBps / mediaBps;
+      });
+      if (windows.some((value) => value === void 0)) {
+        return "未提供";
+      }
+      return `30 秒 ${windows[0].toFixed(2)}× / 60 秒 ${windows[1].toFixed(2)}×`;
     }
     updateStatus() {
-      if (this.destroyed || !this.started) {
+      if (this.destroyed) {
+        return;
+      }
+      if (!this.started) {
+        this.panel.setModel({ mode: "直播", state: "STARTING", stage: this.stage, message: this.retryMessage || this.stage });
         return;
       }
       if (!this.enabled) {
@@ -2003,26 +2324,34 @@
       }
       const inventory = this.readInventory();
       const delay2 = this.estimateDelay();
-      this.stateMachine.onDelayChanged(delay2);
-      this.danmaku.setHidden(delay2 > this.config.hideDanmakuAfterSeconds);
+      this.refreshZeroInventoryWatchdog(inventory);
+      if (delay2 !== void 0) {
+        this.stateMachine.onDelayChanged(delay2);
+      }
       if (this.stateMachine.state === LIVE_STATE.RECOVERING && !this.userPaused && inventory >= this.config.recoveryWatermarkSeconds) {
-        this.stateMachine.onRecoveryReady(delay2);
+        this.stateMachine.onRecoveryReady(delay2 ?? 0);
         this.attemptPlay();
       }
-      const quality = this.track === void 0 ? "未提供" : `${this.track.qualityNumber} / ${this.track.codecName}${delay2 > 3 ? "（积压锁定）" : ""}`;
+      this.danmaku.setHidden(
+        this.stateMachine.state === LIVE_STATE.DELAYED && delay2 !== void 0 && delay2 > this.config.hideDanmakuAfterSeconds
+      );
+      const quality = this.track === void 0 ? "未提供" : `${this.track.qualityDescription || "未提供"} / qn${this.track.qualityNumber} / ${this.track.codecName}${delay2 !== void 0 && delay2 > 3 ? "（积压锁定）" : ""}`;
+      const multiplier = this.liveMultiplier(inventory);
+      const message = [this.failureMessage, this.retryMessage].filter(Boolean).join("；");
       this.panel.setModel({
         state: this.stateMachine.state,
         mode: "直播",
         inventory: `${inventory.toFixed(1)} 秒`,
-        delay: `${delay2.toFixed(1)} 秒`,
+        delay: delay2 === void 0 ? "未提供" : `${delay2.toFixed(1)} 秒`,
         quality,
         speed: `${this.config.playbackRate}×`,
-        multiplier: "直播实时",
-        message: this.failureMessage || ""
+        multiplier,
+        stage: this.stage,
+        message
       });
       this.panel.setAction("toggle", this.enabled ? "停用" : "启用", () => this.runAction(() => this.toggle()));
       const gapVisible = this.stateMachine.state === LIVE_STATE.GAP_UNRECOVERABLE;
-      const backlogReturnVisible = this.stateMachine.state === LIVE_STATE.STALL || this.stateMachine.state === LIVE_STATE.RECOVERING ? delay2 > 0 : false;
+      const backlogReturnVisible = this.stateMachine.state === LIVE_STATE.STALL || this.stateMachine.state === LIVE_STATE.RECOVERING ? delay2 !== void 0 && delay2 > 0 : false;
       const returnVisible = gapVisible || this.stateMachine.state === LIVE_STATE.DELAYED || this.stateMachine.state === LIVE_STATE.USER_PAUSED || backlogReturnVisible;
       this.panel.setAction("skip-gap", "跨过缺口", () => this.runAction(() => this.manualSkipGap()), gapVisible);
       this.panel.setAction("return-live", "回到直播", () => this.runAction(() => this.manualReturnLive()), returnVisible);
@@ -2048,8 +2377,15 @@
       }
       const normalized = toBufferScriptError(error, "GAP_UNRECOVERABLE", "直播连续性无法恢复");
       this.logger.error("进入 GAP_UNRECOVERABLE", normalized);
+      this.cancelZeroInventoryWatchdog();
+      this.starting = false;
+      this.started = true;
       this.failureMessage = `${normalized.code}: ${normalized.message}`;
       this.stateMachine.onGap(normalized.message);
+      this.generation += 1;
+      this.segmentAbort?.abort();
+      this.segmentAbort = new AbortController();
+      this.inFlight.clear();
       this.pauseForRecovery();
       this.updateStatus();
     }
@@ -2069,6 +2405,7 @@
         this.scheduleDownloads();
         void this.refreshManifest();
       } else {
+        this.cancelZeroInventoryWatchdog();
         this.generation += 1;
         this.segmentAbort?.abort();
         this.inFlight.clear();
@@ -2085,7 +2422,7 @@
       this.userPaused = false;
       const inventory = this.readInventory();
       const state = this.stateMachine.onUserPlay(
-        this.estimateDelay(),
+        this.estimateDelay() ?? 0,
         inventory >= this.config.recoveryWatermarkSeconds
       );
       if (state === LIVE_STATE.RECOVERING && inventory < this.config.recoveryWatermarkSeconds) {
@@ -2113,7 +2450,8 @@
       const payload = await fetchRoomPlayInfo(this.roomId, previous.qualityNumber, this.fetchImpl, {
         requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
-        signal
+        signal,
+        onRetry: (retry) => this.reportRetry(retry)
       });
       this.ensureGenerationCurrent(generation);
       const track = extractLiveTrack(payload, previous.qualityNumber, previous.codecName);
@@ -2128,6 +2466,7 @@
     async restartAtCurrentEdge(track = this.track, generation) {
       const activeGeneration = generation === void 0 ? this.beginNewGeneration() : generation;
       this.ensureGenerationCurrent(activeGeneration);
+      this.startZeroInventoryWatchdog(activeGeneration);
       const loaded = await this.loadMediaManifest(track, { enforceVariant: false, generation: activeGeneration });
       this.ensureGenerationCurrent(activeGeneration);
       this.track = track;
@@ -2146,7 +2485,9 @@
         const pipeline = new MseAppendPipeline(
           this.video,
           this.mediaSourceFactory,
-          this.urlApi
+          this.urlApi,
+          this.runtimeObject,
+          this.config.mseWaitTimeoutMilliseconds
         );
         replacementPipeline = pipeline;
         this.pipeline = pipeline;
@@ -2167,6 +2508,7 @@
       this.ensureGenerationCurrent(activeGeneration);
       this.failureMessage = void 0;
       this.stateMachine.onRecoveryReady(0);
+      this.installRuntimeTimers();
       this.scheduleDownloads();
       void this.pumpDelivery();
       this.updateStatus();
@@ -2186,6 +2528,7 @@
       }
       this.destroyed = true;
       this.enabled = false;
+      this.cancelZeroInventoryWatchdog();
       this.generation += 1;
       this.rebuildingSource = false;
       this.rebuildingGeneration = void 0;
@@ -3358,10 +3701,10 @@
         data: value
       };
     }
-    const text2 = utf8ArrayToStr(frame.data.subarray(1));
+    const text = utf8ArrayToStr(frame.data.subarray(1));
     return {
       key: frame.type,
-      data: text2
+      data: text
     };
   };
   var decodeURLFrame = (frame) => {
@@ -14814,7 +15157,7 @@
       let video;
       let audio;
       let initSegment;
-      let text2;
+      let text;
       let id3;
       let independent;
       let audioTimeOffset = timeOffset;
@@ -14892,7 +15235,7 @@
           id3 = flushTextTrackMetadataCueSamples(id3Track, timeOffset, this._initPTS, this._initDTS);
         }
         if (textTrack.samples.length) {
-          text2 = flushTextTrackUserdataCueSamples(textTrack, timeOffset, this._initPTS);
+          text = flushTextTrackUserdataCueSamples(textTrack, timeOffset, this._initPTS);
         }
       }
       return {
@@ -14900,7 +15243,7 @@
         video,
         initSegment,
         independent,
-        text: text2,
+        text,
         id3
       };
     }
@@ -17089,7 +17432,7 @@
       } = level;
       const {
         audio,
-        text: text2,
+        text,
         id3,
         initSegment
       } = remuxResult;
@@ -17136,12 +17479,12 @@
         }, id3);
         hls.trigger(Events.FRAG_PARSING_METADATA, emittedID3);
       }
-      if (text2) {
+      if (text) {
         const emittedText = _extends({
           id,
           frag,
           details
-        }, text2);
+        }, text);
         hls.trigger(Events.FRAG_PARSING_USERDATA, emittedText);
       }
     }
@@ -19846,7 +20189,7 @@
     getDisplayText(asOneRow) {
       asOneRow = asOneRow || false;
       const displayText = [];
-      let text2 = "";
+      let text = "";
       let rowNr = -1;
       for (let i = 0; i < NR_ROWS; i++) {
         const rowText = this.rows[i].getTextString();
@@ -19861,12 +20204,12 @@
       }
       if (displayText.length > 0) {
         if (asOneRow) {
-          text2 = "[" + displayText.join(" | ") + "]";
+          text = "[" + displayText.join(" | ") + "]";
         } else {
-          text2 = displayText.join("\n");
+          text = displayText.join("\n");
         }
       }
-      return text2;
+      return text;
     }
     getTextAndFormat() {
       return this.rows;
@@ -20441,7 +20784,7 @@
       }
       return obj;
     }
-    function VTTCue2(startTime, endTime, text2) {
+    function VTTCue2(startTime, endTime, text) {
       const cue = this;
       const baseObj = {
         enumerable: true
@@ -20451,7 +20794,7 @@
       let _pauseOnExit = false;
       let _startTime = startTime;
       let _endTime = endTime;
-      let _text = text2;
+      let _text = text;
       let _region = null;
       let _vertical = "";
       let _snapToLines = true;
@@ -20983,16 +21326,16 @@
     ts += 60 * 60 * 1e3 * hours;
     return ts;
   };
-  var hash = function hash2(text2) {
+  var hash = function hash2(text) {
     let _hash = 5381;
-    let i = text2.length;
+    let i = text.length;
     while (i) {
-      _hash = _hash * 33 ^ text2.charCodeAt(--i);
+      _hash = _hash * 33 ^ text.charCodeAt(--i);
     }
     return (_hash >>> 0).toString();
   };
-  function generateCueId(startTime, endTime, text2) {
-    return hash(startTime.toString()) + hash(endTime.toString()) + hash(text2);
+  function generateCueId(startTime, endTime, text) {
+    return hash(startTime.toString()) + hash(endTime.toString()) + hash(text);
   }
   var calculateOffset = function calculateOffset2(vttCCs, cc, presentationTime) {
     let currCC = vttCCs[cc];
@@ -21043,10 +21386,10 @@
       const startTime = normalizePts((cue.startTime + cueOffset - timestampMapLOCAL) * 9e4, timeOffset * 9e4) / 9e4;
       cue.startTime = Math.max(startTime, 0);
       cue.endTime = Math.max(startTime + duration, 0);
-      const text2 = cue.text.trim();
-      cue.text = decodeURIComponent(encodeURIComponent(text2));
+      const text = cue.text.trim();
+      cue.text = decodeURIComponent(encodeURIComponent(text));
       if (!cue.id) {
-        cue.id = generateCueId(cue.startTime, cue.endTime, text2);
+        cue.id = generateCueId(cue.startTime, cue.endTime, text);
       }
       if (cue.endTime > 0) {
         cues.push(cue);
@@ -24477,10 +24820,10 @@
           return;
         }
         const code = !error ? 0 : error.code || 0;
-        const text2 = !error ? null : error.message;
+        const text = !error ? null : error.message;
         callbacks.onError({
           code,
-          text: text2
+          text
         }, context, error ? error.details : null, stats);
       });
     }
@@ -24577,20 +24920,20 @@
       let cue;
       let indenting;
       let indent;
-      let text2;
+      let text;
       const Cue = self.VTTCue || self.TextTrackCue;
       for (let r = 0; r < captionScreen.rows.length; r++) {
         row = captionScreen.rows[r];
         indenting = true;
         indent = 0;
-        text2 = "";
+        text = "";
         if (!row.isEmpty()) {
           var _track$cues;
           for (let c = 0; c < row.chars.length; c++) {
             if (WHITESPACE_CHAR.test(row.chars[c].uchar) && indenting) {
               indent++;
             } else {
-              text2 += row.chars[c].uchar;
+              text += row.chars[c].uchar;
               indenting = false;
             }
           }
@@ -24603,7 +24946,7 @@
           } else {
             indent++;
           }
-          const cueText = fixLineBreaks(text2.trim());
+          const cueText = fixLineBreaks(text.trim());
           const id = generateCueId(startTime, endTime, cueText);
           if (!(track != null && (_track$cues = track.cues) != null && _track$cues.getCueById(id))) {
             cue = new Cue(startTime, endTime, cueText);
@@ -26769,7 +27112,7 @@
       } = context;
       const {
         video,
-        text: text2,
+        text,
         id3,
         initSegment
       } = remuxResult;
@@ -26883,12 +27226,12 @@
         };
         hls.trigger(Events.FRAG_PARSING_METADATA, emittedID3);
       }
-      if (details && text2) {
+      if (details && text) {
         const emittedText = {
           id,
           frag,
           details,
-          samples: text2.samples
+          samples: text.samples
         };
         hls.trigger(Events.FRAG_PARSING_USERDATA, emittedText);
       }
@@ -27813,6 +28156,28 @@
   }
 
   // src/vod/policy.js
+  function coreSupports(core, method) {
+    requireValue(core, "VOD_CORE_MISSING", "点播内核为空");
+    if (typeof core.supports === "function") {
+      return core.supports(method) === true;
+    }
+    if (core.capabilities?.core !== void 0 && Object.prototype.hasOwnProperty.call(core.capabilities.core, method)) {
+      return core.capabilities.core[method] === true;
+    }
+    return typeof core[method] === "function";
+  }
+  function playerSupports(player, method) {
+    if (player === void 0 || player === null) {
+      return false;
+    }
+    if (typeof player.supports === "function") {
+      return player.supports(method) === true;
+    }
+    if (player.capabilities !== void 0 && Object.prototype.hasOwnProperty.call(player.capabilities, method)) {
+      return player.capabilities[method] === true;
+    }
+    return typeof player[method] === "function";
+  }
   var VodBufferPolicy = class {
     constructor(config = VOD_CONFIG) {
       this.config = config;
@@ -27822,20 +28187,46 @@
     }
     apply(core) {
       requireValue(core, "VOD_CORE_MISSING", "点播内核为空");
-      const previous = this.applied.get(core);
-      if (previous === this.targetSeconds) {
-        return { changed: false, targetSeconds: this.targetSeconds };
+      const previous = this.applied.get(core) || {};
+      const result = {
+        changed: false,
+        targetSeconds: this.targetSeconds,
+        stableBufferSupported: coreSupports(core, "setStableBufferTime"),
+        pausedSchedulingSupported: coreSupports(core, "setScheduleWhilePaused"),
+        warnings: []
+      };
+      if (!result.stableBufferSupported) {
+        result.warnings.push("当前内核不支持稳定缓冲设置，保持 Bilibili 默认值");
+      } else if (previous.stableBufferTime !== this.targetSeconds) {
+        try {
+          core.setStableBufferTime(this.targetSeconds);
+          previous.stableBufferTime = this.targetSeconds;
+          result.changed = true;
+        } catch (error) {
+          if (!["BRIDGE_METHOD_UNAVAILABLE", "VOD_STABLE_BUFFER_UNAVAILABLE"].includes(error?.code)) {
+            throw error;
+          }
+          result.stableBufferSupported = false;
+          result.warnings.push("当前内核不支持稳定缓冲设置，保持 Bilibili 默认值");
+        }
       }
-      if (typeof core.setStableBufferTime !== "function") {
-        fail("VOD_STABLE_BUFFER_UNAVAILABLE", "点播内核没有 setStableBufferTime");
+      if (!result.pausedSchedulingSupported) {
+        result.warnings.push("当前内核不支持暂停时继续下载，低库存时保持播放");
+      } else if (previous.scheduleWhilePaused !== true) {
+        try {
+          core.setScheduleWhilePaused(true);
+          previous.scheduleWhilePaused = true;
+          result.changed = true;
+        } catch (error) {
+          if (!["BRIDGE_METHOD_UNAVAILABLE", "VOD_PAUSED_SCHEDULE_UNAVAILABLE"].includes(error?.code)) {
+            throw error;
+          }
+          result.pausedSchedulingSupported = false;
+          result.warnings.push("当前内核不支持暂停时继续下载，低库存时保持播放");
+        }
       }
-      if (typeof core.setScheduleWhilePaused !== "function") {
-        fail("VOD_PAUSED_SCHEDULE_UNAVAILABLE", "点播内核没有 setScheduleWhilePaused");
-      }
-      core.setStableBufferTime(this.targetSeconds);
-      core.setScheduleWhilePaused(true);
-      this.applied.set(core, this.targetSeconds);
-      return { changed: true, targetSeconds: this.targetSeconds };
+      this.applied.set(core, previous);
+      return result;
     }
     handleQuota(core) {
       const nextIndex = this.fallbackIndex + 1;
@@ -27853,15 +28244,23 @@
       this.applied = /* @__PURE__ */ new WeakMap();
     }
   };
-  async function callQualityMethod(_player, core, qualityNumber) {
-    if (typeof core.requestQuality !== "function") {
-      fail("VOD_QUALITY_UNAVAILABLE", `当前播放器内核没有权限感知的 qn${qualityNumber} 请求接口`);
+  async function callQualityMethod(player, core, qualityNumber) {
+    if (!Number.isInteger(qualityNumber) || qualityNumber <= 0) {
+      fail("VOD_QUALITY_ARGUMENT_INVALID", `qn${qualityNumber} 不是正整数清晰度`);
     }
-    const result = await core.requestQuality(qualityNumber);
+    let method;
+    if (coreSupports(core, "requestQuality")) {
+      method = "core.requestQuality";
+    } else if (playerSupports(player, "requestQuality")) {
+      method = "player.requestQuality";
+    } else {
+      fail("VOD_QUALITY_UNAVAILABLE", `当前播放器没有权限感知的 qn${qualityNumber} 请求接口`);
+    }
+    const result = method === "core.requestQuality" ? await core.requestQuality(qualityNumber) : await player.requestQuality(qualityNumber);
     if (result === false) {
       fail("VOD_QUALITY_REJECTED", `服务端或播放器拒绝 qn${qualityNumber}`);
     }
-    return { method: "requestQuality", qualityNumber };
+    return { method, qualityNumber };
   }
   function qualityNumberFromValue(value) {
     if (Number.isInteger(value) && value > 0) {
@@ -27909,7 +28308,7 @@
     let value;
     let getter;
     for (const name of ["getQuality", "getCurrentQuality", "getCurrentQn"]) {
-      if (typeof core[name] === "function") {
+      if (coreSupports(core, name)) {
         getter = name;
         value = core[name]();
         break;
@@ -27937,10 +28336,10 @@
         }
       }
     }
-    if (typeof core.getSupportedQualityList === "function") {
+    if (coreSupports(core, "getSupportedQualityList")) {
       collectQualityNumbers(core.getSupportedQualityList(), availableQns);
     }
-    if (typeof core.getQualityList === "function") {
+    if (coreSupports(core, "getQualityList")) {
       collectQualityNumbers(core.getQualityList("video"), availableQns);
     }
     return {
@@ -27953,7 +28352,7 @@
   function readMediaBitrate(core) {
     const getters = ["getMediaInfo", "getCurrentMediaInfo", "getQualityInfo"];
     for (const getter of getters) {
-      if (typeof core[getter] !== "function") {
+      if (!coreSupports(core, getter)) {
         continue;
       }
       const info = core[getter]();
@@ -28094,9 +28493,14 @@
       this.scriptPaused = false;
       this.scriptPauseEvent = false;
       this.startupComplete = false;
+      this.stableBufferSupported = true;
+      this.pausedSchedulingSupported = true;
+      this.coreEventsSupported = true;
+      this.ended = false;
       this.internalRateChange = false;
       this.qualityStatus = "读取当前画质";
       this.message = "";
+      this.policyMessage = "";
       this.mediaMetricsStartMilliseconds = 0;
       this.mediaMetricsBoundaryPending = true;
       this.started = false;
@@ -28145,14 +28549,19 @@
           return;
         }
         this.userPaused = false;
-        if (this.scriptPaused && this.currentCore !== void 0) {
+        if (this.scriptPaused && this.startupComplete && this.currentCore !== void 0) {
           const inventory = readForwardInventory(this.video, this.currentCore);
           const remaining = Number.isFinite(this.video.duration) ? Math.max(0, this.video.duration - this.video.currentTime) : Number.POSITIVE_INFINITY;
           const target = Math.min(this.config.startupBufferSeconds, remaining);
-          if (inventory < target) {
+          if (remaining > 30 && this.pausedSchedulingSupported && inventory < target) {
             this.pauseForRefill();
           }
         }
+      };
+      const onEnded = () => {
+        this.ended = true;
+        this.scriptPaused = false;
+        this.updateStatus();
       };
       const onError = () => {
         if (!this.enabled) {
@@ -28166,6 +28575,7 @@
       this.addVideoListener("ratechange", onRateChange);
       this.addVideoListener("pause", onPause);
       this.addVideoListener("play", onPlay);
+      this.addVideoListener("ended", onEnded);
       this.addVideoListener("error", onError);
     }
     addVideoListener(name, callback) {
@@ -28194,6 +28604,12 @@
           this.handleQuotaError(error);
         }
       };
+      const snapshotSupportsEvents = typeof core.supports === "function" ? core.supports("events") === true : core.capabilities?.core !== void 0 && Object.prototype.hasOwnProperty.call(core.capabilities.core, "events") ? core.capabilities.core.events === true : true;
+      this.coreEventsSupported = snapshotSupportsEvents;
+      if (!snapshotSupportsEvents) {
+        this.policyMessage = "当前内核没有错误事件能力，quota 仅依赖 video error";
+        return;
+      }
       if (typeof core.addEventListener === "function") {
         core.addEventListener("error", onCoreError);
         this.removeCoreErrorListener = () => core.removeEventListener("error", onCoreError);
@@ -28215,7 +28631,9 @@
         } else if (typeof core.off === "function") {
           this.removeCoreErrorListener = () => core.off("error", onCoreError);
         }
+        return;
       }
+      this.coreEventsSupported = false;
     }
     createQualityRequestIdentity(core, requestToken = this.qualitySessionToken, observationToken = this.qualityObservationToken) {
       return {
@@ -28267,6 +28685,7 @@
         if (source === "") {
           return;
         }
+        this.setPlaybackRate();
         const location2 = this.windowObject.location?.href || "";
         const sessionKey = logicalVideoSession(this.windowObject.location);
         const qualityNumber = currentQualityNumber(core);
@@ -28286,7 +28705,7 @@
             this.bufferPolicy.resetForNewSession();
             this.startupComplete = false;
           }
-          this.bufferPolicy.apply(core);
+          this.ended = false;
           if (coreChanged || sourceChanged) {
             this.replaceCoreErrorListener(core);
           }
@@ -28300,20 +28719,22 @@
           this.qualitySettledCore = void 0;
           this.qualitySettledSource = "";
           this.qualitySettledSession = "";
-          const requestIdentity = this.createQualityRequestIdentity(core);
-          await this.reconcileQuality(core, qualityNumber, requestIdentity);
-          if (!this.isQualityObservationCurrent(requestIdentity)) {
-            return;
-          }
-          this.setPlaybackRate();
+        }
+        const policyResult = this.bufferPolicy.apply(core);
+        this.stableBufferSupported = policyResult.stableBufferSupported;
+        this.pausedSchedulingSupported = policyResult.pausedSchedulingSupported;
+        const policyWarnings = [...policyResult.warnings];
+        if (!this.coreEventsSupported) {
+          policyWarnings.push("当前内核没有错误事件能力，quota 仅依赖 video error");
+        }
+        this.policyMessage = policyWarnings.join("；");
+        const requestIdentity = this.createQualityRequestIdentity(core);
+        await this.reconcileQuality(core, qualityNumber, requestIdentity);
+        if (!this.isQualityObservationCurrent(requestIdentity)) {
+          return;
+        }
+        if (rebuilt) {
           this.message = "";
-        } else {
-          const requestIdentity = this.createQualityRequestIdentity(core);
-          this.setPlaybackRate();
-          await this.reconcileQuality(core, qualityNumber, requestIdentity);
-          if (!this.isQualityObservationCurrent(requestIdentity)) {
-            return;
-          }
         }
         this.detectExternalBufferDowngrade(core);
         this.enforceStartupAndRefill(core);
@@ -28430,9 +28851,9 @@
         const after = readQualitySnapshot(core);
         if (before.qn === void 0) {
           const actual = after.qn === void 0 ? "未知" : `qn${after.qn}`;
-          this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，当前实际画质 ${actual}（${normalized.message}）`;
+          this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，当前实际画质 ${actual}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
         } else if (after.qn === before.qn) {
-          this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，保持原画质 qn${before.qn}（${normalized.message}）`;
+          this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，保持原画质 qn${before.qn}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
         } else {
           const restored = await this.restoreQuality(core, before.qn, requestIdentity);
           if (!this.isQualityObservationCurrent(requestIdentity)) {
@@ -28443,7 +28864,7 @@
             this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，已恢复原画质 qn${before.qn}（${normalized.message}）`;
           } else {
             const actual = current === void 0 ? "未知" : `qn${current}`;
-            this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，恢复原画质失败，当前实际画质 ${actual}（${normalized.message}）`;
+            this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，恢复原画质失败，当前实际画质 ${actual}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
           }
         }
         this.logger.warn("点播 qn64 未确认", normalized);
@@ -28501,14 +28922,12 @@
       if (this.userPaused) {
         return;
       }
+      if (remaining <= 30) {
+        return;
+      }
       if (!this.startupComplete) {
         if (inventory >= refillTarget) {
           this.startupComplete = true;
-          if (this.scriptPaused) {
-            this.attemptPlay();
-          }
-        } else if (!this.video.paused) {
-          this.pauseForRefill();
         }
         return;
       }
@@ -28518,8 +28937,10 @@
         }
         return;
       }
-      if (inventory < this.config.lowBufferSeconds && !this.video.paused) {
+      if (inventory < this.config.lowBufferSeconds && !this.video.paused && this.pausedSchedulingSupported) {
         this.pauseForRefill();
+      } else if (inventory < this.config.lowBufferSeconds && !this.pausedSchedulingSupported) {
+        this.policyMessage = "库存低于 30 秒，但内核不支持暂停时继续下载，保持播放";
       }
     }
     attemptPlay() {
@@ -28544,7 +28965,7 @@
         return;
       }
       for (const getter of ["getStableBufferTime", "getStableBufferSeconds"]) {
-        if (typeof core[getter] !== "function") {
+        if (!coreSupports(core, getter)) {
           continue;
         }
         const target = Number(core[getter]());
@@ -28615,7 +29036,8 @@
       } else if (thirty !== void 0 && sixty !== void 0 && this.message === BANDWIDTH_INSUFFICIENT_MESSAGE) {
         this.message = "";
       }
-      const state = this.userPaused ? "USER_PAUSED" : this.scriptPaused ? "REFILLING" : "VOD_READY";
+      const state = this.ended ? "ENDED" : this.userPaused ? "USER_PAUSED" : this.scriptPaused ? "REFILLING" : "VOD_READY";
+      const displayMessage = [this.message, this.policyMessage].filter(Boolean).join("；");
       this.panel.setModel({
         mode: "点播",
         state,
@@ -28624,7 +29046,7 @@
         quality: this.qualityStatus,
         speed: `${this.config.playbackRate}×`,
         multiplier,
-        message: this.message
+        message: displayMessage
       });
       this.panel.setAction("toggle", "停用", () => this.toggleEnabled());
       this.panel.setAction("skip-gap", "", () => {
@@ -28677,131 +29099,145 @@
   };
 
   // src/ui/panel.js
-  var PANEL_STYLE = `
-:host { all: initial; }
-.panel {
-  position: fixed;
-  z-index: 2147483647;
-  right: 16px;
-  bottom: 16px;
-  width: 270px;
-  padding: 12px;
-  border: 1px solid rgba(255, 255, 255, .18);
-  border-radius: 10px;
-  background: rgba(18, 24, 36, .96);
-  color: #f4f7fb;
-  box-shadow: 0 8px 30px rgba(0, 0, 0, .35);
-  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-.title { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-weight: 700; }
-.state { color: #8bd5ff; }
-.rows { display: grid; gap: 4px; }
-.row { display: flex; justify-content: space-between; gap: 12px; }
-.label { color: #aeb9c7; }
-.value { text-align: right; overflow-wrap: anywhere; }
-.message { margin-top: 8px; color: #ffd38b; }
-.actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-button {
-  border: 1px solid #5a6c83;
-  border-radius: 5px;
-  padding: 4px 7px;
-  background: #243247;
-  color: #fff;
-  cursor: pointer;
-  font: inherit;
-}
-button:hover { background: #30435e; }
-button[hidden] { display: none; }
-`;
-  function text(documentObject, value) {
-    return documentObject.createTextNode(value);
+  var STATUS_MESSAGE_VERSION = 1;
+  var ACTION_NAMES = Object.freeze(["toggle", "skip-gap", "return-live"]);
+  var DISPLAY_FIELDS = Object.freeze([
+    "mode",
+    "state",
+    "inventory",
+    "delay",
+    "quality",
+    "speed",
+    "multiplier",
+    "message",
+    "stage"
+  ]);
+  var nextSurfaceNumber = 1;
+  var currentSurface;
+  function createSurfaceId() {
+    const number = nextSurfaceNumber;
+    nextSurfaceNumber += 1;
+    return `surface-${Date.now().toString(36)}-${number.toString(36)}`;
+  }
+  function displayValue(value) {
+    return value === void 0 || value === null || value === "" ? "未提供" : String(value);
+  }
+  function emptyModel(mode) {
+    return {
+      mode,
+      state: "未提供",
+      inventory: "未提供",
+      delay: "未提供",
+      quality: "未提供",
+      speed: "未提供",
+      multiplier: "未提供",
+      message: "未提供",
+      stage: "未提供"
+    };
   }
   var StatusPanel = class {
-    constructor(documentObject, mode, actions = {}) {
-      this.documentObject = documentObject;
-      this.actions = actions;
-      this.host = documentObject.createElement("div");
-      this.host.dataset.bilibiliBufferPanel = "true";
-      this.shadow = this.host.attachShadow({ mode: "open" });
-      const style = documentObject.createElement("style");
-      style.textContent = PANEL_STYLE;
-      this.shadow.append(style);
-      this.panel = documentObject.createElement("section");
-      this.panel.className = "panel";
-      this.shadow.append(this.panel);
-      this.rows = /* @__PURE__ */ new Map();
-      this.message = documentObject.createElement("div");
-      this.message.className = "message";
-      this.actionsElement = documentObject.createElement("div");
-      this.actionsElement.className = "actions";
-      this.createContents(mode);
-      documentObject.documentElement.append(this.host);
-    }
-    createContents(mode) {
-      const title = this.documentObject.createElement("div");
-      title.className = "title";
-      title.append(text(this.documentObject, "Bilibili 抗卡"));
-      this.stateElement = this.documentObject.createElement("span");
-      this.stateElement.className = "state";
-      title.append(this.stateElement);
-      this.panel.append(title);
-      for (const [key, label] of [
-        ["mode", "模式"],
-        ["inventory", "连续库存"],
-        ["delay", "估算延迟"],
-        ["quality", "画质"],
-        ["speed", "速度"],
-        ["multiplier", "下载倍率"]
-      ]) {
-        const row = this.documentObject.createElement("div");
-        row.className = "row";
-        row.dataset.field = key;
-        const labelElement = this.documentObject.createElement("span");
-        labelElement.className = "label";
-        labelElement.append(text(this.documentObject, label));
-        const valueElement = this.documentObject.createElement("span");
-        valueElement.className = "value";
-        row.append(labelElement, valueElement);
-        this.rows.set(key, valueElement);
-        this.panel.append(row);
+    constructor(_documentObject, mode, actions = {}) {
+      if (typeof mode !== "string" || mode.length === 0) {
+        fail("UI_MODE_INVALID", "状态 surface 缺少模式");
       }
-      this.rows.get("mode").textContent = mode;
-      this.panel.append(this.message, this.actionsElement);
+      this.surfaceId = createSurfaceId();
+      this.model = emptyModel(mode);
+      this.actions = /* @__PURE__ */ new Map();
+      this.destroyed = false;
+      this.boundTabId = void 0;
+      for (const [name, action] of Object.entries(actions)) {
+        this.setAction(name, action.label, action.callback, action.visible !== false);
+      }
+      currentSurface = this;
     }
     setAction(name, label, callback, visible = true) {
-      let button = this.actionsElement.querySelector(`[data-action="${name}"]`);
-      if (button === null) {
-        button = this.documentObject.createElement("button");
-        button.dataset.action = name;
-        button.addEventListener("click", () => callback());
-        this.actionsElement.append(button);
+      if (this.destroyed) {
+        fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
       }
-      button.textContent = label;
-      button.hidden = !visible;
-      this.host.dataset[`action${name.replace(/(^|-)([a-z])/g, (_match, _prefix, character) => character.toUpperCase())}`] = visible ? "visible" : "hidden";
+      if (!ACTION_NAMES.includes(name)) {
+        fail("UI_ACTION_UNKNOWN", `状态动作未允许: ${name}`);
+      }
+      if (typeof callback !== "function") {
+        fail("UI_ACTION_CALLBACK_INVALID", `状态动作 ${name} 缺少 callback`);
+      }
+      this.actions.set(name, { label: displayValue(label), callback, visible: visible === true });
     }
     setModel(model) {
-      this.stateElement.textContent = model.state || "";
-      for (const [key, value] of Object.entries(model)) {
-        const element = this.rows.get(key);
-        if (element !== void 0) {
-          element.textContent = value === void 0 ? "未提供" : String(value);
+      if (this.destroyed) {
+        fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
+      }
+      for (const field of DISPLAY_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(model, field)) {
+          this.model[field] = displayValue(model[field]);
         }
       }
-      this.message.textContent = model.message || "";
     }
     setMessage(message) {
-      this.message.textContent = message;
+      this.setModel({ message });
+    }
+    bindTab(tabId) {
+      if (!Number.isInteger(tabId) || tabId <= 0) {
+        fail("UI_TAB_INVALID", "状态 surface 的 tab id 无效");
+      }
+      if (this.boundTabId !== void 0 && this.boundTabId !== tabId) {
+        fail("UI_TAB_MISMATCH", "状态 surface 不属于请求 tab");
+      }
+      this.boundTabId = tabId;
+    }
+    getSnapshot() {
+      if (this.destroyed) {
+        fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
+      }
+      const actions = {};
+      for (const [name, action] of this.actions) {
+        if (action.visible) {
+          actions[name] = action.label;
+        }
+      }
+      return {
+        version: STATUS_MESSAGE_VERSION,
+        surfaceId: this.surfaceId,
+        ...Object.fromEntries(DISPLAY_FIELDS.map((field) => [field, displayValue(this.model[field])])),
+        actions
+      };
+    }
+    runAction(name) {
+      if (this.destroyed) {
+        fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
+      }
+      if (!ACTION_NAMES.includes(name)) {
+        fail("UI_ACTION_UNKNOWN", `状态动作未允许: ${name}`);
+      }
+      const action = this.actions.get(name);
+      if (action === void 0 || !action.visible) {
+        fail("UI_ACTION_NOT_VISIBLE", `状态动作当前不可见: ${name}`);
+      }
+      return action.callback();
     }
     destroy() {
-      this.host.remove();
+      if (this.destroyed) {
+        return;
+      }
+      this.destroyed = true;
+      this.actions.clear();
+      if (currentSurface === this) {
+        currentSurface = void 0;
+      }
     }
   };
   function createStatusPanel(documentObject, mode, actions) {
-    if (documentObject.querySelector('[data-bilibili-buffer-panel="true"]') !== null) {
-      fail("UI_DUPLICATE_PANEL", "页面已经存在抗卡面板");
-    }
     return new StatusPanel(documentObject, mode, actions);
+  }
+  function getCurrentStatusSurface() {
+    return currentSurface;
+  }
+  function createUnavailableStatusSnapshot() {
+    return {
+      version: STATUS_MESSAGE_VERSION,
+      surfaceId: "surface-unavailable",
+      ...Object.fromEntries(DISPLAY_FIELDS.map((field) => [field, "未提供"])),
+      actions: {}
+    };
   }
 
   // src/extension/bridge-contract.js
@@ -28821,8 +29257,10 @@ button[hidden] { display: none; }
   var BRIDGE_PLAYER_METHODS = Object.freeze([
     "setAutoSyncProgressCfg",
     "setAutoDiscardFrameCfg",
-    "pause"
+    "pause",
+    "requestQuality"
   ]);
+  var BRIDGE_PLAYER_CAPABILITIES = Object.freeze([...BRIDGE_PLAYER_METHODS]);
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze([
     "getQuality",
     "getCurrentQuality",
@@ -28879,7 +29317,8 @@ button[hidden] { display: none; }
     "bufferedRanges",
     "mediaInfo",
     "stableBufferTime",
-    "supportsCoreEvents"
+    "supportsCoreEvents",
+    "capabilities"
   ]);
   function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -28919,6 +29358,37 @@ button[hidden] { display: none; }
     }
     if (typeof snapshot.supportsCoreEvents !== "boolean") {
       fail("BRIDGE_SNAPSHOT_INVALID", "桥接内核快照缺少事件能力标记");
+    }
+    const playerCapabilities = snapshot.capabilities?.player;
+    const coreCapabilities = snapshot.capabilities?.core;
+    if (!isObject(snapshot.capabilities) || !isObject(playerCapabilities) || !isObject(coreCapabilities)) {
+      fail("BRIDGE_SNAPSHOT_INVALID", "桥接内核快照缺少真实能力标记");
+    }
+    for (const field of BRIDGE_PLAYER_CAPABILITIES) {
+      if (typeof playerCapabilities[field] !== "boolean") {
+        fail("BRIDGE_SNAPSHOT_INVALID", `桥接内核快照缺少页面播放器能力标记: ${field}`);
+      }
+    }
+    for (const field of [
+      "getQuality",
+      "getCurrentQuality",
+      "getCurrentQn",
+      "getSupportedQualityList",
+      "getQualityList",
+      "requestQuality",
+      "getBufferedRanges",
+      "getMediaInfo",
+      "getCurrentMediaInfo",
+      "getQualityInfo",
+      "getStableBufferTime",
+      "getStableBufferSeconds",
+      "setStableBufferTime",
+      "setScheduleWhilePaused",
+      "events"
+    ]) {
+      if (typeof coreCapabilities[field] !== "boolean") {
+        fail("BRIDGE_SNAPSHOT_INVALID", `桥接内核快照缺少能力标记: ${field}`);
+      }
     }
     for (const [field, value] of Object.entries(snapshot)) {
       if (!CORE_SNAPSHOT_FIELDS.includes(field) || !isSerializable(value)) {
@@ -28965,6 +29435,12 @@ button[hidden] { display: none; }
   }
   function responseError(response) {
     return new BufferScriptError(response.error?.code || "BRIDGE_CALL_FAILED", response.error?.message || "桥接调用失败");
+  }
+  function remapUnavailable(error, code, message) {
+    if (error?.code === "BRIDGE_METHOD_UNAVAILABLE") {
+      fail(code, message, error);
+    }
+    throw error;
   }
   var BridgeClient = class {
     constructor(documentObject = document, runtimeObject = globalThis) {
@@ -29152,6 +29628,13 @@ button[hidden] { display: none; }
         fail("BRIDGE_CORE_STALE", `桥接内核 ${this.coreId} 已过期`);
       }
     }
+    supports(method) {
+      this.assertActive();
+      if (method === "events") {
+        return this.snapshot.capabilities.core.events;
+      }
+      return this.snapshot.capabilities.core[method] === true;
+    }
     markStale() {
       if (this.stale) {
         return;
@@ -29180,6 +29663,9 @@ button[hidden] { display: none; }
     readFirstAvailable(methods, snapshotField, args = []) {
       let unavailable;
       for (const method of methods) {
+        if (!this.supports(method)) {
+          continue;
+        }
         try {
           const value = this.callCoreSync(method, args);
           this.snapshot[snapshotField] = value;
@@ -29221,15 +29707,33 @@ button[hidden] { display: none; }
       return this.readFirstAvailable(["getStableBufferTime", "getStableBufferSeconds"], "stableBufferTime");
     }
     setStableBufferTime(seconds) {
-      const result = this.callCoreSync("setStableBufferTime", [seconds]);
+      if (!this.supports("setStableBufferTime")) {
+        fail("VOD_STABLE_BUFFER_UNAVAILABLE", "点播内核没有稳定缓冲设置能力");
+      }
+      let result;
+      try {
+        result = this.callCoreSync("setStableBufferTime", [seconds]);
+      } catch (error) {
+        remapUnavailable(error, "VOD_STABLE_BUFFER_UNAVAILABLE", "点播内核没有稳定缓冲设置能力");
+      }
       this.snapshot.stableBufferTime = seconds;
       return result;
     }
     setScheduleWhilePaused(enabled) {
-      return this.callCoreSync("setScheduleWhilePaused", [enabled]);
+      if (!this.supports("setScheduleWhilePaused")) {
+        fail("VOD_PAUSED_SCHEDULE_UNAVAILABLE", "点播内核没有暂停时继续调度能力");
+      }
+      try {
+        return this.callCoreSync("setScheduleWhilePaused", [enabled]);
+      } catch (error) {
+        remapUnavailable(error, "VOD_PAUSED_SCHEDULE_UNAVAILABLE", "点播内核没有暂停时继续调度能力");
+      }
     }
     requestQuality(qualityNumber) {
       this.assertActive();
+      if (!this.supports("requestQuality")) {
+        fail("VOD_QUALITY_UNAVAILABLE", "当前播放器内核没有权限感知的画质请求能力");
+      }
       const source = this.snapshot.source;
       return this.client.callAsync("callCoreAsync", [this.coreId, "requestQuality", [qualityNumber]]).then((value) => {
         if (value?.snapshot !== void 0) {
@@ -29242,6 +29746,9 @@ button[hidden] { display: none; }
         }
         return value?.result === void 0 ? value : value.result;
       }).catch((error) => {
+        if (error?.code === "BRIDGE_METHOD_UNAVAILABLE") {
+          fail("VOD_QUALITY_UNAVAILABLE", "当前播放器内核没有权限感知的画质请求能力", error);
+        }
         if (error?.code === "BRIDGE_CORE_STALE") {
           this.markStale();
         }
@@ -29250,7 +29757,15 @@ button[hidden] { display: none; }
     }
     addEventListener(name, callback) {
       this.assertActive();
-      const subscriptionId = this.client.subscribeCore(this.coreId, name, this.snapshot.source, callback);
+      if (!this.supports("events")) {
+        fail("VOD_CORE_EVENTS_UNAVAILABLE", "当前播放器内核没有事件能力");
+      }
+      let subscriptionId;
+      try {
+        subscriptionId = this.client.subscribeCore(this.coreId, name, this.snapshot.source, callback);
+      } catch (error) {
+        remapUnavailable(error, "VOD_CORE_EVENTS_UNAVAILABLE", "当前播放器内核没有事件能力");
+      }
       this.subscriptions.set(callback, subscriptionId);
     }
     removeEventListener(name, callback) {
@@ -29266,6 +29781,7 @@ button[hidden] { display: none; }
   };
   function createPageWindowAdapter(client, windowObject = window) {
     const state = { core: void 0 };
+    let playerCapabilities = Object.fromEntries(BRIDGE_PLAYER_CAPABILITIES.map((method) => [method, false]));
     let refreshPromise;
     const player = {
       __core() {
@@ -29282,6 +29798,21 @@ button[hidden] { display: none; }
       },
       pause() {
         return client.callAsync("callPlayer", ["pause"]);
+      },
+      requestQuality(qualityNumber) {
+        if (!Number.isInteger(qualityNumber) || qualityNumber <= 0) {
+          fail("VOD_QUALITY_ARGUMENT_INVALID", "页面播放器画质请求必须是正整数");
+        }
+        return client.callAsync("callPlayer", ["requestQuality", qualityNumber]).then((value) => value?.result === void 0 ? value : value.result);
+      },
+      supports(method) {
+        if (!BRIDGE_PLAYER_CAPABILITIES.includes(method)) {
+          fail("BRIDGE_CAPABILITY_UNKNOWN", `页面播放器能力未定义: ${method}`);
+        }
+        return playerCapabilities[method] === true;
+      },
+      get capabilities() {
+        return { ...playerCapabilities };
       }
     };
     const pageWindow = {
@@ -29297,6 +29828,7 @@ button[hidden] { display: none; }
         if (refreshPromise === void 0) {
           refreshPromise = client.callAsync("getCoreSnapshot", []).then((snapshot) => {
             validateCoreSnapshot(snapshot);
+            playerCapabilities = snapshot.capabilities.player;
             if (state.core === void 0 || state.core.stale || state.core.coreId !== snapshot.coreId || state.core.snapshot.source !== snapshot.source) {
               state.core?.markStale();
               state.core = new BridgeCore(client, snapshot);
@@ -29356,11 +29888,70 @@ button[hidden] { display: none; }
       quality: "未提供",
       speed: "未提供",
       multiplier: "未提供",
+      stage: "启动失败",
       message: `${normalized.code}: ${normalized.message}`
     });
   }
   function readPreferences(storage) {
     return storage.get([EXTENSION_PREFERENCES.liveEnabled, EXTENSION_PREFERENCES.vodEnabled]);
+  }
+  function popupError(error) {
+    return {
+      code: typeof error?.code === "string" ? error.code : "POPUP_REQUEST_FAILED",
+      message: error?.message || String(error)
+    };
+  }
+  function assertPopupMessage(message) {
+    if (message === null || typeof message !== "object" || Array.isArray(message)) {
+      throw Object.assign(new Error("popup 消息必须是对象"), { code: "POPUP_MESSAGE_INVALID" });
+    }
+    if (message.version !== STATUS_MESSAGE_VERSION) {
+      throw Object.assign(new Error(`popup 消息版本不支持: ${message.version}`), { code: "POPUP_VERSION_UNSUPPORTED" });
+    }
+    if (message.type !== "status:get" && message.type !== "action:run") {
+      throw Object.assign(new Error(`popup 消息类型未允许: ${message.type}`), { code: "POPUP_MESSAGE_INVALID" });
+    }
+    return message;
+  }
+  async function handlePopupMessage(message, sender) {
+    const request2 = assertPopupMessage(message);
+    const senderTabId = sender?.tab?.id;
+    if (request2.tabId !== void 0 && request2.tabId !== senderTabId) {
+      throw Object.assign(new Error("popup 请求 tab 与消息来源不匹配"), { code: "POPUP_TAB_MISMATCH" });
+    }
+    const surface = getCurrentStatusSurface();
+    if (request2.type === "status:get") {
+      if (surface === void 0) {
+        return createUnavailableStatusSnapshot();
+      }
+      if (senderTabId !== void 0) {
+        surface.bindTab(senderTabId);
+      }
+      return surface.getSnapshot();
+    }
+    if (surface === void 0) {
+      throw Object.assign(new Error("当前 tab 没有活动状态 surface"), { code: "POPUP_SURFACE_UNAVAILABLE" });
+    }
+    if (senderTabId !== void 0) {
+      surface.bindTab(senderTabId);
+    }
+    if (request2.surfaceId !== surface.surfaceId) {
+      throw Object.assign(new Error("popup 动作属于过期状态 surface"), { code: "POPUP_SURFACE_STALE" });
+    }
+    if (typeof request2.action !== "string") {
+      throw Object.assign(new Error("popup 动作名称无效"), { code: "POPUP_ACTION_INVALID" });
+    }
+    await surface.runAction(request2.action);
+    return { version: STATUS_MESSAGE_VERSION, ok: true, snapshot: surface.getSnapshot() };
+  }
+  function installPopupMessageHandler(runtimeObject = chrome.runtime) {
+    if (runtimeObject?.onMessage === void 0 || typeof runtimeObject.onMessage.addListener !== "function") {
+      throw new Error("Chrome runtime message API 不可用");
+    }
+    runtimeObject.onMessage.addListener((message, sender, sendResponse) => {
+      void handlePopupMessage(message, sender).then((response) => sendResponse(response)).catch((error) => sendResponse({ version: STATUS_MESSAGE_VERSION, ok: false, error: popupError(error) }));
+      return true;
+    });
   }
   var ExtensionCoordinator = class {
     constructor({
@@ -29443,6 +30034,7 @@ button[hidden] { display: none; }
       panel.setModel({
         mode: mode === "live" ? "直播" : "点播",
         state: "STARTING",
+        stage: "等待 video",
         message: `版本 ${VERSION} 正在启动`
       });
       const routeStillCurrent = () => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location);
@@ -29461,6 +30053,7 @@ button[hidden] { display: none; }
           return;
         }
         this.active.video = video;
+        panel.setModel({ stage: "配置播放器", message: "video 已就绪，正在配置播放器" });
         const pageAdapter = createPageWindowAdapter(this.bridgeClient, this.windowObject);
         if (mode === "live") {
           const controller = new LiveController({
@@ -29547,6 +30140,7 @@ button[hidden] { display: none; }
       this.bridgeClient.destroy();
     }
   };
+  installPopupMessageHandler();
   var coordinator = new ExtensionCoordinator();
   void coordinator.start().catch((error) => console.error("[BilibiliBuffer] 扩展启动失败", error));
 })();

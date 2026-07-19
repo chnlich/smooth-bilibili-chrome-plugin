@@ -15,11 +15,11 @@ import { assertSameLiveSession, renewLiveTrack, extractLiveTrack } from '../src/
 import { LiveController, waitForVideo } from '../src/live/controller.js';
 import { DanmakuVisibilityController } from '../src/live/danmaku.js';
 import { installLivePlaybackGuard } from '../src/live/guard.js';
-import { MseAppendPipeline } from '../src/live/mse.js';
+import { MseAppendPipeline, validateInitSegmentTracks } from '../src/live/mse.js';
 import { OrderedSegmentQueue } from '../src/live/queue.js';
 import { LiveStateMachine } from '../src/live/state.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
-import { VodBufferPolicy, readQualitySnapshot } from '../src/vod/policy.js';
+import { VodBufferPolicy, callQualityMethod, readQualitySnapshot } from '../src/vod/policy.js';
 import { VodController } from '../src/vod/controller.js';
 
 const MEDIA_URL = 'https://cdn-a.example/live/index.m3u8?expires=123&sign=abc';
@@ -40,13 +40,39 @@ function response(status, body, headers = {}) {
   return new Response(body, { status, headers });
 }
 
+function makeBox(type, payload = new Uint8Array()) {
+  const bytes = new Uint8Array(8 + payload.byteLength);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, bytes.byteLength, false);
+  bytes.set([...type].map((character) => character.charCodeAt(0)), 4);
+  bytes.set(payload, 8);
+  return bytes;
+}
+
+function makeMuxedInitSegment() {
+  const handlerBox = (handler) => {
+    const payload = new Uint8Array(12);
+    payload.set([...handler].map((character) => character.charCodeAt(0)), 8);
+    return makeBox('hdlr', payload);
+  };
+  const videoTrack = makeBox('trak', makeBox('mdia', handlerBox('vide')));
+  const audioTrack = makeBox('trak', makeBox('mdia', handlerBox('soun')));
+  const moov = makeBox('moov', new Uint8Array([...videoTrack, ...audioTrack]));
+  return new Uint8Array([...makeBox('ftyp', new Uint8Array(4)), ...moov]).buffer;
+}
+
+const VALID_INIT_SEGMENT = makeMuxedInitSegment();
+
 function createTrack(session = 'session-1') {
   return {
     roomId: 6363772,
     requestedQualityNumber: 10000,
     qualityNumber: 250,
+    qualityDescription: '高清 720P',
     formatName: 'fmp4',
     codecName: 'avc',
+    videoCodecString: 'avc1.4d401f',
+    audioCodecString: 'mp4a.40.2',
     codecString: 'avc1.4d401f, mp4a.40.2',
     session,
     baseUrl: '/live/index.m3u8?',
@@ -87,6 +113,7 @@ function createPayload(session = 'session-1') {
                         { host: 'https://cdn-b.example', extra: 'expires=1&sign=b' },
                       ],
                       session,
+                      description: '高清 720P',
                       video_codecs: { base: 'avc1.4d401f' },
                       audio_codecs: { base: 'mp4a.40.2' },
                     },
@@ -148,7 +175,21 @@ function createLiveVideo({ forwardInventory = 0, asyncPause = false } = {}) {
   };
 }
 
-function createLiveController({ video = createLiveVideo(), fetchImpl } = {}) {
+function createLiveController({ video = createLiveVideo(), fetchImpl, runtimeObject: suppliedRuntime } = {}) {
+  const runtimeObject = suppliedRuntime || {
+    MediaSource: globalThis.MediaSource,
+    URL: globalThis.URL,
+    setInterval: () => 1,
+    clearInterval() {},
+    setTimeout(callback, milliseconds) {
+      const timer = setTimeout(callback, milliseconds);
+      timer.unref?.();
+      return timer;
+    },
+    clearTimeout(timer) {
+      clearTimeout(timer);
+    },
+  };
   const controller = new LiveController({
     windowObject: { setInterval: () => 1, clearInterval() {} },
     documentObject: { querySelectorAll: () => [] },
@@ -159,6 +200,7 @@ function createLiveController({ video = createLiveVideo(), fetchImpl } = {}) {
     fetchImpl: fetchImpl || (async () => {
       throw new Error('unexpected fetch');
     }),
+    runtimeObject,
     logger: { warn() {}, error() {} },
   });
   controller.pipeline.assertOwnsVideoSource = () => {};
@@ -213,11 +255,20 @@ function createStartupRuntime(appendState) {
       return 1;
     },
     clearInterval() {},
+    setTimeout(callback, milliseconds) {
+      const timer = setTimeout(callback, milliseconds);
+      timer.unref?.();
+      return timer;
+    },
+    clearTimeout(timer) {
+      clearTimeout(timer);
+    },
   };
 }
 
 function createStartupController(fetchImpl, appendState = { failAppend: false }) {
   const actions = new Map();
+  const stages = [];
   const controller = new LiveController({
     windowObject: {
       player: {
@@ -229,7 +280,11 @@ function createStartupController(fetchImpl, appendState = { failAppend: false })
     documentObject: { documentElement: null, querySelectorAll: () => [] },
     video: createLiveVideo(),
     panel: {
-      setModel() {},
+      setModel(model) {
+        if (model.stage !== undefined) {
+          stages.push(model.stage);
+        }
+      },
       setMessage() {},
       setAction(name, _label, _callback, visible) {
         actions.set(name, visible);
@@ -243,7 +298,7 @@ function createStartupController(fetchImpl, appendState = { failAppend: false })
     config: { ...LIVE_CONFIG, requestTimeoutMilliseconds: 100, retryBackoffMilliseconds: [0] },
   });
   controller.scheduleDownloads = () => {};
-  return { controller, actions, appendState };
+  return { controller, actions, appendState, stages };
 }
 
 test('manifest parser retains media sequence, init map, and signed query parameters', () => {
@@ -572,7 +627,7 @@ test('LiveController.start renews an expired initial manifest before opening the
     if (parsed.pathname.endsWith('.m3u8')) {
       return response(200, MEDIA_TEXT);
     }
-    return response(200, parsed.pathname.endsWith('init.mp4') ? 'init' : 'segment');
+    return response(200, parsed.pathname.endsWith('init.mp4') ? VALID_INIT_SEGMENT : 'segment');
   });
 
   await controller.start();
@@ -592,8 +647,8 @@ test('LiveController starts without errors while synthetic page-player bridge ca
     if (url.includes('getRoomPlayInfo')) {
       return response(200, JSON.stringify(createPayload()));
     }
-    if (url.endsWith('init.mp4')) {
-      return response(200, 'init');
+    if (new URL(url).pathname.endsWith('init.mp4')) {
+      return response(200, VALID_INIT_SEGMENT);
     }
     return response(200, url.endsWith('.m3u8?expires=1&sign=a') ? MEDIA_TEXT : 'segment');
   });
@@ -614,6 +669,25 @@ test('LiveController starts without errors while synthetic page-player bridge ca
   controller.destroy();
 });
 
+test('live startup reports each bounded controller stage through the status surface', async () => {
+  const { controller, stages } = createStartupController(async (url) => {
+    if (url.includes('getRoomPlayInfo')) {
+      return response(200, JSON.stringify(createPayload()));
+    }
+    if (new URL(url).pathname.endsWith('init.mp4')) {
+      return response(200, VALID_INIT_SEGMENT);
+    }
+    return response(200, MEDIA_TEXT);
+  });
+
+  await controller.start();
+
+  for (const stage of ['配置播放器', '播放信息', 'manifest', 'MSE', 'init', '库存形成']) {
+    assert.ok(stages.includes(stage), `missing live startup stage ${stage}`);
+  }
+  controller.destroy();
+});
+
 test('initial all-CDN manifest 404 enters GAP with actions and manual return can rebuild', async () => {
   let manifestAvailable = false;
   const { controller, actions } = createStartupController(async (url) => {
@@ -623,7 +697,7 @@ test('initial all-CDN manifest 404 enters GAP with actions and manual return can
     if (url.endsWith('.m3u8?expires=1&sign=a') || url.endsWith('.m3u8?expires=1&sign=b')) {
       return manifestAvailable ? response(200, MEDIA_TEXT) : response(404, 'missing');
     }
-    return response(200, url.endsWith('init.mp4') ? 'init' : 'segment');
+    return response(200, new URL(url).pathname.endsWith('init.mp4') ? VALID_INIT_SEGMENT : 'segment');
   });
 
   await controller.start();
@@ -649,7 +723,7 @@ test('initial init append failure enters GAP with actions and manual return can 
     if (url.endsWith('.m3u8?expires=1&sign=a') || url.endsWith('.m3u8?expires=1&sign=b')) {
       return response(200, MEDIA_TEXT);
     }
-    return response(200, url.endsWith('init.mp4') ? 'init' : 'segment');
+    return response(200, new URL(url).pathname.endsWith('init.mp4') ? VALID_INIT_SEGMENT : 'segment');
   }, appendState);
 
   await controller.start();
@@ -1446,6 +1520,126 @@ test('MSE pipeline accepts a cross-realm ArrayBuffer and detects source ownershi
   pipeline.close();
 });
 
+test('live fMP4 init validation requires both video and audio track declarations', () => {
+  assert.deepEqual(validateInitSegmentTracks(VALID_INIT_SEGMENT), { video: true, audio: true });
+  const handlerBox = (handler) => {
+    const payload = new Uint8Array(12);
+    payload.set([...handler].map((character) => character.charCodeAt(0)), 8);
+    return makeBox('hdlr', payload);
+  };
+  const videoOnly = new Uint8Array([
+    ...makeBox('ftyp', new Uint8Array(4)),
+    ...makeBox('moov', makeBox('trak', makeBox('mdia', handlerBox('vide')))),
+  ]).buffer;
+  const audioOnly = new Uint8Array([
+    ...makeBox('ftyp', new Uint8Array(4)),
+    ...makeBox('moov', makeBox('trak', makeBox('mdia', handlerBox('soun')))),
+  ]).buffer;
+  assert.throws(
+    () => validateInitSegmentTracks(videoOnly),
+    (error) => error.code === 'LIVE_AUDIO_TRACK_MISSING',
+  );
+  assert.throws(
+    () => validateInitSegmentTracks(audioOnly),
+    (error) => error.code === 'LIVE_VIDEO_TRACK_MISSING',
+  );
+});
+
+test('MSE sourceopen waits are bounded and report a product timeout', async () => {
+  class ClosedMediaSource extends EventTarget {
+    static isTypeSupported() {
+      return true;
+    }
+
+    constructor() {
+      super();
+      this.readyState = 'closed';
+    }
+  }
+  const video = { src: '', currentSrc: '' };
+  const pipeline = new MseAppendPipeline(
+    video,
+    ClosedMediaSource,
+    { createObjectURL: () => 'blob:timeout', revokeObjectURL() {} },
+    { setTimeout, clearTimeout },
+    5,
+  );
+  await assert.rejects(
+    pipeline.open('video/mp4; codecs="avc1.4d401f, mp4a.40.2"'),
+    (error) => error.code === 'MSE_WAIT_TIMEOUT',
+  );
+  pipeline.close();
+});
+
+test('live zero-inventory watchdog is one absolute 45-second timer and cancels on inventory or generation change', () => {
+  let nextTimer = 1;
+  const timers = new Map();
+  const cleared = [];
+  const runtime = {
+    MediaSource: globalThis.MediaSource,
+    URL: globalThis.URL,
+    setInterval: () => 1,
+    clearInterval() {},
+    setTimeout(callback, milliseconds) {
+      const id = nextTimer;
+      nextTimer += 1;
+      timers.set(id, { callback, milliseconds });
+      return id;
+    },
+    clearTimeout(id) {
+      cleared.push(id);
+      timers.delete(id);
+    },
+  };
+  const { controller } = createLiveController({ runtimeObject: runtime });
+  controller.starting = true;
+  controller.track = createTrack();
+  controller.stage = 'init';
+  controller.readInventory = () => 0;
+  controller.startZeroInventoryWatchdog(0);
+  assert.equal(timers.size, 1);
+  const first = [...timers.entries()][0];
+  assert.equal(first[1].milliseconds, LIVE_CONFIG.zeroInventoryWatchdogMilliseconds);
+  controller.readInventory = () => 1;
+  controller.refreshZeroInventoryWatchdog();
+  assert.deepEqual(cleared, [first[0]]);
+  assert.equal(controller.stateMachine.state, LIVE_STATE.LIVE);
+
+  controller.starting = true;
+  controller.readInventory = () => 0;
+  controller.startZeroInventoryWatchdog(controller.generation);
+  const stale = [...timers.entries()][0][1].callback;
+  controller.beginNewGeneration();
+  stale();
+  assert.notEqual(controller.stateMachine.state, LIVE_STATE.GAP_UNRECOVERABLE);
+  assert.equal(timers.size, 0);
+  controller.destroy();
+});
+
+test('live delay remains unknown without an anchor and uses program-date-time when present', () => {
+  const { controller, video } = createLiveController();
+  controller.liveEdge = { sn: 100, duration: 2, programDateTime: 6000 };
+  video.currentTime = 1;
+  controller.timelineOriginMilliseconds = undefined;
+  controller.readInventory = () => 0;
+  assert.equal(controller.estimateDelay(), undefined);
+  controller.timelineOriginMilliseconds = 1000;
+  assert.equal(controller.estimateDelay(), 6);
+  controller.destroy();
+});
+
+test('live metrics use completed request windows and show inventory-full instead of a fake realtime value', () => {
+  const now = Date.now();
+  const { controller } = createLiveController();
+  controller.requestMetrics = [
+    { kind: 'segment', byteLength: 1000, mediaDuration: 10, completedAtMilliseconds: now - 500 },
+    { kind: 'segment', byteLength: 500, mediaDuration: 20, completedAtMilliseconds: now - 31000 },
+  ];
+  assert.equal(controller.liveMultiplier(60), '库存已满');
+  assert.equal(controller.liveMultiplier(20), '30 秒 0.33× / 60 秒 0.50×');
+  controller.destroy();
+});
+
 test('ordered queue accepts a cross-realm ArrayBuffer from the sandbox fetch realm', () => {
   const queue = new OrderedSegmentQueue();
   const manifest = parseHlsPlaylist(MEDIA_TEXT, MEDIA_URL);
@@ -1481,10 +1675,44 @@ test('VOD policy applies each core once and degrades quota exactly 180 to 120 to
     ['stable', 180],
     ['paused', true],
     ['stable', 120],
-    ['paused', true],
     ['stable', 90],
-    ['paused', true],
   ]);
+});
+
+test('VOD quality chooses capability flags over proxy method existence and prefers core', async () => {
+  const calls = [];
+  const player = {
+    requestQuality() {
+      calls.push('player');
+    },
+    supports: () => true,
+  };
+  const core = {
+    requestQuality() {
+      calls.push('core');
+      return Promise.resolve(true);
+    },
+    supports: (method) => method === 'requestQuality',
+  };
+  await callQualityMethod(player, core, 64);
+  assert.deepEqual(calls, ['core']);
+
+  const coreWithoutRequest = {
+    requestQuality() {
+      calls.push('hidden-core');
+    },
+    supports: () => false,
+  };
+  await callQualityMethod(player, coreWithoutRequest, 64);
+  assert.deepEqual(calls, ['core', 'player']);
+  await assert.rejects(
+    callQualityMethod({ requestQuality() {}, supports: () => false }, coreWithoutRequest, 64),
+    (error) => error.code === 'VOD_QUALITY_UNAVAILABLE',
+  );
+  await assert.rejects(
+    callQualityMethod(player, core, 0),
+    (error) => error.code === 'VOD_QUALITY_ARGUMENT_INVALID',
+  );
 });
 
 test('VOD waits for a nonempty currentSrc or src before binding policy and requesting qn64', async () => {
@@ -1720,9 +1948,50 @@ test('VOD panel disable records a manual play as active intent without enforcing
   actions.get('toggle').callback();
   controller.enforceStartupAndRefill({});
   assert.equal(controller.enabled, true);
-  assert.equal(video.pauseCalls, 2);
+  assert.equal(video.pauseCalls, 1);
   assert.equal(controller.userPaused, false);
   controller.destroy();
+});
+
+test('VOD initial 0, 5, and 20 second inventories remain playing at 2x', () => {
+  for (const inventory of [0, 5, 20]) {
+    const listeners = new Map();
+    const video = {
+      currentTime: 0,
+      duration: 600,
+      paused: false,
+      playbackRate: 1,
+      pauseCalls: 0,
+      buffered: { length: inventory > 0 ? 1 : 0, start: () => 0, end: () => inventory },
+      addEventListener(name, callback) {
+        listeners.set(name, callback);
+      },
+      removeEventListener() {},
+      pause() {
+        this.pauseCalls += 1;
+        this.paused = true;
+        listeners.get('pause')?.();
+      },
+      play() {
+        this.paused = false;
+        listeners.get('play')?.();
+        return Promise.resolve();
+      },
+    };
+    const controller = new VodController({
+      windowObject: {},
+      documentObject: {},
+      video,
+      panel: { setModel() {}, setAction() {} },
+    });
+    controller.installVideoGuards();
+    controller.setPlaybackRate();
+    controller.enforceStartupAndRefill({});
+    assert.equal(video.playbackRate, 2);
+    assert.equal(video.pauseCalls, 0);
+    assert.equal(video.paused, false);
+    controller.destroy();
+  }
 });
 
 test('VOD does not pause at 119 seconds after startup buffering completes', () => {
@@ -1759,7 +2028,7 @@ test('VOD does not pause at 119 seconds after startup buffering completes', () =
   assert.equal(video.paused, false);
 });
 
-test('VOD keeps an asynchronous script pause distinct from a user pause', async () => {
+test('VOD initial background fill never creates a script pause', async () => {
   const listeners = new Map();
   const video = {
     currentTime: 0,
@@ -1785,11 +2054,60 @@ test('VOD keeps an asynchronous script pause distinct from a user pause', async 
   controller.enforceStartupAndRefill({});
   await Promise.resolve();
   assert.equal(controller.scriptPauseEvent, false);
-  assert.equal(controller.scriptPaused, true);
+  assert.equal(controller.scriptPaused, false);
   assert.equal(controller.userPaused, false);
+  assert.equal(video.paused, false);
 });
 
-test('VOD re-pauses an early user play while script refill inventory is below target', () => {
+test('VOD split-track tails within one second never script-pause and still reach ended', () => {
+  const listeners = new Map();
+  const models = [];
+  const video = {
+    currentTime: 99.5,
+    duration: 100,
+    paused: false,
+    playbackRate: 2,
+    pauseCalls: 0,
+    buffered: { length: 1, start: () => 99.5, end: () => 100 },
+    addEventListener(name, callback) {
+      listeners.set(name, callback);
+    },
+    removeEventListener() {},
+    pause() {
+      this.pauseCalls += 1;
+      this.paused = true;
+    },
+    dispatchEvent(event) {
+      listeners.get(event.type)?.(event);
+      return true;
+    },
+  };
+  const core = {
+    getBufferedRanges() {
+      return {
+        video: { length: 1, start: () => 99.5, end: () => 100 },
+        audio: { length: 1, start: () => 99.5, end: () => 99.75 },
+      };
+    },
+  };
+  const controller = new VodController({
+    windowObject: { performance: { now: () => 0, getEntriesByType: () => [] } },
+    documentObject: {},
+    video,
+    panel: { setModel: (model) => models.push(model), setAction() {} },
+  });
+  controller.started = true;
+  controller.startupComplete = true;
+  controller.currentCore = core;
+  controller.installVideoGuards();
+  controller.enforceStartupAndRefill(core);
+  assert.equal(video.pauseCalls, 0);
+  video.dispatchEvent(new Event('ended'));
+  assert.equal(models.at(-1).state, 'ENDED');
+  controller.destroy();
+});
+
+test('VOD does not re-pause an early user play while initial inventory is low', () => {
   const listeners = new Map();
   const video = {
     currentTime: 0,
@@ -1818,11 +2136,11 @@ test('VOD re-pauses an early user play while script refill inventory is below ta
   });
   controller.installVideoGuards();
   controller.enforceStartupAndRefill({});
-  assert.equal(controller.scriptPaused, true);
+  assert.equal(controller.scriptPaused, false);
   controller.currentCore = {};
   video.play();
-  assert.equal(video.paused, true);
-  assert.equal(controller.scriptPaused, true);
+  assert.equal(video.paused, false);
+  assert.equal(controller.scriptPaused, false);
   assert.equal(controller.userPaused, false);
 });
 

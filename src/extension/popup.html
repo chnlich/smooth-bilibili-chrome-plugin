@@ -9,16 +9,32 @@
   <body>
     <main>
       <h1>Bilibili 抗卡</h1>
-      <label class="switch-row">
-        <span>直播增强</span>
-        <input type="checkbox" data-preference="liveEnabled">
-      </label>
-      <label class="switch-row">
-        <span>视频增强</span>
-        <input type="checkbox" data-preference="vodEnabled">
-      </label>
-      <p class="hint">开关在下次刷新页面后生效。当前页面请使用面板里的“停用”。</p>
-      <p class="status" data-status role="status"></p>
+      <section class="preferences" aria-label="刷新默认值">
+        <label class="switch-row">
+          <span>直播增强</span>
+          <input type="checkbox" data-preference="liveEnabled">
+        </label>
+        <label class="switch-row">
+          <span>视频增强</span>
+          <input type="checkbox" data-preference="vodEnabled">
+        </label>
+        <p class="hint">这两个开关是下次刷新页面的默认值，不会立即重建当前页面管线。</p>
+      </section>
+      <section class="snapshot" aria-label="当前页面状态">
+        <div class="title-row"><span>Bilibili 抗卡</span><strong data-status-field="state">未提供</strong></div>
+        <dl>
+          <div><dt>模式</dt><dd data-status-field="mode">未提供</dd></div>
+          <div><dt>连续库存</dt><dd data-status-field="inventory">未提供</dd></div>
+          <div><dt>估算延迟</dt><dd data-status-field="delay">未提供</dd></div>
+          <div><dt>画质</dt><dd data-status-field="quality">未提供</dd></div>
+          <div><dt>速度</dt><dd data-status-field="speed">未提供</dd></div>
+          <div><dt>下载倍率</dt><dd data-status-field="multiplier">未提供</dd></div>
+          <div><dt>阶段</dt><dd data-status-field="stage">未提供</dd></div>
+        </dl>
+        <p class="message" data-status-field="message">未提供</p>
+        <div class="actions" data-actions></div>
+      </section>
+      <p class="status" data-status role="status">正在读取当前页面状态…</p>
     </main>
     <script src="popup.js"></script>
   </body>

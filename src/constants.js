@@ -39,9 +39,12 @@ export const LIVE_CONFIG = Object.freeze({
   playbackRate: 1,
   segmentConcurrency: 3,
   requestTimeoutMilliseconds: 5000,
+  mseWaitTimeoutMilliseconds: 5000,
+  zeroInventoryWatchdogMilliseconds: 45000,
   retryBackoffMilliseconds: Object.freeze([1000, 2000, 4000, 8000, 15000, 30000]),
   manifestRefreshMilliseconds: 1000,
   statusRefreshMilliseconds: 500,
+  metricsWindowsSeconds: Object.freeze([30, 60]),
 });
 
 export const VOD_CONFIG = Object.freeze({

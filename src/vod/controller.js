@@ -2,7 +2,7 @@ import { VOD_CONFIG } from '../constants.js';
 import { BufferScriptError, fail, toBufferScriptError } from '../errors.js';
 import { readForwardInventory } from './buffer.js';
 import { calculateDownloadMultiplier } from './metrics.js';
-import { VodBufferPolicy, callQualityMethod, readMediaBitrate, readQualitySnapshot } from './policy.js';
+import { VodBufferPolicy, callQualityMethod, coreSupports, readMediaBitrate, readQualitySnapshot } from './policy.js';
 
 function createLogger() {
   return {
@@ -143,9 +143,14 @@ export class VodController {
     this.scriptPaused = false;
     this.scriptPauseEvent = false;
     this.startupComplete = false;
+    this.stableBufferSupported = true;
+    this.pausedSchedulingSupported = true;
+    this.coreEventsSupported = true;
+    this.ended = false;
     this.internalRateChange = false;
     this.qualityStatus = '读取当前画质';
     this.message = '';
+    this.policyMessage = '';
     this.mediaMetricsStartMilliseconds = 0;
     this.mediaMetricsBoundaryPending = true;
     this.started = false;
@@ -196,16 +201,21 @@ export class VodController {
         return;
       }
       this.userPaused = false;
-      if (this.scriptPaused && this.currentCore !== undefined) {
+      if (this.scriptPaused && this.startupComplete && this.currentCore !== undefined) {
         const inventory = readForwardInventory(this.video, this.currentCore);
         const remaining = Number.isFinite(this.video.duration)
           ? Math.max(0, this.video.duration - this.video.currentTime)
           : Number.POSITIVE_INFINITY;
         const target = Math.min(this.config.startupBufferSeconds, remaining);
-        if (inventory < target) {
+        if (remaining > 30 && this.pausedSchedulingSupported && inventory < target) {
           this.pauseForRefill();
         }
       }
+    };
+    const onEnded = () => {
+      this.ended = true;
+      this.scriptPaused = false;
+      this.updateStatus();
     };
     const onError = () => {
       if (!this.enabled) {
@@ -219,6 +229,7 @@ export class VodController {
     this.addVideoListener('ratechange', onRateChange);
     this.addVideoListener('pause', onPause);
     this.addVideoListener('play', onPlay);
+    this.addVideoListener('ended', onEnded);
     this.addVideoListener('error', onError);
   }
 
@@ -250,6 +261,16 @@ export class VodController {
         this.handleQuotaError(error);
       }
     };
+    const snapshotSupportsEvents = typeof core.supports === 'function'
+      ? core.supports('events') === true
+      : core.capabilities?.core !== undefined && Object.prototype.hasOwnProperty.call(core.capabilities.core, 'events')
+        ? core.capabilities.core.events === true
+        : true;
+    this.coreEventsSupported = snapshotSupportsEvents;
+    if (!snapshotSupportsEvents) {
+      this.policyMessage = '当前内核没有错误事件能力，quota 仅依赖 video error';
+      return;
+    }
     if (typeof core.addEventListener === 'function') {
       core.addEventListener('error', onCoreError);
       this.removeCoreErrorListener = () => core.removeEventListener('error', onCoreError);
@@ -271,7 +292,9 @@ export class VodController {
       } else if (typeof core.off === 'function') {
         this.removeCoreErrorListener = () => core.off('error', onCoreError);
       }
+      return;
     }
+    this.coreEventsSupported = false;
   }
 
   createQualityRequestIdentity(
@@ -342,6 +365,7 @@ export class VodController {
       if (source === '') {
         return;
       }
+      this.setPlaybackRate();
       const location = this.windowObject.location?.href || '';
       const sessionKey = logicalVideoSession(this.windowObject.location);
       const qualityNumber = currentQualityNumber(core);
@@ -363,7 +387,7 @@ export class VodController {
           this.bufferPolicy.resetForNewSession();
           this.startupComplete = false;
         }
-        this.bufferPolicy.apply(core);
+        this.ended = false;
         if (coreChanged || sourceChanged) {
           this.replaceCoreErrorListener(core);
         }
@@ -377,20 +401,22 @@ export class VodController {
         this.qualitySettledCore = undefined;
         this.qualitySettledSource = '';
         this.qualitySettledSession = '';
-        const requestIdentity = this.createQualityRequestIdentity(core);
-        await this.reconcileQuality(core, qualityNumber, requestIdentity);
-        if (!this.isQualityObservationCurrent(requestIdentity)) {
-          return;
-        }
-        this.setPlaybackRate();
+      }
+      const policyResult = this.bufferPolicy.apply(core);
+      this.stableBufferSupported = policyResult.stableBufferSupported;
+      this.pausedSchedulingSupported = policyResult.pausedSchedulingSupported;
+      const policyWarnings = [...policyResult.warnings];
+      if (!this.coreEventsSupported) {
+        policyWarnings.push('当前内核没有错误事件能力，quota 仅依赖 video error');
+      }
+      this.policyMessage = policyWarnings.join('；');
+      const requestIdentity = this.createQualityRequestIdentity(core);
+      await this.reconcileQuality(core, qualityNumber, requestIdentity);
+      if (!this.isQualityObservationCurrent(requestIdentity)) {
+        return;
+      }
+      if (rebuilt) {
         this.message = '';
-      } else {
-        const requestIdentity = this.createQualityRequestIdentity(core);
-        this.setPlaybackRate();
-        await this.reconcileQuality(core, qualityNumber, requestIdentity);
-        if (!this.isQualityObservationCurrent(requestIdentity)) {
-          return;
-        }
       }
       this.detectExternalBufferDowngrade(core);
       this.enforceStartupAndRefill(core);
@@ -516,10 +542,11 @@ export class VodController {
       const after = readQualitySnapshot(core);
       if (before.qn === undefined) {
         const actual = after.qn === undefined ? '未知' : `qn${after.qn}`;
-        this.qualityStatus = `720P/qn${this.config.qualityNumber} 未生效，当前实际画质 ${actual}（${normalized.message}）`;
+        this.qualityStatus =
+          `720P/qn${this.config.qualityNumber} 未生效，当前实际画质 ${actual}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
       } else if (after.qn === before.qn) {
         this.qualityStatus =
-          `720P/qn${this.config.qualityNumber} 未生效，保持原画质 qn${before.qn}（${normalized.message}）`;
+          `720P/qn${this.config.qualityNumber} 未生效，保持原画质 qn${before.qn}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
       } else {
         const restored = await this.restoreQuality(core, before.qn, requestIdentity);
         if (!this.isQualityObservationCurrent(requestIdentity)) {
@@ -532,7 +559,7 @@ export class VodController {
         } else {
           const actual = current === undefined ? '未知' : `qn${current}`;
           this.qualityStatus =
-            `720P/qn${this.config.qualityNumber} 未生效，恢复原画质失败，当前实际画质 ${actual}（${normalized.message}）`;
+            `720P/qn${this.config.qualityNumber} 未生效，恢复原画质失败，当前实际画质 ${actual}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
         }
       }
       this.logger.warn('点播 qn64 未确认', normalized);
@@ -596,14 +623,12 @@ export class VodController {
     if (this.userPaused) {
       return;
     }
+    if (remaining <= 30) {
+      return;
+    }
     if (!this.startupComplete) {
       if (inventory >= refillTarget) {
         this.startupComplete = true;
-        if (this.scriptPaused) {
-          this.attemptPlay();
-        }
-      } else if (!this.video.paused) {
-        this.pauseForRefill();
       }
       return;
     }
@@ -613,8 +638,10 @@ export class VodController {
       }
       return;
     }
-    if (inventory < this.config.lowBufferSeconds && !this.video.paused) {
+    if (inventory < this.config.lowBufferSeconds && !this.video.paused && this.pausedSchedulingSupported) {
       this.pauseForRefill();
+    } else if (inventory < this.config.lowBufferSeconds && !this.pausedSchedulingSupported) {
+      this.policyMessage = '库存低于 30 秒，但内核不支持暂停时继续下载，保持播放';
     }
   }
 
@@ -643,7 +670,7 @@ export class VodController {
       return;
     }
     for (const getter of ['getStableBufferTime', 'getStableBufferSeconds']) {
-      if (typeof core[getter] !== 'function') {
+      if (!coreSupports(core, getter)) {
         continue;
       }
       const target = Number(core[getter]());
@@ -717,7 +744,8 @@ export class VodController {
     } else if (thirty !== undefined && sixty !== undefined && this.message === BANDWIDTH_INSUFFICIENT_MESSAGE) {
       this.message = '';
     }
-    const state = this.userPaused ? 'USER_PAUSED' : this.scriptPaused ? 'REFILLING' : 'VOD_READY';
+    const state = this.ended ? 'ENDED' : this.userPaused ? 'USER_PAUSED' : this.scriptPaused ? 'REFILLING' : 'VOD_READY';
+    const displayMessage = [this.message, this.policyMessage].filter(Boolean).join('；');
     this.panel.setModel({
       mode: '点播',
       state,
@@ -726,7 +754,7 @@ export class VodController {
       quality: this.qualityStatus,
       speed: `${this.config.playbackRate}×`,
       multiplier,
-      message: this.message,
+      message: displayMessage,
     });
     this.panel.setAction('toggle', '停用', () => this.toggleEnabled());
     this.panel.setAction('skip-gap', '', () => {}, false);

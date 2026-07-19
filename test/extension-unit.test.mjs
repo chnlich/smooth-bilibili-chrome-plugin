@@ -12,6 +12,37 @@ import {
 import { BridgeCore, createPageWindowAdapter } from '../src/extension/bridge-client.js';
 import { createCoreEventSubscription, supportsCoreEvents } from '../src/extension/core-events.js';
 import { createManifest } from '../src/extension/manifest-source.js';
+import { StatusPanel } from '../src/ui/panel.js';
+
+const ALL_CORE_CAPABILITIES = {
+  getQuality: true,
+  getCurrentQuality: false,
+  getCurrentQn: false,
+  getSupportedQualityList: true,
+  getQualityList: true,
+  requestQuality: true,
+  getBufferedRanges: true,
+  getMediaInfo: true,
+  getCurrentMediaInfo: false,
+  getQualityInfo: false,
+  getStableBufferTime: true,
+  getStableBufferSeconds: false,
+  setStableBufferTime: true,
+  setScheduleWhilePaused: true,
+  events: false,
+};
+
+function capabilities(overrides = {}) {
+  return {
+    player: {
+      setAutoSyncProgressCfg: true,
+      setAutoDiscardFrameCfg: true,
+      pause: true,
+      requestQuality: true,
+    },
+    core: { ...ALL_CORE_CAPABILITIES, ...overrides },
+  };
+}
 
 test('extension manifest derives its MV3, match, and permission contract from one source', () => {
   const manifest = createManifest();
@@ -29,6 +60,31 @@ test('extension manifest derives its MV3, match, and permission contract from on
   assert.deepEqual(manifest.permissions, ['storage']);
   assert.equal(manifest.background, undefined);
   assert.equal(manifest.options_page, undefined);
+});
+
+test('status surface is in-memory, versioned, and exposes only visible current actions', () => {
+  let actionCalls = 0;
+  const panel = new StatusPanel({
+    createElement() {
+      throw new Error('status surface must not create page elements');
+    },
+  }, '直播');
+  panel.setModel({ mode: '直播', state: 'RECOVERING', message: '重试第 2 轮' });
+  panel.setMessage('阶段消息');
+  panel.setAction('toggle', '停用', () => { actionCalls += 1; });
+  panel.setAction('skip-gap', '跨过缺口', () => {}, false);
+  const snapshot = panel.getSnapshot();
+  assert.equal(snapshot.version, 1);
+  assert.match(snapshot.surfaceId, /^surface-/);
+  assert.equal(snapshot.state, 'RECOVERING');
+  assert.equal(snapshot.message, '阶段消息');
+  assert.deepEqual(snapshot.actions, { toggle: '停用' });
+  panel.runAction('toggle');
+  assert.equal(actionCalls, 1);
+  assert.throws(() => panel.runAction('skip-gap'), (error) => error.code === 'UI_ACTION_NOT_VISIBLE');
+  panel.destroy();
+  assert.throws(() => panel.getSnapshot(), (error) => error.code === 'UI_SURFACE_DESTROYED');
+  assert.throws(() => panel.runAction('toggle'), (error) => error.code === 'UI_SURFACE_DESTROYED');
 });
 
 test('bridge schema accepts only versioned serializable messages and whitelisted operations', () => {
@@ -124,7 +180,13 @@ test('bridge core reads current MAIN state through the whitelist without leaking
       calls.push(['async', operation, args]);
       return Promise.resolve({
         result: true,
-        snapshot: { coreId: 3, source: 'test-source', supportsCoreEvents: false, ...observed },
+        snapshot: {
+          coreId: 3,
+          source: 'test-source',
+          supportsCoreEvents: false,
+          capabilities: capabilities(),
+          ...observed,
+        },
       });
     },
     subscribeCore() {
@@ -137,6 +199,7 @@ test('bridge core reads current MAIN state through the whitelist without leaking
     source: 'test-source',
     ...observed,
     supportsCoreEvents: false,
+    capabilities: capabilities(),
   });
   assert.equal(core.getQuality().realQ, 32);
   assert.equal(core.getBufferedRanges().video.end(0), 120);
@@ -172,13 +235,20 @@ test('a fresh bridge snapshot stales the old core before old async quality compl
           source: snapshotCalls === 1 ? 'old-source' : 'new-source',
           quality: { realQ: 32 },
           supportsCoreEvents: false,
+          capabilities: capabilities(),
         });
       }
       assert.equal(operation, 'callCoreAsync');
       return new Promise((resolve) => {
         resolveQuality = () => resolve({
           result: true,
-          snapshot: { coreId: 5, source: 'new-source', quality: { realQ: 64 }, supportsCoreEvents: false },
+          snapshot: {
+            coreId: 5,
+            source: 'new-source',
+            quality: { realQ: 64 },
+            supportsCoreEvents: false,
+            capabilities: capabilities(),
+          },
         });
       });
     },

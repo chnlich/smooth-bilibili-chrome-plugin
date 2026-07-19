@@ -16,8 +16,10 @@
   var BRIDGE_PLAYER_METHODS = Object.freeze([
     "setAutoSyncProgressCfg",
     "setAutoDiscardFrameCfg",
-    "pause"
+    "pause",
+    "requestQuality"
   ]);
+  var BRIDGE_PLAYER_CAPABILITIES = Object.freeze([...BRIDGE_PLAYER_METHODS]);
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze([
     "getQuality",
     "getCurrentQuality",
@@ -194,6 +196,14 @@
     const video = findLargestVideo();
     return video === void 0 ? "" : video.currentSrc || video.src || "";
   }
+  function readCurrentVideoSession() {
+    const href = globalThis.location?.href || "";
+    if (href.length === 0) {
+      return "";
+    }
+    const url = new URL(href);
+    return `${url.pathname}#p=${url.searchParams.get("p") || "1"}`;
+  }
   function serializeObserved(value, allowedFields = QUALITY_FIELDS, depth = 0) {
     if (value === null || typeof value === "string" || typeof value === "boolean") {
       return value;
@@ -253,6 +263,30 @@
     }
     return serializeTimeRanges(ranges);
   }
+  function readCoreCapabilities(core) {
+    return {
+      getQuality: typeof core.getQuality === "function",
+      getCurrentQuality: typeof core.getCurrentQuality === "function",
+      getCurrentQn: typeof core.getCurrentQn === "function",
+      getSupportedQualityList: typeof core.getSupportedQualityList === "function",
+      getQualityList: typeof core.getQualityList === "function",
+      requestQuality: typeof core.requestQuality === "function",
+      getBufferedRanges: typeof core.getBufferedRanges === "function",
+      getMediaInfo: typeof core.getMediaInfo === "function",
+      getCurrentMediaInfo: typeof core.getCurrentMediaInfo === "function",
+      getQualityInfo: typeof core.getQualityInfo === "function",
+      getStableBufferTime: typeof core.getStableBufferTime === "function",
+      getStableBufferSeconds: typeof core.getStableBufferSeconds === "function",
+      setStableBufferTime: typeof core.setStableBufferTime === "function",
+      setScheduleWhilePaused: typeof core.setScheduleWhilePaused === "function",
+      events: supportsCoreEvents(core)
+    };
+  }
+  function readPlayerCapabilities(player) {
+    return Object.fromEntries(
+      BRIDGE_PLAYER_CAPABILITIES.map((method) => [method, typeof player[method] === "function"])
+    );
+  }
   function readOptional(core, names, serializer = serializeObserved) {
     for (const name of names) {
       if (typeof core[name] === "function") {
@@ -262,6 +296,7 @@
     return void 0;
   }
   function getCoreSnapshot() {
+    const player = pagePlayer();
     const core = currentCore();
     const record = recordFor(core);
     const hasCoreEventSupport = supportsCoreEvents(core);
@@ -274,7 +309,11 @@
       bufferedRanges: serializeBufferedRanges(core),
       mediaInfo: readOptional(core, ["getMediaInfo", "getCurrentMediaInfo", "getQualityInfo"], serializeMediaInfo),
       stableBufferTime: readOptional(core, ["getStableBufferTime", "getStableBufferSeconds"]),
-      supportsCoreEvents: hasCoreEventSupport
+      supportsCoreEvents: hasCoreEventSupport,
+      capabilities: {
+        player: readPlayerCapabilities(player),
+        core: readCoreCapabilities(core)
+      }
     };
     return snapshot;
   }
@@ -292,7 +331,7 @@
     }
     return args;
   }
-  function callPlayer(args) {
+  async function callPlayer(args) {
     if (!Array.isArray(args) || args.length < 1 || args.length > 2) {
       throw Object.assign(new Error("页面播放器操作参数数量错误"), { code: "BRIDGE_ARGUMENTS_INVALID" });
     }
@@ -301,17 +340,35 @@
       throw Object.assign(new Error(`页面播放器操作未允许: ${method}`), { code: "BRIDGE_OPERATION_DENIED" });
     }
     const player = pagePlayerObject();
+    if (typeof player[method] !== "function") {
+      throw Object.assign(new Error(`当前页面播放器没有 ${method}`), { code: "BRIDGE_METHOD_UNAVAILABLE" });
+    }
     if (method === "pause") {
       if (args.length !== 1) {
         throw Object.assign(new Error("pause 不接受参数"), { code: "BRIDGE_ARGUMENTS_INVALID" });
       }
-      player.pause();
+      await player.pause();
       return true;
+    }
+    if (method === "requestQuality") {
+      if (args.length !== 2 || !Number.isInteger(value) || value <= 0) {
+        throw Object.assign(new Error("页面播放器 requestQuality 参数必须是正整数清晰度"), {
+          code: "BRIDGE_ARGUMENTS_INVALID"
+        });
+      }
+      const core = currentCore();
+      const source = readCurrentVideoSource();
+      const session = readCurrentVideoSession();
+      const result = await player.requestQuality(value);
+      if (pagePlayerObject() !== player || currentCore() !== core || readCurrentVideoSource() !== source || readCurrentVideoSession() !== session) {
+        throw Object.assign(new Error("页面播放器画质请求完成时页面会话已经变化"), { code: "BRIDGE_CORE_STALE" });
+      }
+      return { result: result === void 0 ? true : serializeObserved(result), snapshot: getCoreSnapshot() };
     }
     if (value === null || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 1 || value.enable !== false && value.enable !== true) {
       throw Object.assign(new Error(`${method} 参数必须是 {enable:boolean}`), { code: "BRIDGE_ARGUMENTS_INVALID" });
     }
-    player[method](value);
+    await player[method](value);
     return true;
   }
   function callCoreSync(args) {

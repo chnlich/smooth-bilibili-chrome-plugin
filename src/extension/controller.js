@@ -3,7 +3,12 @@ import { toBufferScriptError } from '../errors.js';
 import { LiveController, roomIdFromLocation, waitForVideo } from '../live/controller.js';
 import { getPinnedHls } from '../live/hls.js';
 import { VodController } from '../vod/controller.js';
-import { createStatusPanel } from '../ui/panel.js';
+import {
+  STATUS_MESSAGE_VERSION,
+  createStatusPanel,
+  createUnavailableStatusSnapshot,
+  getCurrentStatusSurface,
+} from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
 
 function isLivePage(locationObject) {
@@ -50,12 +55,77 @@ function setBootError(panel, error, mode) {
     quality: '未提供',
     speed: '未提供',
     multiplier: '未提供',
+    stage: '启动失败',
     message: `${normalized.code}: ${normalized.message}`,
   });
 }
 
 function readPreferences(storage) {
   return storage.get([EXTENSION_PREFERENCES.liveEnabled, EXTENSION_PREFERENCES.vodEnabled]);
+}
+
+function popupError(error) {
+  return {
+    code: typeof error?.code === 'string' ? error.code : 'POPUP_REQUEST_FAILED',
+    message: error?.message || String(error),
+  };
+}
+
+function assertPopupMessage(message) {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) {
+    throw Object.assign(new Error('popup 消息必须是对象'), { code: 'POPUP_MESSAGE_INVALID' });
+  }
+  if (message.version !== STATUS_MESSAGE_VERSION) {
+    throw Object.assign(new Error(`popup 消息版本不支持: ${message.version}`), { code: 'POPUP_VERSION_UNSUPPORTED' });
+  }
+  if (message.type !== 'status:get' && message.type !== 'action:run') {
+    throw Object.assign(new Error(`popup 消息类型未允许: ${message.type}`), { code: 'POPUP_MESSAGE_INVALID' });
+  }
+  return message;
+}
+
+async function handlePopupMessage(message, sender) {
+  const request = assertPopupMessage(message);
+  const senderTabId = sender?.tab?.id;
+  if (request.tabId !== undefined && request.tabId !== senderTabId) {
+    throw Object.assign(new Error('popup 请求 tab 与消息来源不匹配'), { code: 'POPUP_TAB_MISMATCH' });
+  }
+  const surface = getCurrentStatusSurface();
+  if (request.type === 'status:get') {
+    if (surface === undefined) {
+      return createUnavailableStatusSnapshot();
+    }
+    if (senderTabId !== undefined) {
+      surface.bindTab(senderTabId);
+    }
+    return surface.getSnapshot();
+  }
+  if (surface === undefined) {
+    throw Object.assign(new Error('当前 tab 没有活动状态 surface'), { code: 'POPUP_SURFACE_UNAVAILABLE' });
+  }
+  if (senderTabId !== undefined) {
+    surface.bindTab(senderTabId);
+  }
+  if (request.surfaceId !== surface.surfaceId) {
+    throw Object.assign(new Error('popup 动作属于过期状态 surface'), { code: 'POPUP_SURFACE_STALE' });
+  }
+  if (typeof request.action !== 'string') {
+    throw Object.assign(new Error('popup 动作名称无效'), { code: 'POPUP_ACTION_INVALID' });
+  }
+  await surface.runAction(request.action);
+  return { version: STATUS_MESSAGE_VERSION, ok: true, snapshot: surface.getSnapshot() };
+}
+
+export function installPopupMessageHandler(runtimeObject = chrome.runtime) {
+  if (runtimeObject?.onMessage === undefined || typeof runtimeObject.onMessage.addListener !== 'function') {
+    throw new Error('Chrome runtime message API 不可用');
+  }
+  runtimeObject.onMessage.addListener((message, sender, sendResponse) => {
+    void handlePopupMessage(message, sender)
+      .then((response) => sendResponse(response))
+      .catch((error) => sendResponse({ version: STATUS_MESSAGE_VERSION, ok: false, error: popupError(error) }));
+    return true;
+  });
 }
 
 export class ExtensionCoordinator {
@@ -143,6 +213,7 @@ export class ExtensionCoordinator {
     panel.setModel({
       mode: mode === 'live' ? '直播' : '点播',
       state: 'STARTING',
+      stage: '等待 video',
       message: `版本 ${VERSION} 正在启动`,
     });
     const routeStillCurrent = () =>
@@ -166,6 +237,7 @@ export class ExtensionCoordinator {
         return;
       }
       this.active.video = video;
+      panel.setModel({ stage: '配置播放器', message: 'video 已就绪，正在配置播放器' });
       const pageAdapter = createPageWindowAdapter(this.bridgeClient, this.windowObject);
       if (mode === 'live') {
         const controller = new LiveController({
@@ -255,5 +327,6 @@ export class ExtensionCoordinator {
   }
 }
 
+installPopupMessageHandler();
 const coordinator = new ExtensionCoordinator();
 void coordinator.start().catch((error) => console.error('[BilibiliBuffer] 扩展启动失败', error));

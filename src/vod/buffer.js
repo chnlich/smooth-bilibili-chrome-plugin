@@ -21,6 +21,19 @@ function rangeContainingCurrentTime(ranges, currentTime) {
   return match === undefined ? 0 : Math.max(0, match.end - currentTime);
 }
 
+function supportsBufferedRanges(core) {
+  if (core === undefined || core === null) {
+    return false;
+  }
+  if (typeof core.supports === 'function') {
+    return core.supports('getBufferedRanges') === true;
+  }
+  if (core.capabilities?.core !== undefined && Object.prototype.hasOwnProperty.call(core.capabilities.core, 'getBufferedRanges')) {
+    return core.capabilities.core.getBufferedRanges === true;
+  }
+  return typeof core.getBufferedRanges === 'function';
+}
+
 export function computeForwardInventory(currentTime, tracks) {
   if (!Number.isFinite(currentTime)) {
     fail('VOD_CURRENT_TIME_INVALID', `currentTime 无效: ${currentTime}`);
@@ -33,7 +46,7 @@ export function computeForwardInventory(currentTime, tracks) {
 }
 
 export function bufferedTracksFromVideo(video, core) {
-  const coreRanges = typeof core.getBufferedRanges === 'function' ? core.getBufferedRanges() : undefined;
+  const coreRanges = supportsBufferedRanges(core) ? core.getBufferedRanges() : undefined;
   if (coreRanges !== undefined) {
     const tracks = [];
     if (coreRanges.video !== undefined) {

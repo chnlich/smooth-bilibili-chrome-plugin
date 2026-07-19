@@ -321,33 +321,34 @@ function hasViableTerminalState(mode, state) {
 }
 
 function evaluateSnapshot(snapshot, mode) {
-  if (!snapshot.panel.exists) {
+  if (snapshot.status === undefined) {
     return {
-      status: 'FAIL',
-      reason: 'extension loaded and an anonymous page exposed video, but the product controller panel was absent',
+      status: 'BLOCKED',
+      reason: 'anonymous page exposed video, but the toolbar popup did not expose a current-tab status snapshot',
     };
   }
-  if (snapshot.panel.state === 'ERROR') {
-    const reason = snapshot.panel.message || 'controller entered ERROR';
+  const status = snapshot.status;
+  if (status.state === 'ERROR') {
+    const reason = status.message || 'controller entered ERROR';
     return { status: environmentBlocked(reason) ? 'BLOCKED' : 'FAIL', reason };
   }
-  if (snapshot.panel.state === 'GAP_UNRECOVERABLE') {
+  if (status.state === 'GAP_UNRECOVERABLE') {
     return {
       status: 'FAIL',
-      reason: snapshot.panel.message || 'controller entered GAP_UNRECOVERABLE on the real page',
+      reason: status.message || 'controller entered GAP_UNRECOVERABLE on the real page',
     };
   }
-  if (snapshot.panel.mode !== mode) {
+  if (status.mode !== mode) {
     return {
       status: 'FAIL',
-      reason: `controller reported mode ${snapshot.panel.mode || 'missing'} instead of ${mode}`,
+      reason: `controller reported mode ${status.mode || 'missing'} instead of ${mode}`,
     };
   }
   const expectedSpeed = mode === '直播' ? '1×' : '2×';
-  if (snapshot.panel.speed !== expectedSpeed) {
+  if (status.speed !== expectedSpeed) {
     return {
       status: 'FAIL',
-      reason: `controller reported speed ${snapshot.panel.speed || 'missing'} instead of ${expectedSpeed}`,
+      reason: `controller reported speed ${status.speed || 'missing'} instead of ${expectedSpeed}`,
     };
   }
   if (snapshot.media === undefined || snapshot.media.currentSrc.length === 0 || snapshot.media.readyState < 2) {
@@ -362,29 +363,56 @@ function evaluateSnapshot(snapshot, mode) {
       reason: 'media was not synchronously muted with zero volume',
     };
   }
-  if (mode === '点播' && !/qn64 已生效/.test(snapshot.panel.quality || '')) {
+  if (mode === '点播' && !/qn64 已生效/.test(status.quality || '')) {
     return {
       status: 'BLOCKED',
       reason: 'anonymous VOD page did not confirm qn64',
     };
   }
-  if (!hasViableTerminalState(mode, snapshot.panel.state)) {
+  if (mode === '直播') {
+    const inventory = Number.parseFloat(status.inventory || '');
+    if (!(inventory > 0)) {
+      return {
+        status: 'BLOCKED',
+        reason: `anonymous live page did not form nonzero continuous inventory: ${status.inventory || 'missing'}`,
+      };
+    }
+  }
+  if (!hasViableTerminalState(mode, status.state)) {
     return {
       status: 'BLOCKED',
-      reason: `controller did not reach a viable terminal state: ${snapshot.panel.state || 'missing'}`,
+      reason: `controller did not reach a viable terminal state: ${status.state || 'missing'}`,
     };
   }
   return undefined;
 }
 
-async function closeExternalPage(page) {
+async function closeExternalPage(page, popup) {
   const failures = [];
+  if (popup !== undefined) {
+    await runCleanupStep(failures, 'external smoke popup close', () => popup.close({ runBeforeUnload: false }));
+  }
   await runCleanupStep(failures, 'external smoke page close', () => page.close({ runBeforeUnload: false }));
   throwCleanupFailures(failures);
 }
 
+async function openExternalPopup(context, extensionId, targetPage, consoleErrors, pageErrors) {
+  const popup = await context.newPage();
+  popup.on('console', (message) => {
+    if (message.type() === 'error') {
+      consoleErrors.push({ text: message.text(), location: message.location() });
+    }
+  });
+  popup.on('pageerror', (error) => pageErrors.push(error.stack || error.message));
+  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  await popup.waitForSelector('input[data-preference="liveEnabled"]');
+  await targetPage.bringToFront();
+  return { popup };
+}
+
 async function runExternalPage(context, url, mode) {
   const page = await context.newPage();
+  let popup;
   const consoleErrors = [];
   const pageErrors = [];
   page.on('console', (message) => {
@@ -393,20 +421,9 @@ async function runExternalPage(context, url, mode) {
     }
   });
   page.on('pageerror', (error) => pageErrors.push(error.stack || error.message));
-  const readSnapshot = () => page.evaluate(() => {
-    const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-    const shadow = host?.shadowRoot;
-    const value = (field) => shadow?.querySelector(`[data-field="${field}"] .value`)?.textContent;
+  const readMedia = () => page.evaluate(() => {
     const video = document.querySelector('video');
     return {
-      panel: {
-        exists: host !== null,
-        state: shadow?.querySelector('.state')?.textContent,
-        mode: value('mode'),
-        speed: value('speed'),
-        quality: value('quality'),
-        message: shadow?.querySelector('.message')?.textContent,
-      },
       media: video === null
         ? undefined
         : {
@@ -420,6 +437,33 @@ async function runExternalPage(context, url, mode) {
           },
     };
   });
+  const readSnapshot = async () => ({
+    status: popup === undefined
+      ? undefined
+      : await popup.evaluate(() => {
+        const value = (field) => document.querySelector(`[data-status-field="${field}"]`)?.textContent;
+        const state = value('state');
+        if (state === undefined || state === '未提供') {
+          return undefined;
+        }
+        return {
+          mode: value('mode'),
+          state,
+          inventory: value('inventory'),
+          delay: value('delay'),
+          quality: value('quality'),
+          speed: value('speed'),
+          multiplier: value('multiplier'),
+          stage: value('stage'),
+          message: value('message'),
+          actions: Object.fromEntries(
+            [...document.querySelectorAll('[data-actions] [data-action]')]
+              .map((button) => [button.dataset.action, button.textContent]),
+          ),
+        };
+      }),
+    ...(await readMedia()),
+  });
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForFunction(
@@ -430,6 +474,13 @@ async function runExternalPage(context, url, mode) {
     await page.waitForFunction(() => document.querySelector('video') !== null, undefined, { timeout: 20000 });
     const beforePlay = await page.evaluate(() => window.__bilibiliAudioGuard.assertSilentBeforePlay());
     assert.ok(beforePlay.every((media) => media.muted === true && media.volume === 0));
+    const extensionId = await page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId);
+    ({ popup } = await openExternalPopup(context, extensionId, page, consoleErrors, pageErrors));
+    await popup.waitForFunction(
+      () => document.querySelector('[data-status-field="state"]')?.textContent !== '未提供',
+      undefined,
+      { timeout: 20000 },
+    );
     await wait(15000);
     const first = await readSnapshot();
     const extensionErrors = extensionDiagnostics(consoleErrors, pageErrors);
@@ -547,7 +598,7 @@ async function runExternalPage(context, url, mode) {
       extensionErrors: errors,
     };
   } finally {
-    await closeExternalPage(page);
+    await closeExternalPage(page, popup);
   }
 }
 

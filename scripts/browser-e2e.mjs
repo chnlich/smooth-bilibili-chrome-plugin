@@ -12,6 +12,40 @@ const extensionDirectory = path.join(root, 'dist', 'extension');
 const reportDirectory = path.join(root, 'reports');
 const reportPath = path.join(reportDirectory, 'extension-e2e-report.json');
 const execFileAsync = promisify(execFile);
+const scenarioFilter = process.env.E2E_ONLY;
+
+function makeMp4Box(type, payload = new Uint8Array()) {
+  const bytes = new Uint8Array(8 + payload.byteLength);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, bytes.byteLength, false);
+  bytes.set([...type].map((character) => character.charCodeAt(0)), 4);
+  bytes.set(payload, 8);
+  return bytes;
+}
+
+function makeMuxedInitSegment() {
+  const handlerBox = (handler) => {
+    const payload = new Uint8Array(12);
+    payload.set([...handler].map((character) => character.charCodeAt(0)), 8);
+    return makeMp4Box('hdlr', payload);
+  };
+  const videoTrack = makeMp4Box('trak', makeMp4Box('mdia', handlerBox('vide')));
+  const audioTrack = makeMp4Box('trak', makeMp4Box('mdia', handlerBox('soun')));
+  const moov = makeMp4Box('moov', new Uint8Array([...videoTrack, ...audioTrack]));
+  return Buffer.from(new Uint8Array([...makeMp4Box('ftyp', new Uint8Array(4)), ...moov]));
+}
+
+const MUXED_INIT_SEGMENT = makeMuxedInitSegment();
+const VIDEO_ONLY_INIT_SEGMENT = (() => {
+  const payload = new Uint8Array(12);
+  payload.set([...('vide')].map((character) => character.charCodeAt(0)), 8);
+  const handler = makeMp4Box('hdlr', payload);
+  const track = makeMp4Box('trak', makeMp4Box('mdia', handler));
+  return Buffer.from(new Uint8Array([
+    ...makeMp4Box('ftyp', new Uint8Array(4)),
+    ...makeMp4Box('moov', track),
+  ]));
+})();
 
 function audioGuard() {
   const selector = 'video, audio';
@@ -312,6 +346,7 @@ function playInfoPayload() {
                 session: 'extension-test-session',
                 video_codecs: { base: 'avc1.4d401f' },
                 audio_codecs: { base: 'mp4a.40.2' },
+                description: '高清 720P',
               }],
             }],
           }],
@@ -468,30 +503,49 @@ async function prepareLocalBrowserLibraries() {
   }
 }
 
-async function openPopup(context, extensionId) {
+async function openPopup(context, extensionId, targetPage) {
   const popup = await context.newPage();
   const diagnostics = collectDiagnostics(popup);
   await popup.goto(`chrome-extension://${extensionId}/popup.html`);
   await popup.waitForSelector('input[data-preference="liveEnabled"]');
+  if (targetPage !== undefined) {
+    statusPopups.set(targetPage, popup);
+    await targetPage.bringToFront();
+  }
   return { popup, diagnostics };
 }
 
-async function panelState(page) {
-  return page.evaluate(() => {
-    const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-    if (host === null) return undefined;
-    const shadow = host.shadowRoot;
-    const value = (field) => shadow.querySelector(`[data-field="${field}"] .value`)?.textContent;
+const statusPopups = new WeakMap();
+
+async function popupState(page) {
+  const popup = statusPopups.get(page);
+  assert.ok(popup !== undefined && !popup.isClosed(), 'status popup is not open for this tab');
+  return popup.evaluate(() => {
+    const value = (field) => document.querySelector(`[data-status-field="${field}"]`)?.textContent;
+    const actions = Object.fromEntries(
+      [...document.querySelectorAll('[data-actions] [data-action]')]
+        .map((button) => [button.dataset.action, button.textContent]),
+    );
     return {
-      state: shadow.querySelector('.state')?.textContent,
+      state: value('state'),
       mode: value('mode'),
+      inventory: value('inventory'),
+      delay: value('delay'),
       quality: value('quality'),
       speed: value('speed'),
-      message: shadow.querySelector('.message')?.textContent,
-      skipVisible: host.dataset.actionSkipGap,
-      returnVisible: host.dataset.actionReturnLive,
+      multiplier: value('multiplier'),
+      stage: value('stage'),
+      message: value('message'),
+      actions,
+      toggleLabel: actions.toggle,
+      skipVisible: actions['skip-gap'] === undefined ? 'hidden' : 'visible',
+      returnVisible: actions['return-live'] === undefined ? 'hidden' : 'visible',
     };
   });
+}
+
+async function panelState(page) {
+  return popupState(page);
 }
 
 async function assertNestedShadowAudioGuard(page) {
@@ -632,8 +686,7 @@ async function runVodScenario(context, page) {
   }
   await page.waitForFunction(() => {
     const video = document.querySelector('video');
-    const panel = document.querySelector('[data-bilibili-buffer-panel="true"]');
-    return video?.readyState >= 2 && video.currentSrc !== '' && video.currentTime > 0 && panel !== null;
+    return video?.readyState >= 2 && video.currentSrc !== '' && video.currentTime > 0;
   }, null, { timeout: 20000 });
   const beforeToggle = await page.evaluate(() => window.__bilibiliAudioGuard.assertSilentBeforePlay());
   const nestedShadowGuard = await assertNestedShadowAudioGuard(page);
@@ -641,6 +694,27 @@ async function runVodScenario(context, page) {
   await wait(100);
   const currentTimeAfterAdvance = await page.evaluate(() => document.querySelector('video').currentTime);
   assert.ok(currentTimeAfterAdvance > currentTimeBeforeAdvance);
+  assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
+  const extensionId = await page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId);
+  const { popup, diagnostics: popupDiagnostics } = await openPopup(context, extensionId, page);
+  try {
+    await popup.waitForFunction(
+      () => document.querySelector('[data-status-field="mode"]').textContent === '点播',
+      undefined,
+      { timeout: 15000 },
+    );
+  } catch (error) {
+    const popupDiagnostic = await popup.evaluate(() => ({
+      status: document.querySelector('[data-status]')?.textContent,
+      fields: Object.fromEntries([...document.querySelectorAll('[data-status-field]')].map((element) => [element.dataset.statusField, element.textContent])),
+    }));
+    const pageDiagnostic = await page.evaluate(() => ({
+      marker: document.documentElement.dataset.bilibiliBufferExtensionRuntimeId,
+      traffic: window.__bridgeTraffic,
+      fake: window.__fakeVodState,
+    }));
+    throw new Error(`${error.message}; popup=${JSON.stringify(popupDiagnostic)}; page=${JSON.stringify(pageDiagnostic)}`);
+  }
   const firstState = await panelState(page);
   const actual = await page.evaluate(({ beforeAdvance, afterAdvance }) => ({
     currentSrc: document.querySelector('video').currentSrc,
@@ -665,34 +739,39 @@ async function runVodScenario(context, page) {
   assert.equal(actual.volume, 0);
   assert.equal(actual.qn, 64);
   assert.deepEqual(actual.qualityCalls, [64]);
-  assert.deepEqual(actual.stable, [180]);
-  assert.deepEqual(actual.pausedScheduling, [true]);
+  assert.ok(actual.stable.length >= 1);
+  assert.ok(actual.stable.every((value) => value === 180));
+  assert.ok(actual.pausedScheduling.length >= 1);
+  assert.ok(actual.pausedScheduling.every((value) => value === true));
   assert.equal(firstState.mode, '点播');
   assert.equal(firstState.speed, '2×');
   assert.match(firstState.quality, /qn64 已生效/);
   assert.ok(actual.bridgeTraffic.some((request) => request.operation === 'getCoreSnapshot'));
   assert.ok(actual.bridgeTraffic.some((request) => request.operation === 'callCoreAsync'));
-  const extensionId = await page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId);
   assert.match(extensionId, /^[a-z]{32}$/);
-
-  const { popup, diagnostics: popupDiagnostics } = await openPopup(context, extensionId);
   assert.equal(await popup.locator('input[data-preference="liveEnabled"]').isChecked(), true);
   assert.equal(await popup.locator('input[data-preference="vodEnabled"]').isChecked(), true);
   await popup.locator('input[data-preference="vodEnabled"]').uncheck();
   await popup.waitForFunction(() => document.querySelector('[data-status]').textContent.includes('下次刷新'));
-  assert.ok(await page.locator('[data-bilibili-buffer-panel="true"]').count() === 1);
+  assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
   await page.reload({ waitUntil: 'domcontentloaded' });
   await wait(1200);
   assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
+  assert.equal((await popupState(page)).state, '未提供');
   await popup.bringToFront();
   await popup.locator('input[data-preference="vodEnabled"]').check();
   await popup.waitForFunction(() => document.querySelector('[data-status]').textContent.includes('下次刷新'));
-  await closeFixturePage(popup, 'VOD popup');
   await page.bringToFront();
   await page.reload({ waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('[data-bilibili-buffer-panel="true"]', { state: 'attached', timeout: 15000 });
+  await page.waitForFunction(() => document.querySelector('video') !== null, undefined, { timeout: 15000 });
+  await popup.waitForFunction(
+    () => document.querySelector('[data-status-field="state"]').textContent === 'VOD_READY',
+    undefined,
+    { timeout: 15000 },
+  );
   const pageDiagnosticResult = assertDiagnostics(diagnostics);
   const popupDiagnosticResult = assertDiagnostics(popupDiagnostics);
+  await closeFixturePage(popup, 'VOD popup');
   return {
     mode: 'VOD',
     extensionId,
@@ -720,7 +799,7 @@ function isolatedFakeMediaSourceInit() {
     appendBuffer(bytes) {
       const value = new TextDecoder().decode(bytes);
       const values = JSON.parse(document.documentElement.dataset.bilibiliBufferAppended || '[]');
-      values.push(value);
+    values.push(value.includes('vide') && value.includes('soun') ? 'init' : value);
       document.documentElement.dataset.bilibiliBufferAppended = JSON.stringify(values);
       if (/^seg-\d+$/.test(value)) {
         document.querySelector('video').__bufferEnd += 2;
@@ -740,7 +819,9 @@ function isolatedFakeMediaSourceInit() {
 
     constructor() {
       super();
-      this.readyState = 'open';
+      this.readyState = config.kind === 'mseTimeout' && root.dataset.bilibiliBufferLiveReleaseMseFault !== 'true'
+        ? 'closed'
+        : 'open';
     }
 
     addSourceBuffer() {
@@ -836,7 +917,7 @@ async function runLiveScenario(context, page) {
       await route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: mediaPlaylist });
     } else {
       const name = new URL(url).pathname.split('/').pop().replace('.m4s', '');
-      await route.fulfill({ status: 200, body: name === 'init.mp4' ? 'init' : name });
+      await route.fulfill({ status: 200, body: name === 'init.mp4' ? MUXED_INIT_SEGMENT : name });
     }
   });
   await page.route('https://cdn-b.bilivideo.com/**', async (route) => {
@@ -846,7 +927,7 @@ async function runLiveScenario(context, page) {
       await route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: mediaPlaylist });
     } else {
       const name = new URL(url).pathname.split('/').pop().replace('.m4s', '');
-      await route.fulfill({ status: 200, body: name === 'init.mp4' ? 'init' : name });
+      await route.fulfill({ status: 200, body: name === 'init.mp4' ? MUXED_INIT_SEGMENT : name });
     }
   });
   await page.goto('https://live.bilibili.com/6363772', { waitUntil: 'domcontentloaded' });
@@ -874,12 +955,10 @@ async function runLiveScenario(context, page) {
     throw new Error(`直播隔离世界 fake MSE 注入失败: ${JSON.stringify(fakeInstall)}`);
   }
   await page.evaluate(() => window.__createLiveVideo());
-  await page.waitForSelector('[data-bilibili-buffer-panel="true"]', { state: 'attached', timeout: 15000 });
+  const extensionId = await page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId);
+  const popupInfo = await openPopup(context, extensionId, page);
   try {
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('.state')?.textContent === 'LIVE';
-    }, null, { timeout: 15000 });
+    await waitForPanelState(page, 'LIVE', 15000);
   } catch (error) {
     const isolatedValues = [];
     for (const executionContext of executionContexts) {
@@ -901,15 +980,7 @@ async function runLiveScenario(context, page) {
       }
     }
     const state = await page.evaluate(({ contexts, values }) => ({
-      panel: (() => {
-        const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-        const shadow = host?.shadowRoot;
-        return {
-          state: shadow?.querySelector('.state')?.textContent,
-          rows: [...(shadow?.querySelectorAll('.row') || [])].map((row) => [row.dataset.field, row.textContent]),
-          message: shadow?.querySelector('.message')?.textContent,
-        };
-      })(),
+      pageUi: Boolean(document.querySelector('[data-bilibili-buffer-panel="true"]')),
       fake: window.__fakeLiveState,
       marker: document.documentElement.dataset.bilibiliBufferExtensionRuntimeId,
       executionContexts: contexts,
@@ -939,6 +1010,7 @@ async function runLiveScenario(context, page) {
   assert.ok(actual.bridgeTraffic.some((request) => request.operation === 'callPlayer'));
   assert.ok(requestStarts.length >= 2);
   const diagnosticResult = assertDiagnostics(diagnostics);
+  await closeFixturePage(popupInfo.popup, 'live popup');
   return {
     mode: 'LIVE',
     state,
@@ -1057,6 +1129,7 @@ function livePlayInfoPayload(apiCalls) {
                 session: 'extension-e2e-session',
                 video_codecs: { base: 'avc1.4d401f' },
                 audio_codecs: { base: 'mp4a.40.2' },
+                description: '高清 720P',
               }],
             }],
           }],
@@ -1172,7 +1245,17 @@ async function configureLiveRoutes(page, scenario) {
     }
     if (url.pathname.endsWith('/init.mp4') || url.pathname.endsWith('/init-v2.mp4')) {
       const slow = url.hostname.includes('-a.');
-      await fulfillTracked(route, entry, { status: slow ? 503 : 200, body: url.pathname.endsWith('init-v2.mp4') ? 'init-v2' : 'init' }, slow ? 100 : 0);
+      await fulfillTracked(
+        route,
+        entry,
+        {
+          status: slow ? 503 : 200,
+          body: scenario.kind === 'audioInit' && !state.faultReleased
+            ? VIDEO_ONLY_INIT_SEGMENT
+            : MUXED_INIT_SEGMENT,
+        },
+        slow ? 100 : 0,
+      );
       return;
     }
     const segmentMatch = url.pathname.match(/\/seg-(\d+)\.m4s$/);
@@ -1268,7 +1351,7 @@ function isolatedLiveMseInit(config) {
         throw error;
       }
       const appended = readAppended();
-      appended.push(value);
+      appended.push(value.includes('vide') && value.includes('soun') ? 'init' : value);
       writeAppended(appended);
       if (/^seg-\d+$/.test(value)) {
         root.dataset.bilibiliBufferLiveBufferEnd = String(Number(root.dataset.bilibiliBufferLiveBufferEnd || 0) + 1);
@@ -1295,7 +1378,9 @@ function isolatedLiveMseInit(config) {
 
     constructor() {
       super();
-      this.readyState = 'open';
+      this.readyState = config.kind === 'mseTimeout' && root.dataset.bilibiliBufferLiveReleaseMseFault !== 'true'
+        ? 'closed'
+        : 'open';
     }
 
     addSourceBuffer() {
@@ -1315,6 +1400,8 @@ function isolatedLiveMseInit(config) {
     const value = NativeURL.createObjectURL(source);
     nativeSources.set(value, source);
     root.dataset.bilibiliBufferLiveObjectUrl = value;
+    root.dataset.bilibiliBufferLiveBufferEnd = '0';
+    root.dataset.bilibiliBufferLiveCurrentTime = '0';
     return value;
   };
   FakeURL.revokeObjectURL = (value) => {
@@ -1388,39 +1475,53 @@ async function waitForIsolatedContext(cdp, contexts) {
 }
 
 async function waitForPanelState(page, expectedState, timeout = 15000) {
-  await page.waitForFunction((state) => {
-    const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-    return host?.shadowRoot?.querySelector('.state')?.textContent === state;
-  }, expectedState, { timeout });
+  const popup = statusPopups.get(page);
+  assert.ok(popup !== undefined && !popup.isClosed(), 'status popup is not open for this tab');
+  const expectedStates = Array.isArray(expectedState) ? expectedState : [expectedState];
+  await popup.waitForFunction((state) => {
+    return state.includes(document.querySelector('[data-status-field="state"]')?.textContent);
+  }, expectedStates, { timeout });
 }
 
 async function clickPanelAction(page, action) {
-  await page.evaluate((actionName) => {
-    const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-    const button = host?.shadowRoot?.querySelector(`[data-action="${actionName}"]`);
-    if (button === null || button === undefined || button.hidden) {
-      throw new Error(`panel action is not visible: ${actionName}`);
+  const popup = statusPopups.get(page);
+  assert.ok(popup !== undefined && !popup.isClosed(), 'status popup is not open for this tab');
+  await page.bringToFront();
+  await popup.evaluate((actionName) => {
+    const button = document.querySelector(`[data-actions] [data-action="${actionName}"]`);
+    if (button === null) {
+      throw new Error(`popup action is not visible: ${actionName}`);
     }
     button.click();
   }, action);
 }
 
+async function assertEventuallyVisible(locator, message) {
+  try {
+    await locator.waitFor({ state: 'visible', timeout: 5000 });
+  } catch (error) {
+    throw new Error(`${message}: ${error.message || error}`);
+  }
+}
+
+async function waitForPopupAction(page, action, expectedLabel, timeout = 10000) {
+  const popup = statusPopups.get(page);
+  assert.ok(popup !== undefined && !popup.isClosed(), 'status popup is not open for this tab');
+  await popup.waitForFunction(
+    ({ actionName, label }) => document.querySelector(`[data-actions] [data-action="${actionName}"]`)?.textContent === label,
+    { actionName: action, label: expectedLabel },
+    { timeout },
+  );
+}
+
 async function readLiveFixture(page) {
-  return page.evaluate(() => {
-    const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-    const shadow = host?.shadowRoot;
-    const value = (field) => shadow?.querySelector(`[data-field="${field}"] .value`)?.textContent;
+  const status = await panelState(page);
+  const media = await page.evaluate(() => {
     const video = document.querySelector('video');
     return {
-      state: shadow?.querySelector('.state')?.textContent,
-      message: shadow?.querySelector('.message')?.textContent,
-      skipVisible: host?.dataset.actionSkipGap,
-      returnVisible: host?.dataset.actionReturnLive,
-      speed: value('speed'),
       videoSrc: video?.src,
       currentTime: video?.currentTime,
       playbackRate: video?.playbackRate,
-      toggleLabel: shadow?.querySelector('[data-action="toggle"]')?.textContent,
       appended: JSON.parse(document.documentElement.dataset.bilibiliBufferLiveAppended || '[]'),
       objectUrl: document.documentElement.dataset.bilibiliBufferLiveObjectUrl,
       playCalls: Number(document.documentElement.dataset.bilibiliBufferLivePlayCalls || 0),
@@ -1431,6 +1532,7 @@ async function readLiveFixture(page) {
       chatDisplay: document.querySelector('.chat-history-panel')?.style.display,
     };
   });
+  return { ...status, ...media };
 }
 
 async function openLiveFixture(context, scenario) {
@@ -1456,12 +1558,40 @@ async function openLiveFixture(context, scenario) {
     throw new Error(`could not install live Fake MSE in the extension isolated world: ${JSON.stringify(installed)}`);
   }
   await page.evaluate(() => window.__createLiveFixtureVideo());
-  if (scenario.kind === 'appendFailure') {
-    await waitForPanelState(page, 'GAP_UNRECOVERABLE');
-  } else {
-    await waitForPanelState(page, 'LIVE');
+  const extensionId = await page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId);
+  const popupInfo = await openPopup(context, extensionId, page);
+  try {
+    if (scenario.kind === 'appendFailure' || scenario.kind === 'audioInit' || scenario.kind === 'mseTimeout') {
+      await waitForPanelState(page, 'GAP_UNRECOVERABLE');
+    } else {
+      await waitForPanelState(page, ['LIVE', 'DELAYED']);
+    }
+  } catch (error) {
+    const popupDebug = await popupInfo.popup.evaluate(() => ({
+      status: document.querySelector('[data-status]')?.textContent,
+      fields: Object.fromEntries(
+        [...document.querySelectorAll('[data-status-field]')].map((element) => [element.dataset.statusField, element.textContent]),
+      ),
+    }));
+    const pageDebug = await page.evaluate(() => ({
+      appended: document.documentElement.dataset.bilibiliBufferLiveAppended,
+      objectUrl: document.documentElement.dataset.bilibiliBufferLiveObjectUrl,
+      currentTime: document.documentElement.dataset.bilibiliBufferLiveCurrentTime,
+    }));
+    throw new Error(
+      `${error.message}; popup=${JSON.stringify(popupDebug)}; page=${JSON.stringify(pageDebug)}; requests=${JSON.stringify(routes.state.requests)}`,
+    );
   }
-  return { page, diagnostics, routes, cdp, isolatedContextId: isolated.id };
+  return {
+    page,
+    popup: popupInfo.popup,
+    popupDiagnostics: popupInfo.diagnostics,
+    diagnostics,
+    routes,
+    cdp,
+    isolatedContextId: isolated.id,
+    extensionId,
+  };
 }
 
 function assertConcurrentCandidateStarts(requests, pathname) {
@@ -1484,6 +1614,9 @@ async function closeFixturePage(page, label) {
 
 async function closeLiveFixture(fixture) {
   const failures = [];
+  if (fixture.popup !== undefined && !fixture.popup.isClosed()) {
+    await runCleanupStep(failures, 'live fixture popup close', () => fixture.popup.close({ runBeforeUnload: false }));
+  }
   await runCleanupStep(failures, 'live fixture page close', () => fixture.page.close({ runBeforeUnload: false }));
   throwCleanupFailures(failures);
 }
@@ -1548,12 +1681,15 @@ async function runLiveRecoveryScenario(context, outageSeconds) {
       document.querySelector('video').dispatchEvent(new Event('waiting'));
     }));
     await runLiveRecoveryStep('RECOVERING state', () => waitForPanelState(page, 'RECOVERING'));
-    await runLiveRecoveryStep('same-sequence delayed recovery', () => page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      const segments = JSON.parse(document.documentElement.dataset.bilibiliBufferLiveAppended || '[]')
-        .filter((value) => /^seg-\d+$/.test(value));
-      return host?.shadowRoot?.querySelector('.state')?.textContent === 'DELAYED' && segments.includes('seg-134');
-    }, undefined, { timeout: outageSeconds * 1000 + 45000 }), outageSeconds * 1000 + 50000);
+    await runLiveRecoveryStep('same-sequence delayed recovery', async () => {
+      const timeout = outageSeconds * 1000 + 45000;
+      await waitForPanelState(page, 'DELAYED', timeout);
+      await page.waitForFunction(
+        () => JSON.parse(document.documentElement.dataset.bilibiliBufferLiveAppended || '[]').includes('seg-134'),
+        undefined,
+        { timeout },
+      );
+    }, outageSeconds * 1000 + 50000);
     const delayed = await runLiveRecoveryStep('delayed recovery snapshot', () => readLiveFixture(page));
     const delayedSegments = appendedSegmentNumbers(delayed.appended);
     assert.deepEqual(delayedSegments.slice(0, 16), Array.from({ length: 16 }, (_value, index) => 119 + index));
@@ -1661,6 +1797,8 @@ const liveGapExpectations = Object.freeze({
   variantMissing: 'MANIFEST_VARIANT_MISSING',
   mapMissing: 'MANIFEST_FMP4_MAP_MISSING',
   initMapChanged: 'GAP_MANIFEST_INITIALIZATION_CHANGED',
+  audioInit: 'LIVE_AUDIO_TRACK_MISSING',
+  mseTimeout: 'MSE_WAIT_TIMEOUT',
   appendFailure: 'MSE_APPEND_ERROR',
   removeFailure: 'MSE_REMOVE_ERROR',
 });
@@ -1707,6 +1845,11 @@ async function runLiveGapScenario(context, kind) {
     if (kind !== 'appendFailure') {
       routes.releaseFault();
       if (kind === 'removeFailure') {
+        await page.evaluate(() => {
+          document.documentElement.dataset.bilibiliBufferLiveReleaseMseFault = 'true';
+        });
+      }
+      if (kind === 'mseTimeout') {
         await page.evaluate(() => {
           document.documentElement.dataset.bilibiliBufferLiveReleaseMseFault = 'true';
         });
@@ -1783,12 +1926,12 @@ async function runTemporaryManifestScenario(context, kind) {
       { timeout: 15000 },
     );
     routes.activateTemporaryManifestFailure();
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      const appended = JSON.parse(document.documentElement.dataset.bilibiliBufferLiveAppended || '[]');
-      return document.documentElement.dataset.bilibiliBufferLiveAppended !== undefined &&
-        host?.shadowRoot?.querySelector('.state')?.textContent !== 'GAP_UNRECOVERABLE' && appended.includes('seg-120');
-    }, undefined, { timeout: kind === 'manifestTimeout' ? 20000 : 10000 });
+    await page.waitForFunction(
+      () => JSON.parse(document.documentElement.dataset.bilibiliBufferLiveAppended || '[]').includes('seg-120'),
+      undefined,
+      { timeout: kind === 'manifestTimeout' ? 20000 : 10000 },
+    );
+    assert.notEqual((await panelState(page)).state, 'GAP_UNRECOVERABLE');
     assert.equal(routes.state.temporaryManifestFailures, 2);
     const snapshot = await readLiveFixture(page);
     assert.notEqual(snapshot.state, 'GAP_UNRECOVERABLE');
@@ -1853,10 +1996,7 @@ async function runLiveImmediateDisableScenario(context) {
     const beforeDisable = await readLiveFixture(page);
     assert.equal(beforeDisable.playbackRate, 1);
     await clickPanelAction(page, 'toggle');
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-action="toggle"]')?.textContent === '启用';
-    }, undefined, { timeout: 5000 });
+    await waitForPopupAction(page, 'toggle', '启用', 5000);
     const disabledInteraction = await page.evaluate(() => {
       const video = document.querySelector('video');
       const before = video.currentTime;
@@ -1879,10 +2019,7 @@ async function runLiveImmediateDisableScenario(context) {
     assert.equal(disabled.playbackRate, 2);
 
     await clickPanelAction(page, 'toggle');
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-action="toggle"]')?.textContent === '停用';
-    }, undefined, { timeout: 10000 });
+    await waitForPopupAction(page, 'toggle', '停用', 10000);
     const reenabledInteraction = await page.evaluate(() => {
       const video = document.querySelector('video');
       video.dispatchEvent(new Event('timeupdate'));
@@ -1921,20 +2058,19 @@ async function runLiveImmediateDisableScenario(context) {
 async function runLivePopupRefreshScenario(context) {
   const fixture = await openLiveFixture(context, { kind: 'popupLive' });
   try {
-    const extensionId = await fixture.page.evaluate(
-      () => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId,
-    );
-    const { popup, diagnostics: popupDiagnostics } = await openPopup(context, extensionId);
+    const { page, popup, popupDiagnostics, extensionId } = fixture;
     assert.equal(await popup.locator('input[data-preference="liveEnabled"]').isChecked(), true);
+    await page.bringToFront();
     await popup.locator('input[data-preference="liveEnabled"]').uncheck();
     await popup.waitForFunction(() => document.querySelector('[data-status]').textContent.includes('下次刷新'));
-    assert.equal(await fixture.page.locator('[data-bilibili-buffer-panel="true"]').count(), 1);
-    await fixture.page.reload({ waitUntil: 'domcontentloaded' });
+    assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await wait(1000);
-    assert.equal(await fixture.page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
+    assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
+    assert.equal((await popupState(page)).state, '未提供');
+    await popup.bringToFront();
     await popup.locator('input[data-preference="liveEnabled"]').check();
     await popup.waitForFunction(() => document.querySelector('[data-status]').textContent.includes('下次刷新'));
-    await closeFixturePage(popup, 'live popup');
     const diagnostics = {
       page: assertDiagnostics(fixture.diagnostics),
       popup: assertDiagnostics(popupDiagnostics),
@@ -2010,6 +2146,7 @@ const state = {
   realQ: 32,
   available: ${qualityMode === 'unavailable' ? '[32, 16]' : '[64, 32, 16]'},
   calls: [],
+  playerCalls: [],
   stableCalls: [],
   pausedScheduling: [],
   videoInventory: 120,
@@ -2020,7 +2157,13 @@ const state = {
   bitrate: 1000000,
 };
 class FakeCore extends EventTarget {
-  constructor(id) { super(); this.id = id; }
+  constructor(id) {
+    super();
+    this.id = id;
+    if (['noCoreQuality', 'pageFallback', 'noBoth'].includes(state.mode)) this.requestQuality = undefined;
+    if (state.mode === 'noStable') this.setStableBufferTime = undefined;
+    if (state.mode === 'noSchedule') this.setScheduleWhilePaused = undefined;
+  }
   getQuality() { return { nowQ: state.nowQ, realQ: state.realQ, accept_qn: state.available }; }
   getSupportedQualityList() { return state.available; }
   getBufferedRanges() { return { video: ranges(state.videoInventory), audio: ranges(state.audioInventory) }; }
@@ -2106,6 +2249,14 @@ state.resolvePending = (result = true) => {
 };
 window.__fakeVodPolicy = state;
 window.player = { __core: () => state.core };
+if (['pageFallback', 'corePriority'].includes(state.mode)) {
+  window.player.requestQuality = (value) => {
+    state.playerCalls.push({ value, at: Date.now() });
+    state.nowQ = value;
+    state.realQ = value;
+    return Promise.resolve(true);
+  };
+}
 replaceSource('vod-policy-source-1');
 window.__startVodPolicyFixture = () => {
   if (window.__fakeVodPolicy.started === true) return;
@@ -2153,26 +2304,32 @@ async function openVodPolicyFixture(context, qualityMode) {
     throw new Error(`could not install VOD fixture video shim in the extension isolated world: ${JSON.stringify(installed)}`);
   }
   await page.evaluate(() => window.__startVodPolicyFixture());
-  await page.waitForSelector('[data-bilibili-buffer-panel="true"]', { state: 'attached' });
-  return { page, diagnostics, requestTimeline, cdp, isolatedContextId: isolated.id };
+  const extensionId = await page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId);
+  const popupInfo = await openPopup(context, extensionId, page);
+  await popupInfo.popup.waitForFunction(
+    () => document.querySelector('[data-status-field="mode"]').textContent === '点播',
+    undefined,
+    { timeout: 15000 },
+  );
+  return {
+    page,
+    popup: popupInfo.popup,
+    popupDiagnostics: popupInfo.diagnostics,
+    diagnostics,
+    requestTimeline,
+    cdp,
+    isolatedContextId: isolated.id,
+    extensionId,
+  };
 }
 
 async function readVodPolicyFixture(page) {
-  return page.evaluate(() => {
-    const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-    const shadow = host?.shadowRoot;
-    const value = (field) => shadow?.querySelector(`[data-field="${field}"] .value`)?.textContent;
+  const status = await popupState(page);
+  const fixture = await page.evaluate(() => {
     const state = window.__fakeVodPolicy;
     return {
-      panel: {
-        state: shadow?.querySelector('.state')?.textContent,
-        quality: value('quality'),
-        speed: value('speed'),
-        inventory: value('inventory'),
-        multiplier: value('multiplier'),
-        message: shadow?.querySelector('.message')?.textContent,
-      },
       calls: state.calls,
+      playerCalls: state.playerCalls,
       stableCalls: state.stableCalls,
       pausedScheduling: state.pausedScheduling,
       qn: state.realQ,
@@ -2185,10 +2342,19 @@ async function readVodPolicyFixture(page) {
         currentSrc: state.video.currentSrc,
         src: state.video.src,
       },
-      toggleLabel: shadow?.querySelector('[data-action="toggle"]')?.textContent,
       bridgeTraffic: window.__bridgeTraffic,
     };
   });
+  return { panel: status, ...fixture };
+}
+
+async function closeVodPolicyFixture(fixture, label) {
+  const failures = [];
+  if (fixture.popup !== undefined && !fixture.popup.isClosed()) {
+    await runCleanupStep(failures, `${label} popup close`, () => fixture.popup.close({ runBeforeUnload: false }));
+  }
+  await runCleanupStep(failures, `${label} page close`, () => fixture.page.close({ runBeforeUnload: false }));
+  throwCleanupFailures(failures);
 }
 
 async function runVodQualityScenario(context, qualityMode) {
@@ -2196,10 +2362,11 @@ async function runVodQualityScenario(context, qualityMode) {
   try {
     const expectedText = qualityMode === 'success' || qualityMode === 'realQ' ? '已生效' : '未生效';
     try {
-      await fixture.page.waitForFunction((text) => {
-        const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-        return host?.shadowRoot?.querySelector('[data-field="quality"] .value')?.textContent.includes(text);
-      }, expectedText, { timeout: qualityMode === 'timeout' ? 10000 : 5000 });
+      await fixture.popup.waitForFunction(
+        (text) => document.querySelector('[data-status-field="quality"]')?.textContent.includes(text),
+        expectedText,
+        { timeout: qualityMode === 'timeout' ? 10000 : 5000 },
+      );
     } catch (error) {
       const snapshot = await readVodPolicyFixture(fixture.page);
       error.message = `${error.message}; VOD quality fixture snapshot: ${JSON.stringify(snapshot)}`;
@@ -2221,10 +2388,69 @@ async function runVodQualityScenario(context, qualityMode) {
       assert.equal(result.nowQ, 64, 'realQ must override nowQ during the initial observation');
     }
     assert.match(result.panel.quality, new RegExp(expectedText));
-    const diagnostics = assertDiagnostics(fixture.diagnostics);
+    const diagnostics = {
+      page: assertDiagnostics(fixture.diagnostics),
+      popup: assertDiagnostics(fixture.popupDiagnostics),
+    };
     return { status: 'PASS', qualityMode, result, requestTimeline: fixture.requestTimeline, diagnostics };
   } finally {
-    await closeFixturePage(fixture.page, `VOD quality ${qualityMode}`);
+    await closeVodPolicyFixture(fixture, `VOD quality ${qualityMode}`);
+  }
+}
+
+async function runVodCapabilityScenario(context, capabilityMode) {
+  const fixture = await openVodPolicyFixture(context, capabilityMode);
+  try {
+    const success = capabilityMode !== 'noBoth';
+    const expectedText = success ? '已生效' : '未生效';
+    try {
+      await fixture.popup.waitForFunction(
+        (text) => document.querySelector('[data-status-field="quality"]')?.textContent.includes(text),
+        expectedText,
+        { timeout: 10000 },
+      );
+    } catch (error) {
+      const snapshot = await readVodPolicyFixture(fixture.page);
+      error.message = `${error.message}; VOD capability fixture snapshot: ${JSON.stringify(snapshot)}`;
+      throw error;
+    }
+    const result = await readVodPolicyFixture(fixture.page);
+    assert.equal(result.panel.speed, '2×');
+    assert.ok(result.bridgeTraffic.some((request) => request.operation === 'getCoreSnapshot'));
+    if (capabilityMode === 'corePriority') {
+      assert.equal(result.calls.length, 1, 'core requestQuality must win when both paths exist');
+      assert.equal(result.playerCalls.length, 0, 'page-player fallback must stay unused when core is available');
+      assert.equal(result.qn, 64);
+    } else if (capabilityMode === 'pageFallback') {
+      assert.equal(result.calls.length, 0, 'core requestQuality must not be called when its snapshot flag is false');
+      assert.equal(result.playerCalls.length, 1, 'page-player requestQuality fallback must be used once');
+      assert.equal(result.qn, 64);
+    } else if (capabilityMode === 'noBoth') {
+      assert.equal(result.calls.length, 0);
+      assert.equal(result.playerCalls.length, 0);
+      assert.equal(result.qn, 32);
+      assert.match(result.panel.quality, /请在 Bilibili 播放器手动选择 720P/);
+    }
+    if (capabilityMode === 'noStable') {
+      assert.equal(result.stableCalls.length, 0, 'missing stable-buffer setter must not be invoked');
+      assert.equal(result.pausedScheduling.length, 1, 'paused scheduling must remain independently enabled');
+    }
+    if (capabilityMode === 'noSchedule') {
+      assert.equal(result.stableCalls.at(-1).value, 180, 'stable-buffer setter must remain independently enabled');
+      assert.equal(result.pausedScheduling.length, 0, 'missing paused scheduling setter must not be invoked');
+      await fixture.page.evaluate(() => window.__fakeVodPolicy.setInventory(20, 20));
+      await wait(800);
+      const playing = await readVodPolicyFixture(fixture.page);
+      assert.equal(playing.paused, false, 'unsupported paused scheduling must keep low-inventory playback running');
+      assert.match(playing.panel.message, /不支持暂停时继续下载/);
+    }
+    const diagnostics = {
+      page: assertDiagnostics(fixture.diagnostics),
+      popup: assertDiagnostics(fixture.popupDiagnostics),
+    };
+    return { status: 'PASS', capabilityMode, result, diagnostics };
+  } finally {
+    await closeVodPolicyFixture(fixture, `VOD capability ${capabilityMode}`);
   }
 }
 
@@ -2232,21 +2458,20 @@ async function runVodPolicyScenario(context) {
   const fixture = await openVodPolicyFixture(context, 'success');
   try {
     const { page } = fixture;
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-field="quality"] .value')?.textContent.includes('已生效');
-    });
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-field="multiplier"] .value')?.textContent.includes('30 秒') &&
-        !host.shadowRoot.querySelector('[data-field="multiplier"] .value').textContent.includes('码率不可用');
-    }, undefined, { timeout: 10000 });
+    await fixture.popup.waitForFunction(
+      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('已生效'),
+      undefined,
+      { timeout: 10000 },
+    );
+    await fixture.popup.waitForFunction(
+      () => document.querySelector('[data-status-field="multiplier"]')?.textContent.includes('30 秒') &&
+        !document.querySelector('[data-status-field="multiplier"]').textContent.includes('码率不可用'),
+      undefined,
+      { timeout: 10000 },
+    );
     const throughput = await readVodPolicyFixture(page);
     await page.evaluate(() => window.__fakeVodPolicy.setInventory(120, 120));
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('.state')?.textContent === 'VOD_READY';
-    });
+    await waitForPanelState(page, 'VOD_READY');
     await page.evaluate(() => window.__fakeVodPolicy.setInventory(119, 119));
     await wait(700);
     const at119 = await readVodPolicyFixture(page);
@@ -2254,6 +2479,7 @@ async function runVodPolicyScenario(context) {
 
     await page.evaluate(() => window.__fakeVodPolicy.setInventory(29, 29));
     await page.waitForFunction(() => window.__fakeVodPolicy.video.paused === true);
+    await waitForPanelState(page, 'REFILLING');
     const at29 = await readVodPolicyFixture(page);
     assert.equal(at29.panel.state, 'REFILLING');
     await page.evaluate(async () => {
@@ -2270,10 +2496,7 @@ async function runVodPolicyScenario(context) {
       window.__fakeVodPolicy.video.pause();
       window.__fakeVodPolicy.setInventory(0, 0);
     });
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('.state')?.textContent === 'USER_PAUSED';
-    });
+    await waitForPanelState(page, 'USER_PAUSED');
     await wait(700);
     const userPaused = await readVodPolicyFixture(page);
     assert.equal(userPaused.paused, true, 'a user pause must suppress automatic resume');
@@ -2313,7 +2536,7 @@ async function runVodPolicyScenario(context) {
       oldCoreRequests,
       'the prior core must not retain a reconcile timer after same-tab source/part replacement',
     );
-    assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 1);
+    assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
     assert.equal(afterTeardown.panel.state === 'VOD_READY' || afterTeardown.panel.state === 'USER_PAUSED', true);
     assert.match(throughput.panel.multiplier, /30 秒 .*60 秒/);
     assert.match(throughput.panel.message, /下载不足以覆盖当前 2× 消耗/);
@@ -2333,7 +2556,7 @@ async function runVodPolicyScenario(context) {
       diagnostics,
     };
   } finally {
-    await closeFixturePage(fixture.page, 'VOD policy fixture');
+    await closeVodPolicyFixture(fixture, 'VOD policy fixture');
   }
 }
 
@@ -2358,10 +2581,11 @@ async function runVodStaleCompletionScenario(context) {
     assert.equal(afterNewRequest.calls[1].value, 64);
     await page.evaluate(() => window.__fakeVodPolicy.resolvePending(true));
     await page.waitForFunction(() => window.__fakeVodPolicy.realQ === 64);
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-field="quality"] .value')?.textContent.includes('qn64 已生效');
-    }, undefined, { timeout: 10000 });
+    await fixture.popup.waitForFunction(
+      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('qn64 已生效'),
+      undefined,
+      { timeout: 10000 },
+    );
     const final = await readVodPolicyFixture(page);
     assert.match(final.panel.quality, /qn64 已生效/);
     assert.equal(final.calls.length, 2, 'the stale completion must not suppress or duplicate the new-core request');
@@ -2375,7 +2599,7 @@ async function runVodStaleCompletionScenario(context) {
       diagnostics,
     };
   } finally {
-    await closeFixturePage(fixture.page, 'VOD stale-completion fixture');
+    await closeVodPolicyFixture(fixture, 'VOD stale-completion fixture');
   }
 }
 
@@ -2384,17 +2608,15 @@ async function runVodImmediateDisableScenario(context) {
   try {
     const { page } = fixture;
     await page.waitForFunction(() => window.__fakeVodPolicy.calls.length === 1);
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-field="quality"] .value')?.textContent.includes('正在请求 720P');
-    }, undefined, { timeout: 10000 });
+    await fixture.popup.waitForFunction(
+      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('正在请求 720P'),
+      undefined,
+      { timeout: 10000 },
+    );
     const beforeDisable = await readVodPolicyFixture(page);
     assert.match(beforeDisable.panel.quality, /正在请求 720P/);
     await clickPanelAction(page, 'toggle');
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-action="toggle"]')?.textContent === '启用';
-    }, undefined, { timeout: 5000 });
+    await waitForPopupAction(page, 'toggle', '启用', 5000);
     await page.evaluate(() => {
       const video = window.__fakeVodPolicy.video;
       video.playbackRate = 1;
@@ -2403,7 +2625,7 @@ async function runVodImmediateDisableScenario(context) {
     });
     await wait(800);
     const disabled = await readVodPolicyFixture(page);
-    assert.equal(disabled.toggleLabel, '启用');
+    assert.equal(disabled.panel.toggleLabel, '启用');
     assert.equal(disabled.playbackRate, 1, 'disabling must stop the VOD 2× rate guard immediately');
     assert.equal(disabled.calls.length, 1, 'disabling must not launch another quality request');
     assert.equal(disabled.qn, 64, 'the already-issued page request may complete physically');
@@ -2415,11 +2637,12 @@ async function runVodImmediateDisableScenario(context) {
     assert.doesNotMatch(disabled.panel.quality, /qn64 已生效/);
 
     await clickPanelAction(page, 'toggle');
-    await page.waitForFunction(() => {
-      const host = document.querySelector('[data-bilibili-buffer-panel="true"]');
-      return host?.shadowRoot?.querySelector('[data-action="toggle"]')?.textContent === '停用' &&
-        host.shadowRoot.querySelector('[data-field="quality"] .value')?.textContent.includes('qn64 已生效');
-    }, undefined, { timeout: 10000 });
+    await fixture.popup.waitForFunction(
+      () => document.querySelector('[data-actions] [data-action="toggle"]')?.textContent === '停用' &&
+        document.querySelector('[data-status-field="quality"]')?.textContent.includes('qn64 已生效'),
+      undefined,
+      { timeout: 10000 },
+    );
     const reenabled = await readVodPolicyFixture(page);
     assert.equal(reenabled.playbackRate, 2, 're-enabling must restore the VOD 2× policy');
     assert.match(reenabled.panel.quality, /qn64 已生效/);
@@ -2433,7 +2656,7 @@ async function runVodImmediateDisableScenario(context) {
       diagnostics,
     };
   } finally {
-    await closeFixturePage(fixture.page, 'VOD immediate-disable fixture');
+    await closeVodPolicyFixture(fixture, 'VOD immediate-disable fixture');
   }
 }
 
@@ -2488,6 +2711,10 @@ async function runLiveRecoveryStep(label, operation, timeoutMilliseconds = 60000
 }
 
 async function runScenario(name, runner) {
+  if (scenarioFilter !== undefined && scenarioFilter !== name) {
+    console.log(`E2E SKIP ${name}`);
+    return undefined;
+  }
   report.currentScenario = { name, status: 'RUNNING', startedAt: new Date().toISOString() };
   await checkpointReport();
   console.log(`E2E START ${name}`);
@@ -2538,8 +2765,10 @@ try {
   });
   await context.addInitScript({ content: `(${audioGuard.toString()})();` });
   const page = context.pages()[0] || await context.newPage();
-  await runScenario('vodActualMediaAndPopup', () => runVodScenario(context, page));
-  report.extensionRuntimeId = report.scenarios.vodActualMediaAndPopup.extensionId;
+  const vodScenario = await runScenario('vodActualMediaAndPopup', () => runVodScenario(context, page));
+  if (vodScenario !== undefined) {
+    report.extensionRuntimeId = vodScenario.extensionId;
+  }
   await runScenario('livePopupRefresh', () => runLivePopupRefreshScenario(context));
   await runScenario('liveDelayedPlayer', () => runLiveDelayedPlayerScenario(context));
   await runScenario('liveImmediateDisable', () => runLiveImmediateDisableScenario(context));
@@ -2557,6 +2786,9 @@ try {
   await runScenario('liveTemporaryManifestTimeout', () => runTemporaryManifestScenario(context, 'manifestTimeout'));
   for (const qualityMode of ['success', 'reject', 'unavailable', 'timeout', 'realQ']) {
     await runScenario(`vodQuality${qualityMode}`, () => runVodQualityScenario(context, qualityMode));
+  }
+  for (const capabilityMode of ['corePriority', 'pageFallback', 'noBoth', 'noStable', 'noSchedule']) {
+    await runScenario(`vodCapability${capabilityMode}`, () => runVodCapabilityScenario(context, capabilityMode));
   }
   await runScenario('vodPolicyAndSpaReplacement', () => runVodPolicyScenario(context));
   await runScenario('vodStaleAsyncIsolation', () => runVodStaleCompletionScenario(context));

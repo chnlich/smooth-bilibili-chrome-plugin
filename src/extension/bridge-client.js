@@ -2,6 +2,7 @@ import { BufferScriptError, fail } from '../errors.js';
 import {
   assertOperation,
   BRIDGE_CORE_EVENTS,
+  BRIDGE_PLAYER_CAPABILITIES,
   BRIDGE_EVENT_EVENT,
   BRIDGE_REQUEST_EVENT,
   BRIDGE_RESPONSE_ATTRIBUTE,
@@ -22,6 +23,7 @@ const CORE_SNAPSHOT_FIELDS = Object.freeze([
   'mediaInfo',
   'stableBufferTime',
   'supportsCoreEvents',
+  'capabilities',
 ]);
 
 function isObject(value) {
@@ -78,6 +80,41 @@ function validateCoreSnapshot(snapshot) {
   }
   if (typeof snapshot.supportsCoreEvents !== 'boolean') {
     fail('BRIDGE_SNAPSHOT_INVALID', '桥接内核快照缺少事件能力标记');
+  }
+  const playerCapabilities = snapshot.capabilities?.player;
+  const coreCapabilities = snapshot.capabilities?.core;
+  if (
+    !isObject(snapshot.capabilities) ||
+    !isObject(playerCapabilities) ||
+    !isObject(coreCapabilities)
+  ) {
+    fail('BRIDGE_SNAPSHOT_INVALID', '桥接内核快照缺少真实能力标记');
+  }
+  for (const field of BRIDGE_PLAYER_CAPABILITIES) {
+    if (typeof playerCapabilities[field] !== 'boolean') {
+      fail('BRIDGE_SNAPSHOT_INVALID', `桥接内核快照缺少页面播放器能力标记: ${field}`);
+    }
+  }
+  for (const field of [
+    'getQuality',
+    'getCurrentQuality',
+    'getCurrentQn',
+    'getSupportedQualityList',
+    'getQualityList',
+    'requestQuality',
+    'getBufferedRanges',
+    'getMediaInfo',
+    'getCurrentMediaInfo',
+    'getQualityInfo',
+    'getStableBufferTime',
+    'getStableBufferSeconds',
+    'setStableBufferTime',
+    'setScheduleWhilePaused',
+    'events',
+  ]) {
+    if (typeof coreCapabilities[field] !== 'boolean') {
+      fail('BRIDGE_SNAPSHOT_INVALID', `桥接内核快照缺少能力标记: ${field}`);
+    }
   }
   for (const [field, value] of Object.entries(snapshot)) {
     if (!CORE_SNAPSHOT_FIELDS.includes(field) || !isSerializable(value)) {
@@ -138,6 +175,13 @@ function timeRangesFromSnapshot(snapshot) {
 
 function responseError(response) {
   return new BufferScriptError(response.error?.code || 'BRIDGE_CALL_FAILED', response.error?.message || '桥接调用失败');
+}
+
+function remapUnavailable(error, code, message) {
+  if (error?.code === 'BRIDGE_METHOD_UNAVAILABLE') {
+    fail(code, message, error);
+  }
+  throw error;
 }
 
 export class BridgeClient {
@@ -345,6 +389,14 @@ export class BridgeCore {
     }
   }
 
+  supports(method) {
+    this.assertActive();
+    if (method === 'events') {
+      return this.snapshot.capabilities.core.events;
+    }
+    return this.snapshot.capabilities.core[method] === true;
+  }
+
   markStale() {
     if (this.stale) {
       return;
@@ -375,6 +427,9 @@ export class BridgeCore {
   readFirstAvailable(methods, snapshotField, args = []) {
     let unavailable;
     for (const method of methods) {
+      if (!this.supports(method)) {
+        continue;
+      }
       try {
         const value = this.callCoreSync(method, args);
         this.snapshot[snapshotField] = value;
@@ -425,17 +480,35 @@ export class BridgeCore {
   }
 
   setStableBufferTime(seconds) {
-    const result = this.callCoreSync('setStableBufferTime', [seconds]);
+    if (!this.supports('setStableBufferTime')) {
+      fail('VOD_STABLE_BUFFER_UNAVAILABLE', '点播内核没有稳定缓冲设置能力');
+    }
+    let result;
+    try {
+      result = this.callCoreSync('setStableBufferTime', [seconds]);
+    } catch (error) {
+      remapUnavailable(error, 'VOD_STABLE_BUFFER_UNAVAILABLE', '点播内核没有稳定缓冲设置能力');
+    }
     this.snapshot.stableBufferTime = seconds;
     return result;
   }
 
   setScheduleWhilePaused(enabled) {
-    return this.callCoreSync('setScheduleWhilePaused', [enabled]);
+    if (!this.supports('setScheduleWhilePaused')) {
+      fail('VOD_PAUSED_SCHEDULE_UNAVAILABLE', '点播内核没有暂停时继续调度能力');
+    }
+    try {
+      return this.callCoreSync('setScheduleWhilePaused', [enabled]);
+    } catch (error) {
+      remapUnavailable(error, 'VOD_PAUSED_SCHEDULE_UNAVAILABLE', '点播内核没有暂停时继续调度能力');
+    }
   }
 
   requestQuality(qualityNumber) {
     this.assertActive();
+    if (!this.supports('requestQuality')) {
+      fail('VOD_QUALITY_UNAVAILABLE', '当前播放器内核没有权限感知的画质请求能力');
+    }
     const source = this.snapshot.source;
     return this.client
       .callAsync('callCoreAsync', [this.coreId, 'requestQuality', [qualityNumber]])
@@ -451,6 +524,9 @@ export class BridgeCore {
         return value?.result === undefined ? value : value.result;
       })
       .catch((error) => {
+        if (error?.code === 'BRIDGE_METHOD_UNAVAILABLE') {
+          fail('VOD_QUALITY_UNAVAILABLE', '当前播放器内核没有权限感知的画质请求能力', error);
+        }
         if (error?.code === 'BRIDGE_CORE_STALE') {
           this.markStale();
         }
@@ -460,7 +536,15 @@ export class BridgeCore {
 
   addEventListener(name, callback) {
     this.assertActive();
-    const subscriptionId = this.client.subscribeCore(this.coreId, name, this.snapshot.source, callback);
+    if (!this.supports('events')) {
+      fail('VOD_CORE_EVENTS_UNAVAILABLE', '当前播放器内核没有事件能力');
+    }
+    let subscriptionId;
+    try {
+      subscriptionId = this.client.subscribeCore(this.coreId, name, this.snapshot.source, callback);
+    } catch (error) {
+      remapUnavailable(error, 'VOD_CORE_EVENTS_UNAVAILABLE', '当前播放器内核没有事件能力');
+    }
     this.subscriptions.set(callback, subscriptionId);
   }
 
@@ -478,6 +562,7 @@ export class BridgeCore {
 
 export function createPageWindowAdapter(client, windowObject = window) {
   const state = { core: undefined };
+  let playerCapabilities = Object.fromEntries(BRIDGE_PLAYER_CAPABILITIES.map((method) => [method, false]));
   let refreshPromise;
   const player = {
     __core() {
@@ -495,6 +580,22 @@ export function createPageWindowAdapter(client, windowObject = window) {
     pause() {
       return client.callAsync('callPlayer', ['pause']);
     },
+    requestQuality(qualityNumber) {
+      if (!Number.isInteger(qualityNumber) || qualityNumber <= 0) {
+        fail('VOD_QUALITY_ARGUMENT_INVALID', '页面播放器画质请求必须是正整数');
+      }
+      return client.callAsync('callPlayer', ['requestQuality', qualityNumber]).then((value) =>
+        value?.result === undefined ? value : value.result);
+    },
+    supports(method) {
+      if (!BRIDGE_PLAYER_CAPABILITIES.includes(method)) {
+        fail('BRIDGE_CAPABILITY_UNKNOWN', `页面播放器能力未定义: ${method}`);
+      }
+      return playerCapabilities[method] === true;
+    },
+    get capabilities() {
+      return { ...playerCapabilities };
+    },
   };
   const pageWindow = {
     location: windowObject.location,
@@ -511,6 +612,7 @@ export function createPageWindowAdapter(client, windowObject = window) {
           .callAsync('getCoreSnapshot', [])
           .then((snapshot) => {
             validateCoreSnapshot(snapshot);
+            playerCapabilities = snapshot.capabilities.player;
             if (
               state.core === undefined ||
               state.core.stale ||

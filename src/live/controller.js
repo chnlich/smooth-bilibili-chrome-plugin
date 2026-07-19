@@ -11,7 +11,7 @@ import {
 import { fetchBytesFromCandidates, fetchTextFromCandidates } from './fetcher.js';
 import { OrderedSegmentQueue } from './queue.js';
 import { LiveStateMachine } from './state.js';
-import { MseAppendPipeline } from './mse.js';
+import { MseAppendPipeline, validateInitSegmentTracks } from './mse.js';
 import { DanmakuVisibilityController } from './danmaku.js';
 import { installLivePlaybackGuard } from './guard.js';
 import { copyTimeRanges, computeForwardInventory } from '../vod/buffer.js';
@@ -90,8 +90,8 @@ async function configureOuterPlayer(windowObject, video, logger) {
       try {
         await player[name](config);
       } catch (error) {
-        if (error?.code === 'PLAYER_UNAVAILABLE') {
-          logger.warn(`页面播放器尚未就绪，跳过 ${name}`, error);
+        if (error?.code === 'PLAYER_UNAVAILABLE' || error?.code === 'BRIDGE_METHOD_UNAVAILABLE') {
+          logger.warn(`页面播放器 ${name} 能力在调用时不可用，继续接管`, error);
         } else {
           logger.error(`调用 ${name} 失败`, error);
         }
@@ -101,7 +101,7 @@ async function configureOuterPlayer(windowObject, video, logger) {
       try {
         await player.pause();
       } catch (error) {
-        logger.warn('调用页面播放器 pause 失败，继续接管 video', error);
+        logger.warn('页面播放器 pause 能力在调用时不可用，继续接管 video', error);
       }
     }
   }
@@ -115,10 +115,15 @@ function getVideoForwardInventory(video) {
 }
 
 function buildMime(track) {
-  if (track.codecString.length === 0) {
-    fail('LIVE_CODEC_MISSING', '播放 API 没有返回可用于 MSE 的 codec 字符串');
+  if (
+    typeof track.videoCodecString !== 'string' ||
+    track.videoCodecString.trim().length === 0 ||
+    typeof track.audioCodecString !== 'string' ||
+    track.audioCodecString.trim().length === 0
+  ) {
+    fail('LIVE_CODEC_MISSING', '播放 API 没有同时返回 video 和 audio codec 字符串');
   }
-  return `video/mp4; codecs="${track.codecString}"`;
+  return `video/mp4; codecs="${track.videoCodecString}, ${track.audioCodecString}"`;
 }
 
 function requiresManifestContinuityGap(error) {
@@ -135,7 +140,9 @@ function requiresUnrecoverableGap(error) {
     requiresManifestContinuityGap(error) ||
     ['MANIFEST_PERMANENT_404', 'MSE_APPEND_ERROR', 'MSE_REMOVE_ERROR', 'MSE_QUOTA_EXCEEDED'].includes(error?.code) ||
     error?.code?.startsWith('GAP_') ||
-    error?.code?.startsWith('LIVE_SESSION_')
+    error?.code?.startsWith('LIVE_SESSION_') ||
+    ['LIVE_AUDIO_CODEC_MISSING', 'LIVE_VIDEO_CODEC_MISSING', 'LIVE_CODEC_MISSING', 'LIVE_AUDIO_TRACK_MISSING',
+      'LIVE_VIDEO_TRACK_MISSING', 'LIVE_INIT_INVALID', 'MSE_WAIT_TIMEOUT'].includes(error?.code)
   );
 }
 
@@ -192,7 +199,13 @@ export class LiveController {
     this.stateMachine = new LiveStateMachine();
     this.queue = new OrderedSegmentQueue();
     this.danmaku = new DanmakuVisibilityController(documentObject);
-    this.pipeline = new MseAppendPipeline(video, this.mediaSourceFactory, this.urlApi);
+    this.pipeline = new MseAppendPipeline(
+      video,
+      this.mediaSourceFactory,
+      this.urlApi,
+      this.runtimeObject,
+      this.config.mseWaitTimeoutMilliseconds,
+    );
     this.track;
     this.manifest;
     this.manifestCandidates;
@@ -219,6 +232,12 @@ export class LiveController {
     this.rebuildingSource = false;
     this.rebuildingGeneration;
     this.failureMessage;
+    this.stage = '等待 video';
+    this.retryMessage = '';
+    this.requestMetrics = [];
+    this.watchdogTimer;
+    this.watchdogGeneration;
+    this.watchdogStartedAtMilliseconds;
     this.boundEvents = [];
   }
 
@@ -233,6 +252,7 @@ export class LiveController {
   }
 
   beginNewGeneration() {
+    this.cancelZeroInventoryWatchdog();
     this.generation += 1;
     this.segmentAbort?.abort();
     this.segmentAbort = new AbortController();
@@ -240,6 +260,107 @@ export class LiveController {
     this.rebuildingSource = false;
     this.rebuildingGeneration = undefined;
     return this.generation;
+  }
+
+  setStage(stage, message = stage) {
+    this.stage = stage;
+    this.retryMessage = '';
+    this.panel.setModel({ mode: '直播', state: this.starting ? 'STARTING' : this.stateMachine.state, stage, message });
+  }
+
+  reportRetry({ kind, attempt, hosts }) {
+    const uniqueHosts = [...new Set(hosts)];
+    this.retryMessage = `临时${kind}失败，重试第 ${attempt} 轮：${uniqueHosts.join('、')}`;
+    this.panel.setMessage(this.retryMessage);
+  }
+
+  recordRequest(kind, loaded, mediaDuration) {
+    if (!Number.isFinite(loaded?.byteLength) || loaded.byteLength < 0) {
+      fail('LIVE_METRIC_BYTES_INVALID', `${kind} 请求没有有效实际字节数`);
+    }
+    if (!Number.isFinite(loaded?.completedAtMilliseconds)) {
+      fail('LIVE_METRIC_TIME_INVALID', `${kind} 请求没有有效完成时间`);
+    }
+    if (!Number.isFinite(mediaDuration) || mediaDuration < 0) {
+      fail('LIVE_METRIC_DURATION_INVALID', `${kind} 请求没有有效媒体时长`);
+    }
+    this.requestMetrics.push({
+      kind,
+      byteLength: loaded.byteLength,
+      mediaDuration,
+      completedAtMilliseconds: loaded.completedAtMilliseconds,
+    });
+    const cutoff = loaded.completedAtMilliseconds - 60000;
+    this.requestMetrics = this.requestMetrics.filter((entry) => entry.completedAtMilliseconds >= cutoff);
+  }
+
+  cancelZeroInventoryWatchdog() {
+    if (this.watchdogTimer !== undefined) {
+      this.runtimeObject.clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = undefined;
+    }
+    this.watchdogGeneration = undefined;
+    this.watchdogStartedAtMilliseconds = undefined;
+  }
+
+  candidateHosts() {
+    return [...new Set((this.track?.candidates || this.manifestCandidates || []).map((url) => new URL(url).host))];
+  }
+
+  startZeroInventoryWatchdog(generation = this.generation) {
+    if (
+      this.destroyed ||
+      !this.enabled ||
+      this.watchdogGeneration === generation ||
+      (this.starting === false && this.stateMachine.state !== LIVE_STATE.RECOVERING)
+    ) {
+      return;
+    }
+    this.cancelZeroInventoryWatchdog();
+    this.watchdogGeneration = generation;
+    this.watchdogStartedAtMilliseconds = Date.now();
+    this.watchdogTimer = this.runtimeObject.setTimeout(() => {
+      this.watchdogTimer = undefined;
+      if (!this.isGenerationCurrent(generation) || this.watchdogGeneration !== generation) {
+        return;
+      }
+      this.watchdogGeneration = undefined;
+      if (this.readInventory() > 0) {
+        return;
+      }
+      const stage = this.stage || '未提供';
+      const hosts = this.candidateHosts().join('、') || '未提供';
+      const codec = this.track?.codecString || '未提供';
+      this.enterGap(
+        new BufferScriptError(
+          'LIVE_ZERO_INVENTORY_TIMEOUT',
+          `直播 ${stage} 阶段在 45 秒内没有形成连续可解码库存；候选 ${hosts}；codec ${codec}`,
+        ),
+      );
+    }, this.config.zeroInventoryWatchdogMilliseconds);
+  }
+
+  refreshZeroInventoryWatchdog(inventory = this.readInventory()) {
+    if (inventory > 0) {
+      this.cancelZeroInventoryWatchdog();
+      return;
+    }
+    if (this.starting || this.stateMachine.state === LIVE_STATE.RECOVERING) {
+      this.startZeroInventoryWatchdog(this.generation);
+    }
+  }
+
+  installRuntimeTimers() {
+    if (this.refreshTimer === undefined) {
+      this.refreshTimer = this.runtimeObject.setInterval(() => {
+        void this.refreshManifest();
+      }, this.config.manifestRefreshMilliseconds);
+    }
+    if (this.statusTimer === undefined) {
+      this.statusTimer = this.runtimeObject.setInterval(() => {
+        this.updateStatus();
+      }, this.config.statusRefreshMilliseconds);
+    }
   }
 
   async start() {
@@ -255,21 +376,26 @@ export class LiveController {
     const generation = this.generation;
     const pipeline = this.pipeline;
     this.starting = true;
+    this.setStage('配置播放器', '正在配置播放器');
+    this.startZeroInventoryWatchdog(generation);
     try {
       await configureOuterPlayer(this.windowObject, this.video, this.logger);
       this.ensureGenerationCurrent(generation);
       this.installVideoGuards();
       this.segmentAbort = new AbortController();
+      this.setStage('播放信息', '正在读取播放信息');
       const payload = await fetchRoomPlayInfo(this.roomId, 10000, this.fetchImpl, {
         requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal: this.segmentAbort?.signal,
+        onRetry: (retry) => this.reportRetry(retry),
       });
       this.ensureGenerationCurrent(generation);
       this.track = extractLiveTrack(payload, 10000, 'avc');
       if (this.track.roomId !== this.roomId) {
         fail('LIVE_ROOM_CHANGED', '播放 API 返回了不同直播间');
       }
+      this.setStage('manifest', '正在读取直播 manifest');
       const loaded = await this.loadInitialMediaManifest(generation);
       this.ensureGenerationCurrent(generation);
       this.manifest = loaded.manifest;
@@ -277,12 +403,15 @@ export class LiveController {
       this.variantIdentity = loaded.variantIdentity;
       this.liveEdge = this.manifest.segments[this.manifest.segments.length - 1];
       this.queue.initialize(this.manifest, true);
+      this.setStage('MSE', '正在打开 MSE 管线');
       await pipeline.open(buildMime(this.track));
       this.ensureGenerationCurrent(generation);
+      this.setStage('init', '正在校验并追加音视频 init');
       await this.appendInitSegment(generation, pipeline);
       this.ensureGenerationCurrent(generation);
       pipeline.assertOwnsVideoSource();
       this.started = true;
+      this.setStage('库存形成', '正在形成连续可解码库存');
     } catch (error) {
       if (!this.isGenerationCurrent(generation)) {
         pipeline.close();
@@ -303,12 +432,7 @@ export class LiveController {
       pipeline.close();
       return;
     }
-    this.refreshTimer = this.runtimeObject.setInterval(() => {
-      void this.refreshManifest();
-    }, this.config.manifestRefreshMilliseconds);
-    this.statusTimer = this.runtimeObject.setInterval(() => {
-      this.updateStatus();
-    }, this.config.statusRefreshMilliseconds);
+    this.installRuntimeTimers();
     this.scheduleDownloads();
     void this.pumpDelivery();
     this.updateStatus();
@@ -329,6 +453,7 @@ export class LiveController {
           requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal,
+          onRetry: (retry) => this.reportRetry(retry),
         });
         this.ensureGenerationCurrent(generation);
         this.track = track;
@@ -347,9 +472,11 @@ export class LiveController {
       retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
       signal,
       onWarning: (message, error) => this.logger.warn(message, error),
+      onRetry: (retry) => this.reportRetry(retry),
     });
     this.ensureGenerationCurrent(generation);
     let parsed = parseHlsPlaylist(loaded.text, loaded.url);
+    let manifestLoaded = loaded;
     let candidates = track.candidates;
     let variantIdentity;
     if (parsed.type === 'master') {
@@ -366,9 +493,11 @@ export class LiveController {
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal,
         onWarning: (message, error) => this.logger.warn(message, error),
+        onRetry: (retry) => this.reportRetry(retry),
       });
       this.ensureGenerationCurrent(generation);
       parsed = parseHlsPlaylist(variantLoaded.text, variantLoaded.url);
+      manifestLoaded = variantLoaded;
     }
     if (parsed.type !== 'media') {
       fail('MANIFEST_MEDIA_MISSING', 'HLS 主清单没有解析出媒体清单');
@@ -376,6 +505,11 @@ export class LiveController {
     if (enforceVariant && this.variantIdentity !== undefined && variantIdentity !== this.variantIdentity) {
       fail('GAP_MANIFEST_VARIANT_CHANGED', '自动恢复时 HLS 主清单不再提供原有变体');
     }
+    this.recordRequest(
+      'manifest',
+      manifestLoaded,
+      parsed.segments.reduce((sum, segment) => sum + segment.duration, 0),
+    );
     return { manifest: parsed, candidates, variantIdentity };
   }
 
@@ -404,13 +538,16 @@ export class LiveController {
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal,
           onWarning: (message, error) => this.logger.warn(message, error),
+          onRetry: (retry) => this.reportRetry(retry),
         });
         this.ensureGenerationCurrent(generation);
         if (pipeline !== this.pipeline) {
           fail('LIVE_GENERATION_STALE', '直播初始化片段对应的 MSE 管线已被替换');
         }
+        validateInitSegmentTracks(loaded.bytes);
         await pipeline.append(loaded.bytes);
         this.ensureGenerationCurrent(generation);
+        this.recordRequest('init', loaded, 0);
         return;
       } catch (error) {
         if (error?.code !== 'SIGNATURE_EXPIRED') {
@@ -477,6 +614,7 @@ export class LiveController {
     this.logger.warn(`直播媒体事件: ${reason}`);
     this.stateMachine.onStall();
     this.stateMachine.onRecovering();
+    this.refreshZeroInventoryWatchdog();
     this.pauseForRecovery();
     this.updateStatus();
   }
@@ -529,11 +667,13 @@ export class LiveController {
             retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
             signal: this.segmentAbort.signal,
             onWarning: (message, error) => this.logger.warn(message, error),
+            onRetry: (retry) => this.reportRetry(retry),
           });
           if (generation !== this.generation) {
             this.logger.warn(`丢弃已取消的片段下载 ${segment.sn}`);
             return;
           }
+          this.recordRequest('segment', loaded, currentSegment.duration);
           this.queue.markDownloaded(segment.sn, loaded.bytes);
           void this.pumpDelivery();
           return;
@@ -607,6 +747,7 @@ export class LiveController {
         if (this.stateMachine.state === LIVE_STATE.STALL || this.stateMachine.state === LIVE_STATE.RECOVERING) {
           this.stateMachine.onRecovering();
         }
+        this.refreshZeroInventoryWatchdog();
       }
       if (this.video.currentTime > 30) {
         await pipeline.removeBefore(this.video.currentTime - 30);
@@ -692,6 +833,7 @@ export class LiveController {
         requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal,
+        onRetry: (retry) => this.reportRetry(retry),
       });
       this.ensureGenerationCurrent(generation);
       const loaded = await this.loadMediaManifest(next, { generation, signal });
@@ -717,25 +859,57 @@ export class LiveController {
 
   estimateDelay() {
     if (this.liveEdge === undefined) {
-      return 0;
+      return undefined;
     }
     if (this.timelineOriginMilliseconds !== undefined && this.liveEdge.programDateTime !== undefined) {
       const liveEdgeMilliseconds = this.liveEdge.programDateTime + this.liveEdge.duration * 1000;
       const playbackMilliseconds = this.timelineOriginMilliseconds + this.video.currentTime * 1000;
       return Math.max(0, (liveEdgeMilliseconds - playbackMilliseconds) / 1000);
     }
-    let delay = 0;
+    const inventory = this.readInventory();
+    if (inventory <= 0 || this.queue.lastDelivered === undefined) {
+      return undefined;
+    }
+    let pendingDuration = 0;
     for (let sequence = this.queue.expectedSn; sequence <= this.liveEdge.sn; sequence += 1) {
       const segment = this.queue.getSegment(sequence);
-      if (segment !== undefined) {
-        delay += segment.duration;
+      if (segment === undefined) {
+        return undefined;
       }
+      pendingDuration += segment.duration;
     }
-    return delay;
+    return inventory + pendingDuration;
+  }
+
+  liveMultiplier(inventory) {
+    if (inventory >= this.config.aggressiveBufferSeconds && this.inFlight.size === 0) {
+      return '库存已满';
+    }
+    const nowMilliseconds = Date.now();
+    const windows = this.config.metricsWindowsSeconds.map((windowSeconds) => {
+      const cutoff = nowMilliseconds - windowSeconds * 1000;
+      const entries = this.requestMetrics.filter((entry) => entry.completedAtMilliseconds >= cutoff);
+      const bytes = entries.reduce((sum, entry) => sum + entry.byteLength, 0);
+      const mediaDuration = entries.reduce((sum, entry) => sum + entry.mediaDuration, 0);
+      if (bytes <= 0 || mediaDuration <= 0) {
+        return undefined;
+      }
+      const downloadBps = (bytes * 8) / windowSeconds;
+      const mediaBps = (bytes * 8) / mediaDuration;
+      return downloadBps / mediaBps;
+    });
+    if (windows.some((value) => value === undefined)) {
+      return '未提供';
+    }
+    return `30 秒 ${windows[0].toFixed(2)}× / 60 秒 ${windows[1].toFixed(2)}×`;
   }
 
   updateStatus() {
-    if (this.destroyed || !this.started) {
+    if (this.destroyed) {
+      return;
+    }
+    if (!this.started) {
+      this.panel.setModel({ mode: '直播', state: 'STARTING', stage: this.stage, message: this.retryMessage || this.stage });
       return;
     }
     if (!this.enabled) {
@@ -755,36 +929,48 @@ export class LiveController {
     }
     const inventory = this.readInventory();
     const delay = this.estimateDelay();
-    this.stateMachine.onDelayChanged(delay);
-    this.danmaku.setHidden(delay > this.config.hideDanmakuAfterSeconds);
+    this.refreshZeroInventoryWatchdog(inventory);
+    if (delay !== undefined) {
+      this.stateMachine.onDelayChanged(delay);
+    }
     if (
       this.stateMachine.state === LIVE_STATE.RECOVERING &&
       !this.userPaused &&
       inventory >= this.config.recoveryWatermarkSeconds
     ) {
-      this.stateMachine.onRecoveryReady(delay);
+      this.stateMachine.onRecoveryReady(delay ?? 0);
       this.attemptPlay();
     }
+    this.danmaku.setHidden(
+      this.stateMachine.state === LIVE_STATE.DELAYED &&
+        delay !== undefined &&
+        delay > this.config.hideDanmakuAfterSeconds,
+    );
     const quality =
       this.track === undefined
         ? '未提供'
-        : `${this.track.qualityNumber} / ${this.track.codecName}${delay > 3 ? '（积压锁定）' : ''}`;
+        : `${this.track.qualityDescription || '未提供'} / qn${this.track.qualityNumber} / ${this.track.codecName}${
+            delay !== undefined && delay > 3 ? '（积压锁定）' : ''
+          }`;
+    const multiplier = this.liveMultiplier(inventory);
+    const message = [this.failureMessage, this.retryMessage].filter(Boolean).join('；');
     this.panel.setModel({
       state: this.stateMachine.state,
       mode: '直播',
       inventory: `${inventory.toFixed(1)} 秒`,
-      delay: `${delay.toFixed(1)} 秒`,
+      delay: delay === undefined ? '未提供' : `${delay.toFixed(1)} 秒`,
       quality,
       speed: `${this.config.playbackRate}×`,
-      multiplier: '直播实时',
-      message: this.failureMessage || '',
+      multiplier,
+      stage: this.stage,
+      message,
     });
     this.panel.setAction('toggle', this.enabled ? '停用' : '启用', () => this.runAction(() => this.toggle()));
     const gapVisible = this.stateMachine.state === LIVE_STATE.GAP_UNRECOVERABLE;
     const backlogReturnVisible =
       this.stateMachine.state === LIVE_STATE.STALL ||
       this.stateMachine.state === LIVE_STATE.RECOVERING
-        ? delay > 0
+        ? delay !== undefined && delay > 0
         : false;
     const returnVisible =
       gapVisible ||
@@ -819,8 +1005,15 @@ export class LiveController {
     }
     const normalized = toBufferScriptError(error, 'GAP_UNRECOVERABLE', '直播连续性无法恢复');
     this.logger.error('进入 GAP_UNRECOVERABLE', normalized);
+    this.cancelZeroInventoryWatchdog();
+    this.starting = false;
+    this.started = true;
     this.failureMessage = `${normalized.code}: ${normalized.message}`;
     this.stateMachine.onGap(normalized.message);
+    this.generation += 1;
+    this.segmentAbort?.abort();
+    this.segmentAbort = new AbortController();
+    this.inFlight.clear();
     this.pauseForRecovery();
     this.updateStatus();
   }
@@ -841,6 +1034,7 @@ export class LiveController {
       this.scheduleDownloads();
       void this.refreshManifest();
     } else {
+      this.cancelZeroInventoryWatchdog();
       this.generation += 1;
       this.segmentAbort?.abort();
       this.inFlight.clear();
@@ -858,7 +1052,7 @@ export class LiveController {
     this.userPaused = false;
     const inventory = this.readInventory();
     const state = this.stateMachine.onUserPlay(
-      this.estimateDelay(),
+      this.estimateDelay() ?? 0,
       inventory >= this.config.recoveryWatermarkSeconds,
     );
     if (state === LIVE_STATE.RECOVERING && inventory < this.config.recoveryWatermarkSeconds) {
@@ -890,6 +1084,7 @@ export class LiveController {
       requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
       retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
       signal,
+      onRetry: (retry) => this.reportRetry(retry),
     });
     this.ensureGenerationCurrent(generation);
     const track = extractLiveTrack(payload, previous.qualityNumber, previous.codecName);
@@ -905,6 +1100,7 @@ export class LiveController {
   async restartAtCurrentEdge(track = this.track, generation) {
     const activeGeneration = generation === undefined ? this.beginNewGeneration() : generation;
     this.ensureGenerationCurrent(activeGeneration);
+    this.startZeroInventoryWatchdog(activeGeneration);
     const loaded = await this.loadMediaManifest(track, { enforceVariant: false, generation: activeGeneration });
     this.ensureGenerationCurrent(activeGeneration);
     this.track = track;
@@ -924,6 +1120,8 @@ export class LiveController {
         this.video,
         this.mediaSourceFactory,
         this.urlApi,
+        this.runtimeObject,
+        this.config.mseWaitTimeoutMilliseconds,
       );
       replacementPipeline = pipeline;
       this.pipeline = pipeline;
@@ -944,6 +1142,7 @@ export class LiveController {
     this.ensureGenerationCurrent(activeGeneration);
     this.failureMessage = undefined;
     this.stateMachine.onRecoveryReady(0);
+    this.installRuntimeTimers();
     this.scheduleDownloads();
     void this.pumpDelivery();
     this.updateStatus();
@@ -965,6 +1164,7 @@ export class LiveController {
     }
     this.destroyed = true;
     this.enabled = false;
+    this.cancelZeroInventoryWatchdog();
     this.generation += 1;
     this.rebuildingSource = false;
     this.rebuildingGeneration = undefined;
