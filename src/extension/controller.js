@@ -210,6 +210,16 @@ export class ExtensionCoordinator {
     }
     const panel = createStatusPanel(this.documentObject, mode === 'live' ? '直播' : '点播');
     this.active = { mode, href, panel, video: undefined, controller: undefined };
+    panel.setFreshnessCheck(
+      () =>
+        generation === this.routeGeneration &&
+        !this.destroyed &&
+        !routeAbort.signal.aborted &&
+        this.active?.panel === panel &&
+        this.routeKey === href &&
+        this.windowObject.location.href === href &&
+        modeForLocation(this.windowObject.location) === mode,
+    );
     panel.setModel({
       mode: mode === 'live' ? '直播' : '点播',
       state: 'STARTING',

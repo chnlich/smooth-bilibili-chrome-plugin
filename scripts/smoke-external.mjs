@@ -344,17 +344,17 @@ function evaluateSnapshot(snapshot, mode) {
       reason: `controller reported mode ${status.mode || 'missing'} instead of ${mode}`,
     };
   }
+  if (snapshot.media === undefined || snapshot.media.currentSrc.length === 0 || snapshot.media.readyState < 2) {
+    return {
+      status: 'BLOCKED',
+      reason: 'anonymous page did not converge to a usable media resource',
+    };
+  }
   const expectedSpeed = mode === '直播' ? '1×' : '2×';
   if (status.speed !== expectedSpeed) {
     return {
       status: 'FAIL',
       reason: `controller reported speed ${status.speed || 'missing'} instead of ${expectedSpeed}`,
-    };
-  }
-  if (snapshot.media === undefined || snapshot.media.currentSrc.length === 0 || snapshot.media.readyState < 2) {
-    return {
-      status: 'BLOCKED',
-      reason: 'anonymous page did not converge to a usable media resource',
     };
   }
   if (snapshot.media.muted !== true || snapshot.media.volume !== 0) {
@@ -396,7 +396,7 @@ async function closeExternalPage(page, popup) {
   throwCleanupFailures(failures);
 }
 
-async function openExternalPopup(context, extensionId, targetPage, consoleErrors, pageErrors) {
+async function openExternalPopup(context, extensionId, targetPage, consoleErrors, pageErrors, timeoutMilliseconds = 10000) {
   const popup = await context.newPage();
   popup.on('console', (message) => {
     if (message.type() === 'error') {
@@ -404,23 +404,61 @@ async function openExternalPopup(context, extensionId, targetPage, consoleErrors
     }
   });
   popup.on('pageerror', (error) => pageErrors.push(error.stack || error.message));
-  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-  await popup.waitForSelector('input[data-preference="liveEnabled"]');
+  await popup.goto(`chrome-extension://${extensionId}/popup.html`, { timeout: timeoutMilliseconds });
+  await popup.waitForSelector('input[data-preference="liveEnabled"]', { timeout: timeoutMilliseconds });
   await targetPage.bringToFront();
   return { popup };
 }
 
 async function runExternalPage(context, url, mode) {
-  const page = await context.newPage();
+  let page;
   let popup;
+  let beforePlay;
+  let lastSnapshot;
+  let phase = 'page navigation';
+  const liveDeadlineMilliseconds = mode === '直播' ? Date.now() + 30000 : undefined;
+  const timeoutBeforeLiveDeadline = (fallbackMilliseconds) => {
+    if (liveDeadlineMilliseconds === undefined) {
+      return fallbackMilliseconds;
+    }
+    return Math.max(1, Math.min(fallbackMilliseconds, liveDeadlineMilliseconds - Date.now()));
+  };
+  const withinLiveDeadline = async (operation) => {
+    if (liveDeadlineMilliseconds === undefined) {
+      return operation();
+    }
+    const remainingMilliseconds = liveDeadlineMilliseconds - Date.now();
+    if (remainingMilliseconds <= 0) {
+      throw Object.assign(new Error('anonymous live smoke reached its absolute 30-second deadline'), {
+        code: 'LIVE_SMOKE_DEADLINE',
+      });
+    }
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(operation),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                Object.assign(new Error('anonymous live smoke reached its absolute 30-second deadline'), {
+                  code: 'LIVE_SMOKE_DEADLINE',
+                }),
+              ),
+            remainingMilliseconds,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const withLastLiveStage = (result) =>
+    mode === '直播'
+      ? { ...result, lastStage: result.lastStage || lastSnapshot?.status?.stage || '未提供' }
+      : result;
   const consoleErrors = [];
   const pageErrors = [];
-  page.on('console', (message) => {
-    if (message.type() === 'error') {
-      consoleErrors.push({ text: message.text(), location: message.location() });
-    }
-  });
-  page.on('pageerror', (error) => pageErrors.push(error.stack || error.message));
   const readMedia = () => page.evaluate(() => {
     const video = document.querySelector('video');
     return {
@@ -465,17 +503,135 @@ async function runExternalPage(context, url, mode) {
     ...(await readMedia()),
   });
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForFunction(
-      () => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId,
-      undefined,
-      { timeout: 10000 },
+    page = await withinLiveDeadline(() => context.newPage());
+    page.on('console', (message) => {
+      if (message.type() === 'error') {
+        consoleErrors.push({ text: message.text(), location: message.location() });
+      }
+    });
+    page.on('pageerror', (error) => pageErrors.push(error.stack || error.message));
+    await withinLiveDeadline(() =>
+      page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutBeforeLiveDeadline(30000) }),
     );
+    phase = 'extension runtime marker';
+    await withinLiveDeadline(() =>
+      page.waitForFunction(
+        () => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId,
+        undefined,
+        { timeout: timeoutBeforeLiveDeadline(10000) },
+      ),
+    );
+    const extensionId = await withinLiveDeadline(() =>
+      page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId),
+    );
+    phase = 'toolbar popup';
+    ({ popup } = await withinLiveDeadline(() =>
+      openExternalPopup(
+        context,
+        extensionId,
+        page,
+        consoleErrors,
+        pageErrors,
+        timeoutBeforeLiveDeadline(10000),
+      ),
+    ));
+    if (mode === '直播') {
+      phase = 'live observation';
+      let first;
+      while (Date.now() < liveDeadlineMilliseconds) {
+        const snapshot = await withinLiveDeadline(readSnapshot);
+        lastSnapshot = snapshot;
+        if (Date.now() >= liveDeadlineMilliseconds) {
+          break;
+        }
+        if (snapshot.media !== undefined && beforePlay === undefined) {
+          beforePlay = await withinLiveDeadline(() =>
+            page.evaluate(() => window.__bilibiliAudioGuard.assertSilentBeforePlay()),
+          );
+          assert.ok(beforePlay.every((media) => media.muted === true && media.volume === 0));
+          if (Date.now() >= liveDeadlineMilliseconds) {
+            break;
+          }
+        }
+        const extensionErrors = extensionDiagnostics(consoleErrors, pageErrors);
+        if (extensionErrors.consoleErrors.length > 0 || extensionErrors.pageErrors.length > 0) {
+          return withLastLiveStage({
+            status: 'FAIL',
+            url,
+            reason: 'extension/product error was logged on the real page',
+            first,
+            last: snapshot,
+            beforePlay,
+            consoleErrors,
+            pageErrors,
+            extensionErrors,
+          });
+        }
+        if (consoleErrors.length > 0 || pageErrors.length > 0) {
+          return withLastLiveStage({
+            ...nonProductDiagnosticsAreBlocked(consoleErrors, pageErrors),
+            url,
+            first,
+            last: snapshot,
+            beforePlay,
+            consoleErrors,
+            pageErrors,
+            extensionErrors,
+          });
+        }
+        const result = evaluateSnapshot(snapshot, mode);
+        if (result?.status === 'FAIL' || snapshot.status?.state === 'ERROR') {
+          return withLastLiveStage({
+            ...result,
+            url,
+            first,
+            last: snapshot,
+            beforePlay,
+            consoleErrors,
+            pageErrors,
+            extensionErrors,
+          });
+        }
+        if (result === undefined) {
+          if (
+            first !== undefined &&
+            snapshot.media.currentTime > first.media.currentTime &&
+            Date.now() < liveDeadlineMilliseconds
+          ) {
+            return withLastLiveStage({
+              status: 'PASS',
+              url,
+              first,
+              second: snapshot,
+              beforePlay,
+              consoleErrors,
+              pageErrors,
+              extensionErrors,
+            });
+          }
+          first = snapshot;
+        }
+        const remainingMilliseconds = liveDeadlineMilliseconds - Date.now();
+        if (remainingMilliseconds > 0) {
+          await wait(Math.min(500, remainingMilliseconds));
+        }
+      }
+      const extensionErrors = extensionDiagnostics(consoleErrors, pageErrors);
+      return withLastLiveStage({
+        status: extensionErrors.consoleErrors.length > 0 || extensionErrors.pageErrors.length > 0 ? 'FAIL' : 'BLOCKED',
+        url,
+        reason: 'anonymous live page did not form nonzero inventory and advancing media time within 30 seconds',
+        last: lastSnapshot,
+        beforePlay,
+        consoleErrors,
+        pageErrors,
+        extensionErrors,
+      });
+    }
+    phase = 'VOD media discovery';
     await page.waitForFunction(() => document.querySelector('video') !== null, undefined, { timeout: 20000 });
-    const beforePlay = await page.evaluate(() => window.__bilibiliAudioGuard.assertSilentBeforePlay());
+    beforePlay = await page.evaluate(() => window.__bilibiliAudioGuard.assertSilentBeforePlay());
     assert.ok(beforePlay.every((media) => media.muted === true && media.volume === 0));
-    const extensionId = await page.evaluate(() => document.documentElement.dataset.bilibiliBufferExtensionRuntimeId);
-    ({ popup } = await openExternalPopup(context, extensionId, page, consoleErrors, pageErrors));
     await popup.waitForFunction(
       () => document.querySelector('[data-status-field="state"]')?.textContent !== '未提供',
       undefined,
@@ -483,6 +639,7 @@ async function runExternalPage(context, url, mode) {
     );
     await wait(15000);
     const first = await readSnapshot();
+    lastSnapshot = first;
     const extensionErrors = extensionDiagnostics(consoleErrors, pageErrors);
     if (extensionErrors.consoleErrors.length > 0 || extensionErrors.pageErrors.length > 0) {
       return {
@@ -521,6 +678,7 @@ async function runExternalPage(context, url, mode) {
     }
     await wait(5000);
     const second = await readSnapshot();
+    lastSnapshot = second;
     const secondExtensionErrors = extensionDiagnostics(consoleErrors, pageErrors);
     if (secondExtensionErrors.consoleErrors.length > 0 || secondExtensionErrors.pageErrors.length > 0) {
       return {
@@ -587,18 +745,32 @@ async function runExternalPage(context, url, mode) {
     const reason = error.stack || error.message || String(error);
     const errors = extensionDiagnostics(consoleErrors, pageErrors);
     const productAssertion = error?.name === 'AssertionError';
-    return {
-      status: errors.consoleErrors.length > 0 || errors.pageErrors.length > 0 || productAssertion || !environmentBlocked(reason)
+    const extensionSetupFailure = phase === 'extension runtime marker' || phase === 'toolbar popup';
+    return withLastLiveStage({
+      status:
+        error?.code === 'LIVE_SMOKE_DEADLINE'
+          ? errors.consoleErrors.length > 0 || errors.pageErrors.length > 0
+            ? 'FAIL'
+            : 'BLOCKED'
+          : errors.consoleErrors.length > 0 ||
+              errors.pageErrors.length > 0 ||
+              productAssertion ||
+              extensionSetupFailure ||
+              !environmentBlocked(reason)
         ? 'FAIL'
         : 'BLOCKED',
       url,
       reason,
+      last: lastSnapshot,
+      beforePlay,
       consoleErrors,
       pageErrors,
       extensionErrors: errors,
-    };
+    });
   } finally {
-    await closeExternalPage(page, popup);
+    if (page !== undefined) {
+      await closeExternalPage(page, popup);
+    }
   }
 }
 

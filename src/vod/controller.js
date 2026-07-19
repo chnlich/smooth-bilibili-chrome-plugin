@@ -206,7 +206,7 @@ export class VodController {
         const remaining = Number.isFinite(this.video.duration)
           ? Math.max(0, this.video.duration - this.video.currentTime)
           : Number.POSITIVE_INFINITY;
-        const target = Math.min(this.config.startupBufferSeconds, remaining);
+        const target = Math.min(this.config.startupBufferSeconds, Math.max(0, remaining - 1));
         if (remaining > 30 && this.pausedSchedulingSupported && inventory < target) {
           this.pauseForRefill();
         }
@@ -619,21 +619,25 @@ export class VodController {
     const remaining = Number.isFinite(this.video.duration)
       ? Math.max(0, this.video.duration - this.video.currentTime)
       : Number.POSITIVE_INFINITY;
-    const refillTarget = Math.min(this.config.startupBufferSeconds, remaining);
+    const initialFillTarget = Math.min(this.config.startupBufferSeconds, remaining);
+    const refillResumeTarget = Math.min(this.config.startupBufferSeconds, Math.max(0, remaining - 1));
     if (this.userPaused) {
       return;
     }
     if (remaining <= 30) {
+      if (this.scriptPaused) {
+        this.attemptPlay();
+      }
       return;
     }
     if (!this.startupComplete) {
-      if (inventory >= refillTarget) {
+      if (inventory >= initialFillTarget) {
         this.startupComplete = true;
       }
       return;
     }
     if (this.scriptPaused) {
-      if (inventory >= refillTarget) {
+      if (inventory >= refillResumeTarget) {
         this.attemptPlay();
       }
       return;

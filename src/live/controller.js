@@ -138,7 +138,16 @@ function requiresManifestContinuityGap(error) {
 function requiresUnrecoverableGap(error) {
   return (
     requiresManifestContinuityGap(error) ||
-    ['MANIFEST_PERMANENT_404', 'MSE_APPEND_ERROR', 'MSE_REMOVE_ERROR', 'MSE_QUOTA_EXCEEDED'].includes(error?.code) ||
+    [
+      'MANIFEST_PERMANENT_404',
+      'MSE_UNSUPPORTED',
+      'MSE_CODEC_UNSUPPORTED',
+      'MSE_SOURCEBUFFER_ERROR',
+      'MSE_EVENT_ERROR',
+      'MSE_APPEND_ERROR',
+      'MSE_REMOVE_ERROR',
+      'MSE_QUOTA_EXCEEDED',
+    ].includes(error?.code) ||
     error?.code?.startsWith('GAP_') ||
     error?.code?.startsWith('LIVE_SESSION_') ||
     ['LIVE_AUDIO_CODEC_MISSING', 'LIVE_VIDEO_CODEC_MISSING', 'LIVE_CODEC_MISSING', 'LIVE_AUDIO_TRACK_MISSING',
@@ -238,6 +247,7 @@ export class LiveController {
     this.watchdogTimer;
     this.watchdogGeneration;
     this.watchdogStartedAtMilliseconds;
+    this.initialInventoryFormed = false;
     this.boundEvents = [];
   }
 
@@ -254,6 +264,7 @@ export class LiveController {
   beginNewGeneration() {
     this.cancelZeroInventoryWatchdog();
     this.generation += 1;
+    this.retryMessage = '';
     this.segmentAbort?.abort();
     this.segmentAbort = new AbortController();
     this.inFlight.clear();
@@ -268,7 +279,10 @@ export class LiveController {
     this.panel.setModel({ mode: '直播', state: this.starting ? 'STARTING' : this.stateMachine.state, stage, message });
   }
 
-  reportRetry({ kind, attempt, hosts }) {
+  reportRetry(generation, { kind, attempt, hosts }) {
+    if (!this.isGenerationCurrent(generation)) {
+      return;
+    }
     const uniqueHosts = [...new Set(hosts)];
     this.retryMessage = `临时${kind}失败，重试第 ${attempt} 轮：${uniqueHosts.join('、')}`;
     this.panel.setMessage(this.retryMessage);
@@ -307,12 +321,20 @@ export class LiveController {
     return [...new Set((this.track?.candidates || this.manifestCandidates || []).map((url) => new URL(url).host))];
   }
 
+  needsZeroInventoryWatchdog() {
+    return (
+      this.starting ||
+      this.stateMachine.state === LIVE_STATE.RECOVERING ||
+      (!this.initialInventoryFormed && this.stateMachine.state === LIVE_STATE.LIVE)
+    );
+  }
+
   startZeroInventoryWatchdog(generation = this.generation) {
     if (
       this.destroyed ||
       !this.enabled ||
       this.watchdogGeneration === generation ||
-      (this.starting === false && this.stateMachine.state !== LIVE_STATE.RECOVERING)
+      !this.needsZeroInventoryWatchdog()
     ) {
       return;
     }
@@ -342,11 +364,14 @@ export class LiveController {
 
   refreshZeroInventoryWatchdog(inventory = this.readInventory()) {
     if (inventory > 0) {
+      this.initialInventoryFormed = true;
       this.cancelZeroInventoryWatchdog();
       return;
     }
-    if (this.starting || this.stateMachine.state === LIVE_STATE.RECOVERING) {
+    if (this.needsZeroInventoryWatchdog()) {
       this.startZeroInventoryWatchdog(this.generation);
+    } else {
+      this.cancelZeroInventoryWatchdog();
     }
   }
 
@@ -388,7 +413,7 @@ export class LiveController {
         requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal: this.segmentAbort?.signal,
-        onRetry: (retry) => this.reportRetry(retry),
+        onRetry: (retry) => this.reportRetry(generation, retry),
       });
       this.ensureGenerationCurrent(generation);
       this.track = extractLiveTrack(payload, 10000, 'avc');
@@ -419,7 +444,7 @@ export class LiveController {
         return;
       }
       const normalized = toBufferScriptError(error, 'LIVE_START_FAILED', '直播初始媒体管线失败');
-      if (this.track !== undefined && requiresStartupGap(normalized)) {
+      if (requiresStartupGap(normalized)) {
         this.started = true;
         this.enterGap(normalized);
       } else {
@@ -453,7 +478,7 @@ export class LiveController {
           requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal,
-          onRetry: (retry) => this.reportRetry(retry),
+          onRetry: (retry) => this.reportRetry(generation, retry),
         });
         this.ensureGenerationCurrent(generation);
         this.track = track;
@@ -472,7 +497,7 @@ export class LiveController {
       retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
       signal,
       onWarning: (message, error) => this.logger.warn(message, error),
-      onRetry: (retry) => this.reportRetry(retry),
+      onRetry: (retry) => this.reportRetry(generation, retry),
     });
     this.ensureGenerationCurrent(generation);
     let parsed = parseHlsPlaylist(loaded.text, loaded.url);
@@ -493,7 +518,7 @@ export class LiveController {
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal,
         onWarning: (message, error) => this.logger.warn(message, error),
-        onRetry: (retry) => this.reportRetry(retry),
+        onRetry: (retry) => this.reportRetry(generation, retry),
       });
       this.ensureGenerationCurrent(generation);
       parsed = parseHlsPlaylist(variantLoaded.text, variantLoaded.url);
@@ -508,7 +533,7 @@ export class LiveController {
     this.recordRequest(
       'manifest',
       manifestLoaded,
-      parsed.segments.reduce((sum, segment) => sum + segment.duration, 0),
+      0,
     );
     return { manifest: parsed, candidates, variantIdentity };
   }
@@ -538,7 +563,7 @@ export class LiveController {
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal,
           onWarning: (message, error) => this.logger.warn(message, error),
-          onRetry: (retry) => this.reportRetry(retry),
+          onRetry: (retry) => this.reportRetry(generation, retry),
         });
         this.ensureGenerationCurrent(generation);
         if (pipeline !== this.pipeline) {
@@ -667,7 +692,7 @@ export class LiveController {
             retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
             signal: this.segmentAbort.signal,
             onWarning: (message, error) => this.logger.warn(message, error),
-            onRetry: (retry) => this.reportRetry(retry),
+            onRetry: (retry) => this.reportRetry(generation, retry),
           });
           if (generation !== this.generation) {
             this.logger.warn(`丢弃已取消的片段下载 ${segment.sn}`);
@@ -833,7 +858,7 @@ export class LiveController {
         requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal,
-        onRetry: (retry) => this.reportRetry(retry),
+        onRetry: (retry) => this.reportRetry(generation, retry),
       });
       this.ensureGenerationCurrent(generation);
       const loaded = await this.loadMediaManifest(next, { generation, signal });
@@ -888,7 +913,13 @@ export class LiveController {
     const nowMilliseconds = Date.now();
     const windows = this.config.metricsWindowsSeconds.map((windowSeconds) => {
       const cutoff = nowMilliseconds - windowSeconds * 1000;
-      const entries = this.requestMetrics.filter((entry) => entry.completedAtMilliseconds >= cutoff);
+      const entries = this.requestMetrics.filter(
+        (entry) =>
+          entry.kind === 'segment' &&
+          entry.byteLength > 0 &&
+          entry.mediaDuration > 0 &&
+          entry.completedAtMilliseconds >= cutoff,
+      );
       const bytes = entries.reduce((sum, entry) => sum + entry.byteLength, 0);
       const mediaDuration = entries.reduce((sum, entry) => sum + entry.mediaDuration, 0);
       if (bytes <= 0 || mediaDuration <= 0) {
@@ -929,6 +960,16 @@ export class LiveController {
     }
     const inventory = this.readInventory();
     const delay = this.estimateDelay();
+    if (
+      this.initialInventoryFormed &&
+      inventory <= 0 &&
+      !this.userPaused &&
+      [LIVE_STATE.LIVE, LIVE_STATE.DELAYED, LIVE_STATE.STALL].includes(this.stateMachine.state)
+    ) {
+      this.stateMachine.onStall();
+      this.stateMachine.onRecovering();
+      this.pauseForRecovery();
+    }
     this.refreshZeroInventoryWatchdog(inventory);
     if (delay !== undefined) {
       this.stateMachine.onDelayChanged(delay);
@@ -955,7 +996,10 @@ export class LiveController {
     const multiplier = this.liveMultiplier(inventory);
     const message = [this.failureMessage, this.retryMessage].filter(Boolean).join('；');
     this.panel.setModel({
-      state: this.stateMachine.state,
+      state:
+        !this.initialInventoryFormed && inventory <= 0 && this.stateMachine.state === LIVE_STATE.LIVE
+          ? 'STARTING'
+          : this.stateMachine.state,
       mode: '直播',
       inventory: `${inventory.toFixed(1)} 秒`,
       delay: delay === undefined ? '未提供' : `${delay.toFixed(1)} 秒`,
@@ -1009,6 +1053,7 @@ export class LiveController {
     this.starting = false;
     this.started = true;
     this.failureMessage = `${normalized.code}: ${normalized.message}`;
+    this.retryMessage = '';
     this.stateMachine.onGap(normalized.message);
     this.generation += 1;
     this.segmentAbort?.abort();
@@ -1036,6 +1081,7 @@ export class LiveController {
     } else {
       this.cancelZeroInventoryWatchdog();
       this.generation += 1;
+      this.retryMessage = '';
       this.segmentAbort?.abort();
       this.inFlight.clear();
       this.rebuildingSource = false;
@@ -1061,6 +1107,10 @@ export class LiveController {
   }
 
   async manualSkipGap() {
+    if (this.track === undefined) {
+      await this.manualReturnLive();
+      return;
+    }
     this.stateMachine.manualSkipGap();
     this.userPaused = false;
     await this.restartAtCurrentEdge();
@@ -1070,6 +1120,8 @@ export class LiveController {
     this.stateMachine.manualReturnLive();
     this.userPaused = false;
     const generation = this.beginNewGeneration();
+    this.setStage('播放信息', '正在读取播放信息');
+    this.startZeroInventoryWatchdog(generation);
     const track = await this.loadManualReturnTrack(generation);
     if (!this.isGenerationCurrent(generation)) {
       return;
@@ -1079,19 +1131,21 @@ export class LiveController {
 
   async loadManualReturnTrack(generation = this.generation, signal = this.segmentAbort?.signal) {
     const previous = this.track;
+    const requestedQualityNumber = previous?.qualityNumber ?? 10000;
+    const preferredCodec = previous?.codecName ?? 'avc';
     this.ensureGenerationCurrent(generation);
-    const payload = await fetchRoomPlayInfo(this.roomId, previous.qualityNumber, this.fetchImpl, {
+    const payload = await fetchRoomPlayInfo(this.roomId, requestedQualityNumber, this.fetchImpl, {
       requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
       retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
       signal,
-      onRetry: (retry) => this.reportRetry(retry),
+      onRetry: (retry) => this.reportRetry(generation, retry),
     });
     this.ensureGenerationCurrent(generation);
-    const track = extractLiveTrack(payload, previous.qualityNumber, previous.codecName);
+    const track = extractLiveTrack(payload, requestedQualityNumber, preferredCodec);
     if (track.roomId !== this.roomId) {
       fail('LIVE_ROOM_CHANGED', '播放 API 返回了不同直播间');
     }
-    if (track.qualityNumber !== previous.qualityNumber) {
+    if (previous !== undefined && track.qualityNumber !== previous.qualityNumber) {
       fail('LIVE_QUALITY_CHANGED', '回到直播返回了不同清晰度，不能建立当前边缘');
     }
     return track;
@@ -1101,6 +1155,7 @@ export class LiveController {
     const activeGeneration = generation === undefined ? this.beginNewGeneration() : generation;
     this.ensureGenerationCurrent(activeGeneration);
     this.startZeroInventoryWatchdog(activeGeneration);
+    this.setStage('manifest', '正在读取直播 manifest');
     const loaded = await this.loadMediaManifest(track, { enforceVariant: false, generation: activeGeneration });
     this.ensureGenerationCurrent(activeGeneration);
     this.track = track;
@@ -1125,8 +1180,10 @@ export class LiveController {
       );
       replacementPipeline = pipeline;
       this.pipeline = pipeline;
+      this.setStage('MSE', '正在重新打开 MSE 管线');
       await pipeline.open(buildMime(this.track));
       this.ensureGenerationCurrent(activeGeneration);
+      this.setStage('init', '正在校验并追加音视频 init');
       await this.appendInitSegment(activeGeneration, pipeline);
       this.ensureGenerationCurrent(activeGeneration);
       pipeline.assertOwnsVideoSource();
@@ -1141,7 +1198,7 @@ export class LiveController {
     }
     this.ensureGenerationCurrent(activeGeneration);
     this.failureMessage = undefined;
-    this.stateMachine.onRecoveryReady(0);
+    this.setStage('库存形成', '正在形成连续可解码库存');
     this.installRuntimeTimers();
     this.scheduleDownloads();
     void this.pumpDelivery();
@@ -1149,8 +1206,25 @@ export class LiveController {
   }
 
   runAction(action) {
-    Promise.resolve(action()).catch((error) => {
-      if (this.destroyed || error?.code === 'LIVE_GENERATION_STALE') {
+    let operation;
+    try {
+      operation = action();
+    } catch (error) {
+      if (this.destroyed || error?.code === 'LIVE_GENERATION_STALE' || error?.code === 'STATE_MANUAL_ACTION_INVALID') {
+        this.logger.warn('忽略已取消的直播人工操作', error);
+        return;
+      }
+      this.enterGap(error);
+      return;
+    }
+    const actionGeneration = this.generation;
+    Promise.resolve(operation).catch((error) => {
+      if (
+        this.destroyed ||
+        actionGeneration !== this.generation ||
+        error?.code === 'LIVE_GENERATION_STALE' ||
+        error?.code === 'STATE_MANUAL_ACTION_INVALID'
+      ) {
         this.logger.warn('忽略已取消的直播人工操作', error);
         return;
       }

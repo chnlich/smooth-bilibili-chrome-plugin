@@ -1721,7 +1721,16 @@ async function runLiveRecoveryScenario(context, outageSeconds) {
     );
     const delayedSource = delayed.videoSrc;
     await runLiveRecoveryStep('delayed return-to-live action', () => clickPanelAction(page, 'return-live'));
-    await runLiveRecoveryStep('LIVE after delayed return', () => waitForPanelState(page, 'LIVE'));
+    await runLiveRecoveryStep('rebuilt RECOVERING after delayed return without the 15-second watermark', () =>
+      Promise.all([
+        waitForPanelState(page, 'RECOVERING'),
+        page.waitForFunction(
+          (previousSource) =>
+            document.querySelector('video').src !== previousSource &&
+            document.querySelector('.chat-history-panel').style.display === 'flex',
+          delayedSource,
+        ),
+      ]));
     const afterDelayedReturn = await runLiveRecoveryStep(
       'post-delayed-return snapshot',
       () => readLiveFixture(page),
@@ -1747,7 +1756,11 @@ async function runLiveRecoveryScenario(context, outageSeconds) {
     assert.match(ownershipGap.message, /GAP_MEDIA_OWNERSHIP_LOST/);
     assert.equal(ownershipGap.returnVisible, 'visible');
     await runLiveRecoveryStep('ownership return-to-live action', () => clickPanelAction(page, 'return-live'));
-    await runLiveRecoveryStep('LIVE after ownership return', () => waitForPanelState(page, 'LIVE'));
+    await runLiveRecoveryStep('rebuilt RECOVERING after ownership return without the 15-second watermark', () =>
+      Promise.all([
+        waitForPanelState(page, 'RECOVERING'),
+        page.waitForFunction(() => document.querySelector('video').src.startsWith('blob:')),
+      ]));
 
     await runLiveRecoveryStep('user play then pause', () => page.evaluate(() => {
       const video = document.querySelector('video');
@@ -1760,8 +1773,16 @@ async function runLiveRecoveryScenario(context, outageSeconds) {
     assert.equal(userPaused.returnVisible, 'visible');
     await runLiveRecoveryStep('user-pause persistence delay', () => wait(1100), 5000);
     await runLiveRecoveryStep('USER_PAUSED persistence state', () => waitForPanelState(page, 'USER_PAUSED'));
+    const userPauseSource = (await readLiveFixture(page)).videoSrc;
     await runLiveRecoveryStep('user-pause return-to-live action', () => clickPanelAction(page, 'return-live'));
-    await runLiveRecoveryStep('LIVE after user-pause return', () => waitForPanelState(page, 'LIVE'));
+    await runLiveRecoveryStep('rebuilt RECOVERING after user-pause return without the 15-second watermark', () =>
+      Promise.all([
+        waitForPanelState(page, 'RECOVERING'),
+        page.waitForFunction(
+          (previousSource) => document.querySelector('video').src !== previousSource,
+          userPauseSource,
+        ),
+      ]));
     const diagnostics = assertDiagnostics(fixture.diagnostics, [
       /\[BilibiliBuffer\] 进入 GAP_UNRECOVERABLE/,
       (entry) => entry.location.url.includes('/live/seg-120.m4s?') &&
@@ -1855,9 +1876,17 @@ async function runLiveGapScenario(context, kind) {
         });
       }
       await clickPanelAction(page, kind === 'permanent' ? 'skip-gap' : 'return-live');
-      await waitForPanelState(page, 'LIVE');
+      await Promise.all([
+        waitForPanelState(page, 'RECOVERING'),
+        page.waitForFunction(
+          (previousSource) =>
+            document.querySelector('video').src !== previousSource &&
+            document.querySelector('video').src.startsWith('blob:'),
+          gap.videoSrc,
+        ),
+      ]);
       manualRecovery = await readLiveFixture(page);
-      assert.equal(manualRecovery.state, 'LIVE');
+      assert.equal(manualRecovery.state, 'RECOVERING');
       assert.ok(manualRecovery.videoSrc.startsWith('blob:'));
     }
     const expectedErrorMatchers = [/\[BilibiliBuffer\] 进入 GAP_UNRECOVERABLE/];
@@ -2076,6 +2105,41 @@ async function runLivePopupRefreshScenario(context) {
       popup: assertDiagnostics(popupDiagnostics),
     };
     return { status: 'PASS', extensionId, diagnostics };
+  } finally {
+    await closeLiveFixture(fixture);
+  }
+}
+
+async function runPopupStaleSpaActionScenario(context) {
+  const fixture = await openLiveFixture(context, { kind: 'popupLive' });
+  try {
+    const { page, popup } = fixture;
+    await page.bringToFront();
+    const current = await popup.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      const snapshot = await chrome.tabs.sendMessage(tab.id, { version: 1, type: 'status:get' });
+      return { tabId: tab.id, surfaceId: snapshot.surfaceId };
+    });
+    assert.equal(typeof current.surfaceId, 'string');
+    await page.evaluate(() => history.pushState({}, '', '/6363772?popup-stale-action=1'));
+    const response = await popup.evaluate(async ({ tabId, surfaceId }) => {
+      try {
+        return await chrome.tabs.sendMessage(tabId, {
+          version: 1,
+          type: 'action:run',
+          surfaceId,
+          action: 'toggle',
+        });
+      } catch (error) {
+        return { transportError: error.message || String(error) };
+      }
+    }, current);
+    assert.equal(response.ok, false, `stale popup action unexpectedly ran: ${JSON.stringify(response)}`);
+    assert.ok(
+      ['UI_SURFACE_STALE', 'POPUP_SURFACE_UNAVAILABLE'].includes(response.error?.code),
+      `unexpected stale action response: ${JSON.stringify(response)}`,
+    );
+    return { status: 'PASS', response, diagnostics: assertDiagnostics(fixture.diagnostics) };
   } finally {
     await closeLiveFixture(fixture);
   }
@@ -2770,6 +2834,7 @@ try {
     report.extensionRuntimeId = vodScenario.extensionId;
   }
   await runScenario('livePopupRefresh', () => runLivePopupRefreshScenario(context));
+  await runScenario('popupStaleSpaAction', () => runPopupStaleSpaActionScenario(context));
   await runScenario('liveDelayedPlayer', () => runLiveDelayedPlayerScenario(context));
   await runScenario('liveImmediateDisable', () => runLiveImmediateDisableScenario(context));
   for (const outageSeconds of [2, 10, 30]) {

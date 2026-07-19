@@ -467,7 +467,8 @@
     if (!Number.isInteger(roomId)) {
       fail("PLAY_INFO_ROOM_MISSING", "播放 API 缺少有效 room_id");
     }
-    const streams = requireValue(data.playurl_info?.playurl?.stream, "PLAY_INFO_STREAM_MISSING", "播放 API 缺少 stream");
+    const playurl = requireValue(data.playurl_info?.playurl, "PLAY_INFO_STREAM_MISSING", "播放 API 缺少 playurl");
+    const streams = requireValue(playurl.stream, "PLAY_INFO_STREAM_MISSING", "播放 API 缺少 stream");
     const hlsStreams = streams.filter(protocolIsHls);
     if (hlsStreams.length === 0) {
       fail("LIVE_HLS_MISSING", "播放 API 没有 HLS 流");
@@ -504,7 +505,8 @@
       codec.display_name,
       codec.quality_name,
       codec.qn_desc,
-      codec.name
+      codec.name,
+      ...(playurl.g_qn_desc || []).filter((description) => Number(description?.qn) === qualityNumber).flatMap((description) => [description.desc, description.description, description.name])
     ].find((value) => typeof value === "string" && value.trim().length > 0);
     return {
       roomId,
@@ -1112,7 +1114,7 @@
   function ascii(bytes, start, length) {
     return String.fromCharCode(...bytes.subarray(start, start + length));
   }
-  function visitBoxes(bytes, start, end, tracks) {
+  function visitBoxes(bytes, start, end, tracks, path = []) {
     let offset = start;
     while (offset < end) {
       if (offset + 8 > end) {
@@ -1141,14 +1143,14 @@
       }
       const payloadStart = offset + headerSize;
       const boxEnd = offset + boxSize;
-      if (type === "hdlr" && payloadStart + 12 <= boxEnd) {
+      if (type === "hdlr" && path.length === 3 && path[0] === "moov" && path[1] === "trak" && path[2] === "mdia" && payloadStart + 12 <= boxEnd) {
         const handler = ascii(bytes, payloadStart + 8, 4);
         if (handler === "vide" || handler === "soun") {
           tracks.add(handler);
         }
       }
       if (["moov", "trak", "mdia", "minf", "stbl", "mvex", "edts", "dinf"].includes(type)) {
-        visitBoxes(bytes, payloadStart, boxEnd, tracks);
+        visitBoxes(bytes, payloadStart, boxEnd, tracks, [...path, type]);
       }
       offset = boxEnd;
     }
@@ -1591,7 +1593,16 @@
     ].includes(error?.code);
   }
   function requiresUnrecoverableGap(error) {
-    return requiresManifestContinuityGap(error) || ["MANIFEST_PERMANENT_404", "MSE_APPEND_ERROR", "MSE_REMOVE_ERROR", "MSE_QUOTA_EXCEEDED"].includes(error?.code) || error?.code?.startsWith("GAP_") || error?.code?.startsWith("LIVE_SESSION_") || [
+    return requiresManifestContinuityGap(error) || [
+      "MANIFEST_PERMANENT_404",
+      "MSE_UNSUPPORTED",
+      "MSE_CODEC_UNSUPPORTED",
+      "MSE_SOURCEBUFFER_ERROR",
+      "MSE_EVENT_ERROR",
+      "MSE_APPEND_ERROR",
+      "MSE_REMOVE_ERROR",
+      "MSE_QUOTA_EXCEEDED"
+    ].includes(error?.code) || error?.code?.startsWith("GAP_") || error?.code?.startsWith("LIVE_SESSION_") || [
       "LIVE_AUDIO_CODEC_MISSING",
       "LIVE_VIDEO_CODEC_MISSING",
       "LIVE_CODEC_MISSING",
@@ -1688,6 +1699,7 @@
       this.watchdogTimer;
       this.watchdogGeneration;
       this.watchdogStartedAtMilliseconds;
+      this.initialInventoryFormed = false;
       this.boundEvents = [];
     }
     isGenerationCurrent(generation) {
@@ -1701,6 +1713,7 @@
     beginNewGeneration() {
       this.cancelZeroInventoryWatchdog();
       this.generation += 1;
+      this.retryMessage = "";
       this.segmentAbort?.abort();
       this.segmentAbort = new AbortController();
       this.inFlight.clear();
@@ -1713,7 +1726,10 @@
       this.retryMessage = "";
       this.panel.setModel({ mode: "直播", state: this.starting ? "STARTING" : this.stateMachine.state, stage, message });
     }
-    reportRetry({ kind, attempt, hosts }) {
+    reportRetry(generation, { kind, attempt, hosts }) {
+      if (!this.isGenerationCurrent(generation)) {
+        return;
+      }
       const uniqueHosts = [...new Set(hosts)];
       this.retryMessage = `临时${kind}失败，重试第 ${attempt} 轮：${uniqueHosts.join("、")}`;
       this.panel.setMessage(this.retryMessage);
@@ -1748,8 +1764,11 @@
     candidateHosts() {
       return [...new Set((this.track?.candidates || this.manifestCandidates || []).map((url) => new URL(url).host))];
     }
+    needsZeroInventoryWatchdog() {
+      return this.starting || this.stateMachine.state === LIVE_STATE.RECOVERING || !this.initialInventoryFormed && this.stateMachine.state === LIVE_STATE.LIVE;
+    }
     startZeroInventoryWatchdog(generation = this.generation) {
-      if (this.destroyed || !this.enabled || this.watchdogGeneration === generation || this.starting === false && this.stateMachine.state !== LIVE_STATE.RECOVERING) {
+      if (this.destroyed || !this.enabled || this.watchdogGeneration === generation || !this.needsZeroInventoryWatchdog()) {
         return;
       }
       this.cancelZeroInventoryWatchdog();
@@ -1777,11 +1796,14 @@
     }
     refreshZeroInventoryWatchdog(inventory = this.readInventory()) {
       if (inventory > 0) {
+        this.initialInventoryFormed = true;
         this.cancelZeroInventoryWatchdog();
         return;
       }
-      if (this.starting || this.stateMachine.state === LIVE_STATE.RECOVERING) {
+      if (this.needsZeroInventoryWatchdog()) {
         this.startZeroInventoryWatchdog(this.generation);
+      } else {
+        this.cancelZeroInventoryWatchdog();
       }
     }
     installRuntimeTimers() {
@@ -1821,7 +1843,7 @@
           requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal: this.segmentAbort?.signal,
-          onRetry: (retry) => this.reportRetry(retry)
+          onRetry: (retry) => this.reportRetry(generation, retry)
         });
         this.ensureGenerationCurrent(generation);
         this.track = extractLiveTrack(payload, 1e4, "avc");
@@ -1852,7 +1874,7 @@
           return;
         }
         const normalized = toBufferScriptError(error, "LIVE_START_FAILED", "直播初始媒体管线失败");
-        if (this.track !== void 0 && requiresStartupGap(normalized)) {
+        if (requiresStartupGap(normalized)) {
           this.started = true;
           this.enterGap(normalized);
         } else {
@@ -1885,7 +1907,7 @@
             requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
             retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
             signal,
-            onRetry: (retry) => this.reportRetry(retry)
+            onRetry: (retry) => this.reportRetry(generation, retry)
           });
           this.ensureGenerationCurrent(generation);
           this.track = track;
@@ -1900,7 +1922,7 @@
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal,
         onWarning: (message, error) => this.logger.warn(message, error),
-        onRetry: (retry) => this.reportRetry(retry)
+        onRetry: (retry) => this.reportRetry(generation, retry)
       });
       this.ensureGenerationCurrent(generation);
       let parsed = parseHlsPlaylist(loaded.text, loaded.url);
@@ -1921,7 +1943,7 @@
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal,
           onWarning: (message, error) => this.logger.warn(message, error),
-          onRetry: (retry) => this.reportRetry(retry)
+          onRetry: (retry) => this.reportRetry(generation, retry)
         });
         this.ensureGenerationCurrent(generation);
         parsed = parseHlsPlaylist(variantLoaded.text, variantLoaded.url);
@@ -1936,7 +1958,7 @@
       this.recordRequest(
         "manifest",
         manifestLoaded,
-        parsed.segments.reduce((sum, segment) => sum + segment.duration, 0)
+        0
       );
       return { manifest: parsed, candidates, variantIdentity };
     }
@@ -1964,7 +1986,7 @@
             retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
             signal,
             onWarning: (message, error) => this.logger.warn(message, error),
-            onRetry: (retry) => this.reportRetry(retry)
+            onRetry: (retry) => this.reportRetry(generation, retry)
           });
           this.ensureGenerationCurrent(generation);
           if (pipeline !== this.pipeline) {
@@ -2080,7 +2102,7 @@
               retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
               signal: this.segmentAbort.signal,
               onWarning: (message, error) => this.logger.warn(message, error),
-              onRetry: (retry) => this.reportRetry(retry)
+              onRetry: (retry) => this.reportRetry(generation, retry)
             });
             if (generation !== this.generation) {
               this.logger.warn(`丢弃已取消的片段下载 ${segment.sn}`);
@@ -2231,7 +2253,7 @@
           requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
           retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
           signal,
-          onRetry: (retry) => this.reportRetry(retry)
+          onRetry: (retry) => this.reportRetry(generation, retry)
         });
         this.ensureGenerationCurrent(generation);
         const loaded = await this.loadMediaManifest(next, { generation, signal });
@@ -2282,7 +2304,9 @@
       const nowMilliseconds = Date.now();
       const windows = this.config.metricsWindowsSeconds.map((windowSeconds) => {
         const cutoff = nowMilliseconds - windowSeconds * 1e3;
-        const entries = this.requestMetrics.filter((entry) => entry.completedAtMilliseconds >= cutoff);
+        const entries = this.requestMetrics.filter(
+          (entry) => entry.kind === "segment" && entry.byteLength > 0 && entry.mediaDuration > 0 && entry.completedAtMilliseconds >= cutoff
+        );
         const bytes = entries.reduce((sum, entry) => sum + entry.byteLength, 0);
         const mediaDuration = entries.reduce((sum, entry) => sum + entry.mediaDuration, 0);
         if (bytes <= 0 || mediaDuration <= 0) {
@@ -2324,6 +2348,11 @@
       }
       const inventory = this.readInventory();
       const delay2 = this.estimateDelay();
+      if (this.initialInventoryFormed && inventory <= 0 && !this.userPaused && [LIVE_STATE.LIVE, LIVE_STATE.DELAYED, LIVE_STATE.STALL].includes(this.stateMachine.state)) {
+        this.stateMachine.onStall();
+        this.stateMachine.onRecovering();
+        this.pauseForRecovery();
+      }
       this.refreshZeroInventoryWatchdog(inventory);
       if (delay2 !== void 0) {
         this.stateMachine.onDelayChanged(delay2);
@@ -2339,7 +2368,7 @@
       const multiplier = this.liveMultiplier(inventory);
       const message = [this.failureMessage, this.retryMessage].filter(Boolean).join("；");
       this.panel.setModel({
-        state: this.stateMachine.state,
+        state: !this.initialInventoryFormed && inventory <= 0 && this.stateMachine.state === LIVE_STATE.LIVE ? "STARTING" : this.stateMachine.state,
         mode: "直播",
         inventory: `${inventory.toFixed(1)} 秒`,
         delay: delay2 === void 0 ? "未提供" : `${delay2.toFixed(1)} 秒`,
@@ -2381,6 +2410,7 @@
       this.starting = false;
       this.started = true;
       this.failureMessage = `${normalized.code}: ${normalized.message}`;
+      this.retryMessage = "";
       this.stateMachine.onGap(normalized.message);
       this.generation += 1;
       this.segmentAbort?.abort();
@@ -2407,6 +2437,7 @@
       } else {
         this.cancelZeroInventoryWatchdog();
         this.generation += 1;
+        this.retryMessage = "";
         this.segmentAbort?.abort();
         this.inFlight.clear();
         this.rebuildingSource = false;
@@ -2430,6 +2461,10 @@
       }
     }
     async manualSkipGap() {
+      if (this.track === void 0) {
+        await this.manualReturnLive();
+        return;
+      }
       this.stateMachine.manualSkipGap();
       this.userPaused = false;
       await this.restartAtCurrentEdge();
@@ -2438,6 +2473,8 @@
       this.stateMachine.manualReturnLive();
       this.userPaused = false;
       const generation = this.beginNewGeneration();
+      this.setStage("播放信息", "正在读取播放信息");
+      this.startZeroInventoryWatchdog(generation);
       const track = await this.loadManualReturnTrack(generation);
       if (!this.isGenerationCurrent(generation)) {
         return;
@@ -2446,19 +2483,21 @@
     }
     async loadManualReturnTrack(generation = this.generation, signal = this.segmentAbort?.signal) {
       const previous = this.track;
+      const requestedQualityNumber = previous?.qualityNumber ?? 1e4;
+      const preferredCodec = previous?.codecName ?? "avc";
       this.ensureGenerationCurrent(generation);
-      const payload = await fetchRoomPlayInfo(this.roomId, previous.qualityNumber, this.fetchImpl, {
+      const payload = await fetchRoomPlayInfo(this.roomId, requestedQualityNumber, this.fetchImpl, {
         requestTimeoutMilliseconds: this.config.requestTimeoutMilliseconds,
         retryBackoffMilliseconds: this.config.retryBackoffMilliseconds,
         signal,
-        onRetry: (retry) => this.reportRetry(retry)
+        onRetry: (retry) => this.reportRetry(generation, retry)
       });
       this.ensureGenerationCurrent(generation);
-      const track = extractLiveTrack(payload, previous.qualityNumber, previous.codecName);
+      const track = extractLiveTrack(payload, requestedQualityNumber, preferredCodec);
       if (track.roomId !== this.roomId) {
         fail("LIVE_ROOM_CHANGED", "播放 API 返回了不同直播间");
       }
-      if (track.qualityNumber !== previous.qualityNumber) {
+      if (previous !== void 0 && track.qualityNumber !== previous.qualityNumber) {
         fail("LIVE_QUALITY_CHANGED", "回到直播返回了不同清晰度，不能建立当前边缘");
       }
       return track;
@@ -2467,6 +2506,7 @@
       const activeGeneration = generation === void 0 ? this.beginNewGeneration() : generation;
       this.ensureGenerationCurrent(activeGeneration);
       this.startZeroInventoryWatchdog(activeGeneration);
+      this.setStage("manifest", "正在读取直播 manifest");
       const loaded = await this.loadMediaManifest(track, { enforceVariant: false, generation: activeGeneration });
       this.ensureGenerationCurrent(activeGeneration);
       this.track = track;
@@ -2491,8 +2531,10 @@
         );
         replacementPipeline = pipeline;
         this.pipeline = pipeline;
+        this.setStage("MSE", "正在重新打开 MSE 管线");
         await pipeline.open(buildMime(this.track));
         this.ensureGenerationCurrent(activeGeneration);
+        this.setStage("init", "正在校验并追加音视频 init");
         await this.appendInitSegment(activeGeneration, pipeline);
         this.ensureGenerationCurrent(activeGeneration);
         pipeline.assertOwnsVideoSource();
@@ -2507,15 +2549,27 @@
       }
       this.ensureGenerationCurrent(activeGeneration);
       this.failureMessage = void 0;
-      this.stateMachine.onRecoveryReady(0);
+      this.setStage("库存形成", "正在形成连续可解码库存");
       this.installRuntimeTimers();
       this.scheduleDownloads();
       void this.pumpDelivery();
       this.updateStatus();
     }
     runAction(action) {
-      Promise.resolve(action()).catch((error) => {
-        if (this.destroyed || error?.code === "LIVE_GENERATION_STALE") {
+      let operation;
+      try {
+        operation = action();
+      } catch (error) {
+        if (this.destroyed || error?.code === "LIVE_GENERATION_STALE" || error?.code === "STATE_MANUAL_ACTION_INVALID") {
+          this.logger.warn("忽略已取消的直播人工操作", error);
+          return;
+        }
+        this.enterGap(error);
+        return;
+      }
+      const actionGeneration = this.generation;
+      Promise.resolve(operation).catch((error) => {
+        if (this.destroyed || actionGeneration !== this.generation || error?.code === "LIVE_GENERATION_STALE" || error?.code === "STATE_MANUAL_ACTION_INVALID") {
           this.logger.warn("忽略已取消的直播人工操作", error);
           return;
         }
@@ -28552,7 +28606,7 @@
         if (this.scriptPaused && this.startupComplete && this.currentCore !== void 0) {
           const inventory = readForwardInventory(this.video, this.currentCore);
           const remaining = Number.isFinite(this.video.duration) ? Math.max(0, this.video.duration - this.video.currentTime) : Number.POSITIVE_INFINITY;
-          const target = Math.min(this.config.startupBufferSeconds, remaining);
+          const target = Math.min(this.config.startupBufferSeconds, Math.max(0, remaining - 1));
           if (remaining > 30 && this.pausedSchedulingSupported && inventory < target) {
             this.pauseForRefill();
           }
@@ -28918,21 +28972,25 @@
       }
       const inventory = readForwardInventory(this.video, core);
       const remaining = Number.isFinite(this.video.duration) ? Math.max(0, this.video.duration - this.video.currentTime) : Number.POSITIVE_INFINITY;
-      const refillTarget = Math.min(this.config.startupBufferSeconds, remaining);
+      const initialFillTarget = Math.min(this.config.startupBufferSeconds, remaining);
+      const refillResumeTarget = Math.min(this.config.startupBufferSeconds, Math.max(0, remaining - 1));
       if (this.userPaused) {
         return;
       }
       if (remaining <= 30) {
+        if (this.scriptPaused) {
+          this.attemptPlay();
+        }
         return;
       }
       if (!this.startupComplete) {
-        if (inventory >= refillTarget) {
+        if (inventory >= initialFillTarget) {
           this.startupComplete = true;
         }
         return;
       }
       if (this.scriptPaused) {
-        if (inventory >= refillTarget) {
+        if (inventory >= refillResumeTarget) {
           this.attemptPlay();
         }
         return;
@@ -29112,12 +29170,12 @@
     "message",
     "stage"
   ]);
-  var nextSurfaceNumber = 1;
   var currentSurface;
   function createSurfaceId() {
-    const number = nextSurfaceNumber;
-    nextSurfaceNumber += 1;
-    return `surface-${Date.now().toString(36)}-${number.toString(36)}`;
+    if (typeof globalThis.crypto?.randomUUID !== "function") {
+      fail("UI_SURFACE_ID_UNAVAILABLE", "当前环境不能生成唯一状态 surface id");
+    }
+    return `surface-${globalThis.crypto.randomUUID()}`;
   }
   function displayValue(value) {
     return value === void 0 || value === null || value === "" ? "未提供" : String(value);
@@ -29145,6 +29203,7 @@
       this.actions = /* @__PURE__ */ new Map();
       this.destroyed = false;
       this.boundTabId = void 0;
+      this.freshnessCheck = () => true;
       for (const [name, action] of Object.entries(actions)) {
         this.setAction(name, action.label, action.callback, action.visible !== false);
       }
@@ -29175,6 +29234,20 @@
     setMessage(message) {
       this.setModel({ message });
     }
+    setFreshnessCheck(callback) {
+      if (this.destroyed) {
+        fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
+      }
+      if (typeof callback !== "function") {
+        fail("UI_SURFACE_FRESHNESS_INVALID", "状态 surface 缺少有效新鲜度检查");
+      }
+      this.freshnessCheck = callback;
+    }
+    assertFresh() {
+      if (this.freshnessCheck() !== true) {
+        fail("UI_SURFACE_STALE", "状态 surface 已不属于当前页面");
+      }
+    }
     bindTab(tabId) {
       if (!Number.isInteger(tabId) || tabId <= 0) {
         fail("UI_TAB_INVALID", "状态 surface 的 tab id 无效");
@@ -29188,6 +29261,7 @@
       if (this.destroyed) {
         fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
       }
+      this.assertFresh();
       const actions = {};
       for (const [name, action] of this.actions) {
         if (action.visible) {
@@ -29205,6 +29279,7 @@
       if (this.destroyed) {
         fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
       }
+      this.assertFresh();
       if (!ACTION_NAMES.includes(name)) {
         fail("UI_ACTION_UNKNOWN", `状态动作未允许: ${name}`);
       }
@@ -30031,6 +30106,9 @@
       }
       const panel = createStatusPanel(this.documentObject, mode === "live" ? "直播" : "点播");
       this.active = { mode, href, panel, video: void 0, controller: void 0 };
+      panel.setFreshnessCheck(
+        () => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && this.active?.panel === panel && this.routeKey === href && this.windowObject.location.href === href && modeForLocation(this.windowObject.location) === mode
+      );
       panel.setModel({
         mode: mode === "live" ? "直播" : "点播",
         state: "STARTING",

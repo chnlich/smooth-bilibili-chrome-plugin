@@ -567,6 +567,16 @@ test('signature renewal preserves room, quality, format, codec, and stream sessi
   );
 });
 
+test('live track retains the API quality description when codec metadata omits it', () => {
+  const payload = createPayload();
+  const playurl = payload.data.playurl_info.playurl;
+  const codec = playurl.stream[0].format[0].codec[0];
+  delete codec.description;
+  playurl.g_qn_desc = [{ qn: 250, desc: '超清' }];
+
+  assert.equal(extractLiveTrack(payload, 10000, 'avc').qualityDescription, '超清');
+});
+
 test('automatic signature renewal refreshes manifest candidates before retrying cached sequences', async () => {
   const initialManifest = parseHlsPlaylist(MEDIA_TEXT, MEDIA_URL);
   const freshManifestUrl = 'https://cdn-renewed.example/live/index.m3u8?expires=fresh&sign=fresh';
@@ -688,9 +698,9 @@ test('live startup reports each bounded controller stage through the status surf
   controller.destroy();
 });
 
-test('initial all-CDN manifest 404 enters GAP with actions and manual return can rebuild', async () => {
+test('initial all-CDN manifest 404 enters GAP with actions and manual return reports recovery stages', async () => {
   let manifestAvailable = false;
-  const { controller, actions } = createStartupController(async (url) => {
+  const { controller, actions, stages } = createStartupController(async (url) => {
     if (url.includes('getRoomPlayInfo')) {
       return response(200, JSON.stringify(createPayload()));
     }
@@ -709,7 +719,11 @@ test('initial all-CDN manifest 404 enters GAP with actions and manual return can
   assert.equal(controller.track.qualityNumber, 250);
   manifestAvailable = true;
   await controller.manualReturnLive();
-  assert.equal(controller.stateMachine.state, LIVE_STATE.LIVE);
+  assert.equal(controller.stateMachine.state, LIVE_STATE.RECOVERING);
+  assert.equal(controller.stage, '库存形成');
+  for (const stage of ['播放信息', 'manifest', 'MSE', 'init', '库存形成']) {
+    assert.ok(stages.includes(stage), `missing live recovery stage ${stage}`);
+  }
   assert.match(controller.pipeline.objectUrl, /^blob:startup-/);
   controller.destroy();
 });
@@ -735,8 +749,59 @@ test('initial init append failure enters GAP with actions and manual return can 
   assert.equal(controller.track.qualityNumber, 250);
   appendState.failAppend = false;
   await controller.manualReturnLive();
-  assert.equal(controller.stateMachine.state, LIVE_STATE.LIVE);
+  assert.equal(controller.stateMachine.state, LIVE_STATE.RECOVERING);
+  assert.equal(controller.stage, '库存形成');
   assert.match(controller.pipeline.objectUrl, /^blob:startup-/);
+  controller.destroy();
+});
+
+test('an unsupported combined live audio/video MIME enters an explicit GAP', async () => {
+  const { controller, actions } = createStartupController(async (url) => {
+    if (url.includes('getRoomPlayInfo')) {
+      return response(200, JSON.stringify(createPayload()));
+    }
+    if (new URL(url).pathname.endsWith('init.mp4')) {
+      return response(200, VALID_INIT_SEGMENT);
+    }
+    return response(200, MEDIA_TEXT);
+  });
+  controller.pipeline.mediaSourceFactory = { isTypeSupported: () => false };
+
+  await controller.start();
+
+  assert.equal(controller.stateMachine.state, LIVE_STATE.GAP_UNRECOVERABLE);
+  assert.match(controller.failureMessage, /^MSE_CODEC_UNSUPPORTED:/);
+  assert.equal(actions.get('skip-gap'), true);
+  assert.equal(actions.get('return-live'), true);
+  controller.destroy();
+});
+
+test('a live API response without an audio codec enters an explicit GAP before MSE setup', async () => {
+  const missingAudioPayload = createPayload();
+  delete missingAudioPayload.data.playurl_info.playurl.stream[0].format[0].codec[0].audio_codecs;
+  let payload = missingAudioPayload;
+  const { controller, actions } = createStartupController(async (url) => {
+    if (url.includes('getRoomPlayInfo')) {
+      return response(200, JSON.stringify(payload));
+    }
+    if (new URL(url).pathname.endsWith('init.mp4')) {
+      return response(200, VALID_INIT_SEGMENT);
+    }
+    return response(200, MEDIA_TEXT);
+  });
+
+  await controller.start();
+
+  assert.equal(controller.stateMachine.state, LIVE_STATE.GAP_UNRECOVERABLE);
+  assert.match(controller.failureMessage, /^LIVE_AUDIO_CODEC_MISSING:/);
+  assert.equal(actions.get('skip-gap'), true);
+  assert.equal(actions.get('return-live'), true);
+  assert.equal(controller.track, undefined);
+  payload = createPayload();
+  await controller.manualReturnLive();
+  assert.equal(controller.stateMachine.state, LIVE_STATE.RECOVERING);
+  assert.equal(controller.track.qualityNumber, 250);
+  assert.equal(controller.stage, '库存形成');
   controller.destroy();
 });
 
@@ -1543,6 +1608,14 @@ test('live fMP4 init validation requires both video and audio track declarations
     () => validateInitSegmentTracks(audioOnly),
     (error) => error.code === 'LIVE_VIDEO_TRACK_MISSING',
   );
+  const orphanHandlers = new Uint8Array([
+    ...makeBox('ftyp', new Uint8Array(4)),
+    ...makeBox('moov', new Uint8Array([...handlerBox('vide'), ...handlerBox('soun')])),
+  ]).buffer;
+  assert.throws(
+    () => validateInitSegmentTracks(orphanHandlers),
+    (error) => error.code === 'LIVE_VIDEO_TRACK_MISSING',
+  );
 });
 
 test('MSE sourceopen waits are bounded and report a product timeout', async () => {
@@ -1613,6 +1686,238 @@ test('live zero-inventory watchdog is one absolute 45-second timer and cancels o
   stale();
   assert.notEqual(controller.stateMachine.state, LIVE_STATE.GAP_UNRECOVERABLE);
   assert.equal(timers.size, 0);
+  controller.starting = false;
+  controller.initialInventoryFormed = false;
+  controller.stateMachine.onGap('terminal startup failure');
+  controller.refreshZeroInventoryWatchdog();
+  assert.equal(timers.size, 0);
+  controller.destroy();
+});
+
+test('re-enabling an initial zero-inventory live generation installs a fresh watchdog', async () => {
+  let nextTimer = 1;
+  const timers = new Map();
+  const runtime = {
+    MediaSource: globalThis.MediaSource,
+    URL: globalThis.URL,
+    setInterval: () => 1,
+    clearInterval() {},
+    setTimeout(callback, milliseconds) {
+      const id = nextTimer;
+      nextTimer += 1;
+      timers.set(id, { callback, milliseconds });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  const { controller } = createLiveController({ runtimeObject: runtime });
+  controller.started = true;
+  controller.track = createTrack();
+  controller.segmentAbort = new AbortController();
+  controller.readInventory = () => 0;
+  controller.scheduleDownloads = () => {};
+  controller.refreshManifest = async () => {};
+  controller.startZeroInventoryWatchdog(controller.generation);
+  const [initialTimerId] = timers.keys();
+
+  await controller.toggle();
+  assert.equal(timers.has(initialTimerId), false);
+  assert.equal(controller.generation, 1);
+
+  await controller.toggle();
+  assert.equal(timers.size, 1);
+  const [freshTimer] = timers.values();
+  assert.equal(freshTimer.milliseconds, LIVE_CONFIG.zeroInventoryWatchdogMilliseconds);
+  freshTimer.callback();
+  assert.equal(controller.stateMachine.state, LIVE_STATE.GAP_UNRECOVERABLE);
+  controller.destroy();
+});
+
+test('re-enabling live clears a stale generation retry message', async () => {
+  const models = [];
+  const { controller } = createLiveController();
+  controller.started = true;
+  controller.track = createTrack();
+  controller.readInventory = () => 1;
+  controller.scheduleDownloads = () => {};
+  controller.refreshManifest = async () => {};
+  controller.panel.setModel = (model) => models.push(model);
+  controller.retryMessage = '临时 segment 失败，重试第 1 轮：cdn-a.example';
+  const staleGeneration = controller.generation;
+
+  await controller.toggle();
+  await controller.toggle();
+  controller.reportRetry(staleGeneration, { kind: 'segment', attempt: 2, hosts: ['cdn-a.example'] });
+
+  assert.equal(controller.retryMessage, '');
+  assert.equal(models.at(-1).message, '');
+  controller.destroy();
+});
+
+test('manual return starts a new zero-inventory watchdog before retrying play info', async () => {
+  let nextTimer = 1;
+  const timers = new Map();
+  const runtime = {
+    MediaSource: globalThis.MediaSource,
+    URL: globalThis.URL,
+    setInterval: () => 1,
+    clearInterval() {},
+    setTimeout(callback, milliseconds) {
+      const id = nextTimer;
+      nextTimer += 1;
+      timers.set(id, { callback, milliseconds });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  const { controller } = createLiveController({ runtimeObject: runtime });
+  controller.track = createTrack();
+  controller.stateMachine.onGap('initial startup failed');
+  controller.loadManualReturnTrack = async () => new Promise(() => {});
+
+  void controller.manualReturnLive();
+  await Promise.resolve();
+
+  const [watchdog] = timers.values();
+  assert.equal(watchdog.milliseconds, LIVE_CONFIG.zeroInventoryWatchdogMilliseconds);
+  watchdog.callback();
+  assert.equal(controller.stateMachine.state, LIVE_STATE.GAP_UNRECOVERABLE);
+  controller.destroy();
+});
+
+test('a stale manual return abort cannot freeze a newer live generation', async () => {
+  const pendingReturns = [];
+  const { controller } = createLiveController();
+  controller.stateMachine.onGap('manual recovery fixture');
+  controller.loadManualReturnTrack = async (generation) =>
+    new Promise((resolve, reject) => {
+      pendingReturns.push({ generation, resolve, reject });
+    });
+
+  controller.runAction(() => controller.manualReturnLive());
+  controller.runAction(() => controller.manualReturnLive());
+  assert.equal(pendingReturns.length, 2);
+  assert.equal(controller.generation, 2);
+  pendingReturns[0].reject(new BufferScriptError('REQUEST_ABORTED', 'first manual action was superseded'));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(controller.stateMachine.state, LIVE_STATE.RECOVERING);
+  assert.equal(controller.failureMessage, undefined);
+  controller.destroy();
+});
+
+test('a t=30 required response uses only the remaining time of one 45-second watchdog', async () => {
+  const originalDateNow = Date.now;
+  let nowMilliseconds = 0;
+  let controller;
+  Date.now = () => nowMilliseconds;
+  try {
+    let nextTimer = 1;
+    const timers = new Map();
+    let resolveSegment;
+    let resolveAppend;
+    let signalAppendStarted;
+    const appendStarted = new Promise((resolve) => {
+      signalAppendStarted = resolve;
+    });
+    const runtime = {
+      MediaSource: globalThis.MediaSource,
+      URL: globalThis.URL,
+      setInterval: () => 1,
+      clearInterval() {},
+      setTimeout(callback, milliseconds) {
+        const id = nextTimer;
+        nextTimer += 1;
+        timers.set(id, { callback, milliseconds, dueAtMilliseconds: nowMilliseconds + milliseconds });
+        return id;
+      },
+      clearTimeout(id) {
+        timers.delete(id);
+      },
+    };
+    ({ controller } = createLiveController({
+      runtimeObject: runtime,
+      fetchImpl: async (url) => {
+        if (new URL(url).pathname.endsWith('seg-102.m4s')) {
+          return new Promise((resolve) => {
+            resolveSegment = resolve;
+          });
+        }
+        throw new Error(`unexpected request ${url}`);
+      },
+    }));
+    const manifest = parseHlsPlaylist(MEDIA_TEXT, MEDIA_URL);
+    let inventory = 0;
+    controller.started = true;
+    controller.starting = true;
+    controller.track = createTrack();
+    controller.manifestCandidates = controller.track.candidates;
+    controller.segmentAbort = new AbortController();
+    controller.queue.initialize(manifest, true);
+    controller.readInventory = () => inventory;
+    controller.scheduleDownloads = () => {};
+    controller.pipeline.append = () =>
+      new Promise((resolve) => {
+        resolveAppend = () => {
+          inventory = 2;
+          resolve();
+        };
+        signalAppendStarted();
+      });
+    controller.startZeroInventoryWatchdog(controller.generation);
+    const [watchdogId, watchdog] = timers.entries().next().value;
+    assert.equal(watchdog.milliseconds, LIVE_CONFIG.zeroInventoryWatchdogMilliseconds);
+    assert.equal(watchdog.dueAtMilliseconds, 45000);
+
+    const downloading = controller.downloadSegment(controller.queue.getNextSegment(), controller.generation);
+    await Promise.resolve();
+    assert.equal(typeof resolveSegment, 'function');
+    nowMilliseconds = 30000;
+    resolveSegment(response(200, new Uint8Array([1, 2, 3])));
+    await downloading;
+    await appendStarted;
+    assert.equal(timers.size, 1);
+    assert.equal(timers.get(watchdogId).dueAtMilliseconds, 45000);
+
+    nowMilliseconds = 44999;
+    resolveAppend();
+    for (let tick = 0; tick < 10 && timers.has(watchdogId); tick += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(inventory, 2);
+    assert.equal(timers.has(watchdogId), false);
+    nowMilliseconds = 45000;
+    watchdog.callback();
+    assert.notEqual(controller.stateMachine.state, LIVE_STATE.GAP_UNRECOVERABLE);
+  } finally {
+    controller?.destroy();
+    Date.now = originalDateNow;
+  }
+});
+
+test('zero inventory after init is displayed as STARTING until decodable inventory exists', () => {
+  const models = [];
+  const { controller } = createLiveController();
+  controller.started = true;
+  controller.track = createTrack();
+  controller.panel.setModel = (model) => models.push(model);
+  controller.readInventory = () => 0;
+
+  controller.updateStatus();
+  assert.equal(models.at(-1).state, 'STARTING');
+
+  controller.readInventory = () => 1;
+  controller.updateStatus();
+  assert.equal(models.at(-1).state, LIVE_STATE.LIVE);
+
+  controller.readInventory = () => 0;
+  controller.updateStatus();
+  assert.equal(models.at(-1).state, LIVE_STATE.RECOVERING);
   controller.destroy();
 });
 
@@ -1632,11 +1937,25 @@ test('live metrics use completed request windows and show inventory-full instead
   const now = Date.now();
   const { controller } = createLiveController();
   controller.requestMetrics = [
+    { kind: 'manifest', byteLength: 100000, mediaDuration: 999, completedAtMilliseconds: now - 100 },
     { kind: 'segment', byteLength: 1000, mediaDuration: 10, completedAtMilliseconds: now - 500 },
     { kind: 'segment', byteLength: 500, mediaDuration: 20, completedAtMilliseconds: now - 31000 },
   ];
   assert.equal(controller.liveMultiplier(60), '库存已满');
   assert.equal(controller.liveMultiplier(20), '30 秒 0.33× / 60 秒 0.50×');
+  controller.destroy();
+});
+
+test('stale live retry callbacks cannot overwrite a new generation status message', () => {
+  const messages = [];
+  const { controller } = createLiveController();
+  controller.panel.setMessage = (message) => messages.push(message);
+  const staleGeneration = controller.generation;
+  controller.reportRetry(staleGeneration, { kind: 'segment', attempt: 1, hosts: ['cdn-a.example'] });
+  controller.beginNewGeneration();
+  controller.reportRetry(staleGeneration, { kind: 'segment', attempt: 2, hosts: ['cdn-b.example'] });
+
+  assert.deepEqual(messages, ['临时segment失败，重试第 1 轮：cdn-a.example']);
   controller.destroy();
 });
 
@@ -2105,6 +2424,82 @@ test('VOD split-track tails within one second never script-pause and still reach
   video.dispatchEvent(new Event('ended'));
   assert.equal(models.at(-1).state, 'ENDED');
   controller.destroy();
+});
+
+test('VOD resumes a pre-tail script refill when the audio tail is up to one second shorter', async () => {
+  for (const audioTailDifference of [0.05, 0.5, 1]) {
+    const listeners = new Map();
+    let videoEnd = 597.9;
+    let audioEnd = 597.9;
+    const video = {
+      currentTime: 568.9,
+      duration: 600,
+      paused: false,
+      playbackRate: 2,
+      pauseCalls: 0,
+      playCalls: 0,
+      buffered: { length: 1, start: () => 568.9, end: () => videoEnd },
+      addEventListener(name, callback) {
+        listeners.set(name, callback);
+      },
+      removeEventListener() {},
+      pause() {
+        this.pauseCalls += 1;
+        this.paused = true;
+        listeners.get('pause')?.();
+      },
+      play() {
+        this.playCalls += 1;
+        this.paused = false;
+        listeners.get('play')?.();
+        return Promise.resolve();
+      },
+      dispatchEvent(event) {
+        listeners.get(event.type)?.(event);
+        return true;
+      },
+    };
+    const core = {
+      getBufferedRanges() {
+        return {
+          video: { length: 1, start: () => 568.9, end: () => videoEnd },
+          audio: { length: 1, start: () => 568.9, end: () => audioEnd },
+        };
+      },
+    };
+    const controller = new VodController({
+      windowObject: { performance: { now: () => 0, getEntriesByType: () => [] } },
+      documentObject: {},
+      video,
+      panel: { setModel() {}, setAction() {} },
+    });
+    controller.started = true;
+    controller.startupComplete = true;
+    controller.currentCore = core;
+    controller.installVideoGuards();
+
+    controller.enforceStartupAndRefill(core);
+    assert.equal(video.pauseCalls, 1, `split ${audioTailDifference} must enter the only permitted mid-video refill`);
+    assert.equal(controller.scriptPaused, true);
+
+    videoEnd = 600;
+    audioEnd = 600 - audioTailDifference;
+    controller.enforceStartupAndRefill(core);
+    await Promise.resolve();
+    assert.equal(video.playCalls, 1, `split ${audioTailDifference} must satisfy the bounded refill target`);
+    assert.equal(controller.scriptPaused, false);
+
+    controller.scriptPaused = true;
+    video.currentTime = 570.1;
+    video.paused = true;
+    controller.enforceStartupAndRefill(core);
+    await Promise.resolve();
+    assert.equal(video.pauseCalls, 1, 'the final 30 seconds must never add another script pause');
+    assert.equal(video.paused, false, 'a script pause crossing the tail must resume naturally');
+    video.dispatchEvent(new Event('ended'));
+    assert.equal(controller.ended, true);
+    controller.destroy();
+  }
 });
 
 test('VOD does not re-pause an early user play while initial inventory is low', () => {

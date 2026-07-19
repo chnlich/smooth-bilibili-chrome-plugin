@@ -137,7 +137,8 @@ export function extractLiveTrack(payload, requestedQualityNumber = 10000, prefer
   if (!Number.isInteger(roomId)) {
     fail('PLAY_INFO_ROOM_MISSING', '播放 API 缺少有效 room_id');
   }
-  const streams = requireValue(data.playurl_info?.playurl?.stream, 'PLAY_INFO_STREAM_MISSING', '播放 API 缺少 stream');
+  const playurl = requireValue(data.playurl_info?.playurl, 'PLAY_INFO_STREAM_MISSING', '播放 API 缺少 playurl');
+  const streams = requireValue(playurl.stream, 'PLAY_INFO_STREAM_MISSING', '播放 API 缺少 stream');
   const hlsStreams = streams.filter(protocolIsHls);
   if (hlsStreams.length === 0) {
     fail('LIVE_HLS_MISSING', '播放 API 没有 HLS 流');
@@ -185,6 +186,9 @@ export function extractLiveTrack(payload, requestedQualityNumber = 10000, prefer
     codec.quality_name,
     codec.qn_desc,
     codec.name,
+    ...((playurl.g_qn_desc || [])
+      .filter((description) => Number(description?.qn) === qualityNumber)
+      .flatMap((description) => [description.desc, description.description, description.name])),
   ].find((value) => typeof value === 'string' && value.trim().length > 0);
   return {
     roomId,

@@ -15,13 +15,13 @@ const DISPLAY_FIELDS = Object.freeze([
   'stage',
 ]);
 
-let nextSurfaceNumber = 1;
 let currentSurface;
 
 function createSurfaceId() {
-  const number = nextSurfaceNumber;
-  nextSurfaceNumber += 1;
-  return `surface-${Date.now().toString(36)}-${number.toString(36)}`;
+  if (typeof globalThis.crypto?.randomUUID !== 'function') {
+    fail('UI_SURFACE_ID_UNAVAILABLE', '当前环境不能生成唯一状态 surface id');
+  }
+  return `surface-${globalThis.crypto.randomUUID()}`;
 }
 
 function displayValue(value) {
@@ -52,6 +52,7 @@ export class StatusPanel {
     this.actions = new Map();
     this.destroyed = false;
     this.boundTabId = undefined;
+    this.freshnessCheck = () => true;
     for (const [name, action] of Object.entries(actions)) {
       this.setAction(name, action.label, action.callback, action.visible !== false);
     }
@@ -86,6 +87,22 @@ export class StatusPanel {
     this.setModel({ message });
   }
 
+  setFreshnessCheck(callback) {
+    if (this.destroyed) {
+      fail('UI_SURFACE_DESTROYED', '状态 surface 已销毁');
+    }
+    if (typeof callback !== 'function') {
+      fail('UI_SURFACE_FRESHNESS_INVALID', '状态 surface 缺少有效新鲜度检查');
+    }
+    this.freshnessCheck = callback;
+  }
+
+  assertFresh() {
+    if (this.freshnessCheck() !== true) {
+      fail('UI_SURFACE_STALE', '状态 surface 已不属于当前页面');
+    }
+  }
+
   bindTab(tabId) {
     if (!Number.isInteger(tabId) || tabId <= 0) {
       fail('UI_TAB_INVALID', '状态 surface 的 tab id 无效');
@@ -100,6 +117,7 @@ export class StatusPanel {
     if (this.destroyed) {
       fail('UI_SURFACE_DESTROYED', '状态 surface 已销毁');
     }
+    this.assertFresh();
     const actions = {};
     for (const [name, action] of this.actions) {
       if (action.visible) {
@@ -118,6 +136,7 @@ export class StatusPanel {
     if (this.destroyed) {
       fail('UI_SURFACE_DESTROYED', '状态 surface 已销毁');
     }
+    this.assertFresh();
     if (!ACTION_NAMES.includes(name)) {
       fail('UI_ACTION_UNKNOWN', `状态动作未允许: ${name}`);
     }

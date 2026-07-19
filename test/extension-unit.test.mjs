@@ -82,9 +82,21 @@ test('status surface is in-memory, versioned, and exposes only visible current a
   panel.runAction('toggle');
   assert.equal(actionCalls, 1);
   assert.throws(() => panel.runAction('skip-gap'), (error) => error.code === 'UI_ACTION_NOT_VISIBLE');
+  panel.setFreshnessCheck(() => false);
+  assert.throws(() => panel.getSnapshot(), (error) => error.code === 'UI_SURFACE_STALE');
+  assert.throws(() => panel.runAction('toggle'), (error) => error.code === 'UI_SURFACE_STALE');
+  assert.equal(actionCalls, 1);
   panel.destroy();
   assert.throws(() => panel.getSnapshot(), (error) => error.code === 'UI_SURFACE_DESTROYED');
   assert.throws(() => panel.runAction('toggle'), (error) => error.code === 'UI_SURFACE_DESTROYED');
+});
+
+test('status surfaces use independent cryptographic ids across isolated contexts', () => {
+  const first = new StatusPanel({}, '直播');
+  const second = new StatusPanel({}, '直播');
+  assert.notEqual(first.surfaceId, second.surfaceId);
+  first.destroy();
+  second.destroy();
 });
 
 test('bridge schema accepts only versioned serializable messages and whitelisted operations', () => {

@@ -32,7 +32,7 @@ function ascii(bytes, start, length) {
   return String.fromCharCode(...bytes.subarray(start, start + length));
 }
 
-function visitBoxes(bytes, start, end, tracks) {
+function visitBoxes(bytes, start, end, tracks, path = []) {
   let offset = start;
   while (offset < end) {
     if (offset + 8 > end) {
@@ -61,14 +61,21 @@ function visitBoxes(bytes, start, end, tracks) {
     }
     const payloadStart = offset + headerSize;
     const boxEnd = offset + boxSize;
-    if (type === 'hdlr' && payloadStart + 12 <= boxEnd) {
+    if (
+      type === 'hdlr' &&
+      path.length === 3 &&
+      path[0] === 'moov' &&
+      path[1] === 'trak' &&
+      path[2] === 'mdia' &&
+      payloadStart + 12 <= boxEnd
+    ) {
       const handler = ascii(bytes, payloadStart + 8, 4);
       if (handler === 'vide' || handler === 'soun') {
         tracks.add(handler);
       }
     }
     if (['moov', 'trak', 'mdia', 'minf', 'stbl', 'mvex', 'edts', 'dinf'].includes(type)) {
-      visitBoxes(bytes, payloadStart, boxEnd, tracks);
+      visitBoxes(bytes, payloadStart, boxEnd, tracks, [...path, type]);
     }
     offset = boxEnd;
   }

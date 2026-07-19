@@ -69,6 +69,7 @@
     PREFERENCES.map((name) => [name, document.querySelector(`input[data-preference="${name}"]`)])
   );
   var latestSnapshot;
+  var latestTabId;
   var pollTimer;
   function displayValue(value) {
     return value === void 0 || value === null || value === "" ? "未提供" : String(value);
@@ -76,7 +77,7 @@
   function unavailableSnapshot() {
     return Object.fromEntries(FIELDS.map((field) => [field, "未提供"]));
   }
-  function renderSnapshot(snapshot) {
+  function renderSnapshot(snapshot, tabId) {
     const values = snapshot === void 0 ? unavailableSnapshot() : snapshot;
     for (const field of FIELDS) {
       const element = document.querySelector(`[data-status-field="${field}"]`);
@@ -98,6 +99,7 @@
       actionElement.append(button);
     }
     latestSnapshot = snapshot;
+    latestTabId = tabId;
   }
   async function activeTab() {
     const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -118,15 +120,15 @@
     if (response?.ok === false) {
       throw new Error(response.error?.message || "当前页面拒绝状态请求");
     }
-    return response;
+    return { tabId: tab.id, snapshot: response };
   }
   async function pollStatus() {
     try {
-      const snapshot = await getSnapshot();
-      renderSnapshot(snapshot);
-      statusElement.textContent = snapshot === void 0 ? "当前活动页面未提供扩展状态。" : "状态每 500ms 刷新。";
+      const result = await getSnapshot();
+      renderSnapshot(result?.snapshot, result?.tabId);
+      statusElement.textContent = result === void 0 ? "当前活动页面未提供扩展状态。" : "状态每 500ms 刷新。";
     } catch (error) {
-      renderSnapshot(void 0);
+      renderSnapshot(void 0, void 0);
       statusElement.textContent = `读取当前页面状态失败: ${error.message || error}`;
     }
   }
@@ -141,6 +143,11 @@
       if (tab === void 0) {
         throw new Error("没有可用活动 tab");
       }
+      if (latestTabId !== tab.id) {
+        statusElement.textContent = "活动 tab 已变化，已拒绝使用旧页面状态执行动作。";
+        await pollStatus();
+        return;
+      }
       const response = await chrome.tabs.sendMessage(tab.id, {
         version: MESSAGE_VERSION,
         type: "action:run",
@@ -150,7 +157,7 @@
       if (response?.ok !== true) {
         throw new Error(response?.error?.message || "当前页面拒绝动作");
       }
-      renderSnapshot(response.snapshot);
+      renderSnapshot(response.snapshot, tab.id);
       statusElement.textContent = "动作已提交。";
     } catch (error) {
       statusElement.textContent = `动作失败: ${error.message || error}`;
