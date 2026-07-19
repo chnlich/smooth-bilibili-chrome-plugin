@@ -7,8 +7,8 @@ export const BRIDGE_RESPONSE_ATTRIBUTE = 'data-bilibili-buffer-bridge-response-v
 export const BRIDGE_OPERATIONS = Object.freeze([
   'getCoreSnapshot',
   'callPlayer',
+  'callPlayerSync',
   'callCoreSync',
-  'callCoreAsync',
   'subscribeCoreEvents',
   'unsubscribeCoreEvents',
 ]);
@@ -17,17 +17,18 @@ export const BRIDGE_PLAYER_METHODS = Object.freeze([
   'setAutoSyncProgressCfg',
   'setAutoDiscardFrameCfg',
   'pause',
-  'requestQuality',
 ]);
 
-export const BRIDGE_PLAYER_CAPABILITIES = Object.freeze([...BRIDGE_PLAYER_METHODS]);
+export const BRIDGE_PLAYER_READ_METHODS = Object.freeze(['getQuality', 'getSupportedQualityList']);
+
+export const BRIDGE_PLAYER_CAPABILITIES = Object.freeze([
+  ...BRIDGE_PLAYER_METHODS,
+  ...BRIDGE_PLAYER_READ_METHODS,
+]);
 
 export const BRIDGE_CORE_SYNC_METHODS = Object.freeze([
   'getQuality',
-  'getCurrentQuality',
-  'getCurrentQn',
   'getSupportedQualityList',
-  'getQualityList',
   'getBufferedRanges',
   'getMediaInfo',
   'getCurrentMediaInfo',
@@ -37,8 +38,6 @@ export const BRIDGE_CORE_SYNC_METHODS = Object.freeze([
   'setStableBufferTime',
   'setScheduleWhilePaused',
 ]);
-
-export const BRIDGE_CORE_ASYNC_METHODS = Object.freeze(['requestQuality']);
 
 export const BRIDGE_CORE_EVENTS = Object.freeze(['error']);
 

@@ -1,6 +1,6 @@
 # Bilibili 桌面网页抗卡
 
-这是一个双模式 Manifest V3 Chrome 扩展：直播页使用连续的 HLS/fMP4 缓冲管线，点播页使用 Bilibili 当前播放器内核的公开/观察到的 `requestQuality(64)`、2× 播放和连续前向缓冲策略。直播与点播是互斥入口，同一个标签页不会同时运行两个控制器。
+这是一个双模式 Manifest V3 Chrome 扩展：直播页使用连续的 HLS/fMP4 缓冲管线，点播页使用 Bilibili 当前播放器的公开只读画质信息、2× 播放和连续前向缓冲策略。直播与点播是互斥入口，同一个标签页不会同时运行两个控制器。
 
 固定 userscript 行为合同迁移自已审核版本的 `src/live/*`、`src/vod/*`、`src/constants.js`、`src/errors.js`、`src/ui/*` 及对应测试；扩展新增的执行边界在 `src/extension/`。扩展不读取 userscript 资源、不执行运行时字符串代码，也不修改原 userscript 仓库。
 
@@ -31,11 +31,11 @@ popup 会报告 `等待 video`、`配置播放器`、`播放信息`、`manifest`
 
 ## 点播模式
 
-点播首次形成任意连续库存（包括 0、5 或 20 秒）时立即应用 2×，让 Bilibili 原生播放器在后台向 120 秒（短视频则为剩余时长）下载；脚本不会把用户第一次播放重新暂停。只有初始后台填充已经完成、之后连续前向库存降到 30 秒以下，且当前内核明确支持 paused scheduling，才允许脚本暂停进行中途补水；缺少该能力时保持播放并显示降级提示，不制造下载死锁。用户主动暂停不会被自动恢复，最后 30 秒不脚本暂停，独立 audio/video 尾部相差 0.05–1 秒时让浏览器自然进入 `ended`。
+点播一绑定原生 video/audio source 就立即尝试播放并应用 2×；0、5 或 20 秒初始库存都不是启动门槛，Bilibili 原生播放器在后台积极向 120 秒下载。只有当前位置此前达到 120 秒目标、连续前向库存低于 30 秒、内核明确支持 paused scheduling，且不是用户暂停、seek 恢复期或片尾时，脚本才允许一次补水暂停；缺少该能力时保持播放并显示降级提示，不制造下载死锁。用户主动暂停不会被自动恢复，最后 30 秒不脚本暂停，独立 audio/video 尾部相差 0.05–1 秒时让浏览器自然进入 `ended`。
 
-点播只通过 MAIN world 的版本化桥接访问当前播放器和 `player.__core()` 的实际能力快照。稳定缓冲、paused scheduling、质量 getter/list、`requestQuality`、buffer/media info 和 core events 分别判断；一个可选 API 缺失不会阻塞 2×、指标、画质或其他可用控制。稳定缓冲目标按现有的 180→120→90 秒 quota 会话策略逐级降级并保持每个内核幂等。
+点播只通过 MAIN world 的版本化桥接访问当前播放器和 `player.__core()` 的实际能力快照。稳定缓冲、paused scheduling、公开只读 `getQuality`/`getSupportedQualityList`、buffer/media info 和 core events 分别判断；一个可选 API 缺失不会阻塞 2×、指标、画质或其他可用控制。稳定缓冲目标按现有的 180→120→90 秒 quota 会话策略逐级降级并保持每个内核幂等。
 
-扩展只向实际可用的权限感知 `requestQuality(64)` 请求 720P：优先当前 core，core 没有时才使用当前页面播放器，一次观察不会同时调用两条路径。只有真实 getter/event 观察确认 qn64 后才报告成功；权限拒绝、路径不可用或确认超时会保留实际/原始画质，继续 2×、库存、指标和已支持的缓冲控制，并提示 `请在 Bilibili 播放器手动选择 720P`。不会调用隐藏的 `setQuality`、`setQn` 或 `setVideoQuality`，也不会绕过登录、会员、地区、版权或 DRM 授权。
+画质完全由 Bilibili 播放器和用户控制，扩展没有画质写入口、固定目标、恢复或补偿路径。每次 reconcile 和 popup 刷新都 fresh read：优先页面播放器公开 getter 返回的有效 `realQ`，否则使用页面播放器或 core 的可解释当前 qn；单个 getter 返回空值、非数字或抛错时记录诊断并继续读备用来源。两边都没有有效 qn 时只显示来源、能力和 `videoWidth`/`videoHeight`，像素尺寸不会冒充精确 qn。手工切换画质触发 core/source/SPA 重建时，点播仍保留同一 BVID/分 P 的 quota、seek epoch 和播放所有权。
 
 产品代码从不设置 `HTMLMediaElement.muted` 或 `volume`，也不替换 Bilibili 原生点播 video/audio source；点播继续观察页面可能分离的原生音视频轨。自动化只为安全测试在 document-start 安装静音守卫，并使用 headless、临时 profile、`--mute-audio`，在每次测试 `play()` 前断言所有 media 为 `muted=true`、`volume=0`。这不是用户可听效果的通过证明。
 
@@ -69,7 +69,7 @@ npm audit --omit=dev --json
 npm run smoke:external
 ```
 
-`test:e2e` 使用 Playwright `1.55.1` 的 headless 临时 profile 加载已构建的 `dist/extension`，驱动真实扩展 entrypoint、真实 `LiveController`、Fake `MediaSource`/`SourceBuffer`、受控 API/manifest/segment 路由和 popup。它覆盖点播 2×/质量/quota/SPA、桥接能力与 stale session、直播阶段、音频+视频 init、并发同序号恢复、GAP、回到直播、SRI、unsafeWindow/page-world bridge、popup 新鲜度和静音守卫。每次测试结束清理 profile 与临时库。
+`test:e2e` 使用 Playwright `1.55.1` 的 headless 临时 profile 加载已构建的 `dist/extension`，驱动真实扩展 entrypoint、真实 `LiveController`、Fake `MediaSource`/`SourceBuffer`、受控 API/manifest/segment 路由和 popup。它覆盖点播立即 2×、库存/seek/暂停所有权、只读质量切换与 quota/SPA、桥接能力与 stale session、直播阶段、音频+视频 init、并发同序号恢复、GAP、回到直播、SRI、unsafeWindow/page-world bridge、popup 新鲜度和静音守卫。每次测试结束清理 profile 与临时库。
 
 `test:contract` 检查 MV3、最小 Chrome 版本、精确 match/top-frame/document-start/world、权限、固定 `hls.js@1.5.17`、popup 资源、source/dist 禁止项和生成结果一致性。`smoke:external` 使用匿名、headless、全新临时 profile 访问批准的 VOD URL 和房间 6363772；若房间离线，只从官方推荐列表选择当前 `live_status=1` 的房间。它严格报告 `PASS`、`BLOCKED` 或 `FAIL`，任何 `BLOCKED`/`FAIL` 都以非零退出；反爬、匿名页面没有播放器、网络环境或编解码器缺失只能报告 `BLOCKED`，不能宣称真实页面通过。报告写入被忽略的 `reports/`，不会提交到仓库。
 

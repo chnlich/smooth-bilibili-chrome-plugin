@@ -8,24 +8,24 @@
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
     "callPlayer",
+    "callPlayerSync",
     "callCoreSync",
-    "callCoreAsync",
     "subscribeCoreEvents",
     "unsubscribeCoreEvents"
   ]);
   var BRIDGE_PLAYER_METHODS = Object.freeze([
     "setAutoSyncProgressCfg",
     "setAutoDiscardFrameCfg",
-    "pause",
-    "requestQuality"
+    "pause"
   ]);
-  var BRIDGE_PLAYER_CAPABILITIES = Object.freeze([...BRIDGE_PLAYER_METHODS]);
+  var BRIDGE_PLAYER_READ_METHODS = Object.freeze(["getQuality", "getSupportedQualityList"]);
+  var BRIDGE_PLAYER_CAPABILITIES = Object.freeze([
+    ...BRIDGE_PLAYER_METHODS,
+    ...BRIDGE_PLAYER_READ_METHODS
+  ]);
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze([
     "getQuality",
-    "getCurrentQuality",
-    "getCurrentQn",
     "getSupportedQualityList",
-    "getQualityList",
     "getBufferedRanges",
     "getMediaInfo",
     "getCurrentMediaInfo",
@@ -35,7 +35,6 @@
     "setStableBufferTime",
     "setScheduleWhilePaused"
   ]);
-  var BRIDGE_CORE_ASYNC_METHODS = Object.freeze(["requestQuality"]);
   var BRIDGE_CORE_EVENTS = Object.freeze(["error"]);
   function encodeMessage(message) {
     return JSON.stringify(message);
@@ -118,6 +117,10 @@
     "realQ",
     "id",
     "value",
+    "width",
+    "height",
+    "videoWidth",
+    "videoHeight",
     "oldA",
     "nowA",
     "newA",
@@ -196,14 +199,6 @@
     const video = findLargestVideo();
     return video === void 0 ? "" : video.currentSrc || video.src || "";
   }
-  function readCurrentVideoSession() {
-    const href = globalThis.location?.href || "";
-    if (href.length === 0) {
-      return "";
-    }
-    const url = new URL(href);
-    return `${url.pathname}#p=${url.searchParams.get("p") || "1"}`;
-  }
   function serializeObserved(value, allowedFields = QUALITY_FIELDS, depth = 0) {
     if (value === null || typeof value === "string" || typeof value === "boolean") {
       return value;
@@ -266,11 +261,7 @@
   function readCoreCapabilities(core) {
     return {
       getQuality: typeof core.getQuality === "function",
-      getCurrentQuality: typeof core.getCurrentQuality === "function",
-      getCurrentQn: typeof core.getCurrentQn === "function",
       getSupportedQualityList: typeof core.getSupportedQualityList === "function",
-      getQualityList: typeof core.getQualityList === "function",
-      requestQuality: typeof core.requestQuality === "function",
       getBufferedRanges: typeof core.getBufferedRanges === "function",
       getMediaInfo: typeof core.getMediaInfo === "function",
       getCurrentMediaInfo: typeof core.getCurrentMediaInfo === "function",
@@ -295,6 +286,20 @@
     }
     return void 0;
   }
+  function readOptionalQuality(core, names) {
+    for (const name of names) {
+      if (typeof core[name] !== "function") {
+        continue;
+      }
+      try {
+        return serializeObserved(core[name]());
+      } catch (error) {
+        console.warn(`[BilibiliBuffer] 读取 core 画质 getter ${name} 失败`, serializeError(error));
+        return void 0;
+      }
+    }
+    return void 0;
+  }
   function getCoreSnapshot() {
     const player = pagePlayer();
     const core = currentCore();
@@ -303,9 +308,8 @@
     const snapshot = {
       coreId: record.id,
       source: readCurrentVideoSource(),
-      quality: readOptional(core, ["getQuality", "getCurrentQuality", "getCurrentQn"]),
-      supportedQualityList: typeof core.getSupportedQualityList === "function" ? serializeObserved(core.getSupportedQualityList()) : void 0,
-      qualityList: typeof core.getQualityList === "function" ? serializeObserved(core.getQualityList("video")) : void 0,
+      quality: readOptionalQuality(core, ["getQuality"]),
+      supportedQualityList: readOptionalQuality(core, ["getSupportedQualityList"]),
       bufferedRanges: serializeBufferedRanges(core),
       mediaInfo: readOptional(core, ["getMediaInfo", "getCurrentMediaInfo", "getQualityInfo"], serializeMediaInfo),
       stableBufferTime: readOptional(core, ["getStableBufferTime", "getStableBufferSeconds"]),
@@ -350,26 +354,26 @@
       await player.pause();
       return true;
     }
-    if (method === "requestQuality") {
-      if (args.length !== 2 || !Number.isInteger(value) || value <= 0) {
-        throw Object.assign(new Error("页面播放器 requestQuality 参数必须是正整数清晰度"), {
-          code: "BRIDGE_ARGUMENTS_INVALID"
-        });
-      }
-      const core = currentCore();
-      const source = readCurrentVideoSource();
-      const session = readCurrentVideoSession();
-      const result = await player.requestQuality(value);
-      if (pagePlayerObject() !== player || currentCore() !== core || readCurrentVideoSource() !== source || readCurrentVideoSession() !== session) {
-        throw Object.assign(new Error("页面播放器画质请求完成时页面会话已经变化"), { code: "BRIDGE_CORE_STALE" });
-      }
-      return { result: result === void 0 ? true : serializeObserved(result), snapshot: getCoreSnapshot() };
-    }
     if (value === null || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 1 || value.enable !== false && value.enable !== true) {
       throw Object.assign(new Error(`${method} 参数必须是 {enable:boolean}`), { code: "BRIDGE_ARGUMENTS_INVALID" });
     }
     await player[method](value);
     return true;
+  }
+  function callPlayerSync(args) {
+    const [method, methodArgs] = requireArguments(args, 2);
+    if (!BRIDGE_PLAYER_READ_METHODS.includes(method)) {
+      throw Object.assign(new Error(`页面播放器同步读取未允许: ${method}`), { code: "BRIDGE_OPERATION_DENIED" });
+    }
+    const values = methodArgs === void 0 ? [] : methodArgs;
+    if (!Array.isArray(values) || values.length !== 0) {
+      throw Object.assign(new Error(`${method} 不接受参数`), { code: "BRIDGE_ARGUMENTS_INVALID" });
+    }
+    const player = pagePlayerObject();
+    if (typeof player[method] !== "function") {
+      throw Object.assign(new Error(`当前页面播放器没有 ${method}`), { code: "BRIDGE_METHOD_UNAVAILABLE" });
+    }
+    return serializeObserved(player[method]());
   }
   function callCoreSync(args) {
     const [coreId, method, methodArgs] = requireArguments(args, 3);
@@ -386,8 +390,6 @@
     }
     if ([
       "getQuality",
-      "getCurrentQuality",
-      "getCurrentQn",
       "getSupportedQualityList",
       "getBufferedRanges",
       "getMediaInfo",
@@ -397,9 +399,6 @@
       "getStableBufferSeconds"
     ].includes(method) && values.length !== 0) {
       throw Object.assign(new Error(`${method} 不接受参数`), { code: "BRIDGE_ARGUMENTS_INVALID" });
-    }
-    if (method === "getQualityList" && (values.length !== 1 || values[0] !== "video")) {
-      throw Object.assign(new Error("getQualityList 只接受 video 轨道参数"), { code: "BRIDGE_ARGUMENTS_INVALID" });
     }
     if (method === "setStableBufferTime" && (values.length !== 1 || !Number.isFinite(values[0]) || values[0] <= 0)) {
       throw Object.assign(new Error("稳定缓冲秒数必须是正数"), { code: "BRIDGE_ARGUMENTS_INVALID" });
@@ -415,28 +414,6 @@
       return serializeMediaInfo(result);
     }
     return serializeObserved(result);
-  }
-  async function callCoreAsync(args) {
-    const [coreId, method, methodArgs] = requireArguments(args, 3);
-    if (!Number.isInteger(coreId) || !BRIDGE_CORE_ASYNC_METHODS.includes(method)) {
-      throw Object.assign(new Error(`内核异步操作未允许: ${method}`), { code: "BRIDGE_OPERATION_DENIED" });
-    }
-    const record = requireCurrentRecord(coreId);
-    const values = methodArgs === void 0 ? [] : methodArgs;
-    if (!Array.isArray(values)) {
-      throw Object.assign(new Error("内核异步操作参数必须是数组"), { code: "BRIDGE_ARGUMENTS_INVALID" });
-    }
-    if (method !== "requestQuality" || values.length !== 1 || !Number.isInteger(values[0]) || values[0] <= 0) {
-      throw Object.assign(new Error("requestQuality 参数必须是正整数清晰度"), { code: "BRIDGE_ARGUMENTS_INVALID" });
-    }
-    if (typeof record.core[method] !== "function") {
-      throw Object.assign(new Error(`当前内核没有 ${method}`), { code: "BRIDGE_METHOD_UNAVAILABLE" });
-    }
-    const result = await record.core[method](...values);
-    return {
-      result: result === void 0 ? true : serializeObserved(result),
-      snapshot: getCoreSnapshot()
-    };
   }
   function errorFromEvent(event) {
     const value = event?.error ?? event?.detail?.error ?? event?.detail ?? event;
@@ -489,10 +466,10 @@
         return getCoreSnapshot();
       case "callPlayer":
         return callPlayer(request.args);
+      case "callPlayerSync":
+        return callPlayerSync(request.args);
       case "callCoreSync":
         return callCoreSync(request.args);
-      case "callCoreAsync":
-        return callCoreAsync(request.args);
       case "subscribeCoreEvents":
         return subscribeCoreEvents(request.args, request.id);
       case "unsubscribeCoreEvents":

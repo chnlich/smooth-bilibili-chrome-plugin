@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { EXTENSION_MANIFEST, EXTENSION_PREFERENCES, HLS_DEPENDENCY } from '../src/constants.js';
 import {
-  BRIDGE_CORE_ASYNC_METHODS,
   BRIDGE_CORE_SYNC_METHODS,
   BRIDGE_OPERATIONS,
   BRIDGE_VERSION,
@@ -16,11 +15,7 @@ import { StatusPanel } from '../src/ui/panel.js';
 
 const ALL_CORE_CAPABILITIES = {
   getQuality: true,
-  getCurrentQuality: false,
-  getCurrentQn: false,
   getSupportedQualityList: true,
-  getQualityList: true,
-  requestQuality: true,
   getBufferedRanges: true,
   getMediaInfo: true,
   getCurrentMediaInfo: false,
@@ -38,7 +33,8 @@ function capabilities(overrides = {}) {
       setAutoSyncProgressCfg: true,
       setAutoDiscardFrameCfg: true,
       pause: true,
-      requestQuality: true,
+      getQuality: true,
+      getSupportedQualityList: true,
     },
     core: { ...ALL_CORE_CAPABILITIES, ...overrides },
   };
@@ -109,8 +105,10 @@ test('bridge schema accepts only versioned serializable messages and whitelisted
   };
   assert.deepEqual(decodeMessage(encodeMessage(message)), message);
   assert.ok(BRIDGE_OPERATIONS.includes('getCoreSnapshot'));
+  assert.ok(BRIDGE_OPERATIONS.includes('callPlayerSync'));
+  assert.equal(BRIDGE_OPERATIONS.includes('callCoreAsync'), false);
   assert.ok(BRIDGE_CORE_SYNC_METHODS.includes('getQuality'));
-  assert.deepEqual(BRIDGE_CORE_ASYNC_METHODS, ['requestQuality']);
+  assert.ok(BRIDGE_CORE_SYNC_METHODS.includes('getSupportedQualityList'));
   assert.throws(() => decodeMessage(JSON.stringify({ ...message, version: 2 })), /not supported/);
   assert.throws(() => decodeMessage(JSON.stringify({ ...message, id: 0 })), /positive integer/);
 });
@@ -150,7 +148,6 @@ test('bridge core reads current MAIN state through the whitelist without leaking
   const observed = {
     quality: { nowQ: 32, realQ: 32 },
     supportedQualityList: [64, 32],
-    qualityList: [64, 32],
     bufferedRanges: { video: [{ start: 0, end: 120 }], audio: [{ start: 0, end: 118 }] },
     mediaInfo: { bitrate: 1000, bandwidth: 900, video: { bitrate: 700 }, audio: { bitrate: 300 } },
     stableBufferTime: 180,
@@ -175,10 +172,6 @@ test('bridge core reads current MAIN state through the whitelist without leaking
       }
       if (method === 'getSupportedQualityList') {
         return observed.supportedQualityList;
-      }
-      if (method === 'getQualityList') {
-        assert.deepEqual(values, ['video']);
-        return observed.qualityList;
       }
       if (method === 'getMediaInfo') {
         return observed.mediaInfo;
@@ -225,9 +218,7 @@ test('bridge core reads current MAIN state through the whitelist without leaking
   assert.equal(core.getBufferedRanges().audio.end(0), 140);
   assert.equal(core.getMediaInfo().bitrate, 2000);
   assert.equal(core.getStableBufferTime(), 120);
-  await core.requestQuality(64);
   core.setStableBufferTime(120);
-  assert.ok(calls.some((call) => call[1] === 'callCoreAsync' && call[2][1] === 'requestQuality'));
   assert.ok(calls.some((call) => call[2][1] === 'getQuality'));
   assert.ok(calls.some((call) => call[2][1] === 'getBufferedRanges'));
   assert.ok(calls.some((call) => call[2][1] === 'getMediaInfo'));
@@ -235,9 +226,9 @@ test('bridge core reads current MAIN state through the whitelist without leaking
   assert.deepEqual(Object.values(EXTENSION_PREFERENCES), ['liveEnabled', 'vodEnabled']);
 });
 
-test('a fresh bridge snapshot stales the old core before old async quality completion can mutate it', async () => {
+test('a fresh bridge snapshot stales the old core and page quality reads stay synchronous', async () => {
   let snapshotCalls = 0;
-  let resolveQuality;
+  const playerQuality = { realQ: 32 };
   const client = {
     callAsync(operation) {
       if (operation === 'getCoreSnapshot') {
@@ -250,22 +241,12 @@ test('a fresh bridge snapshot stales the old core before old async quality compl
           capabilities: capabilities(),
         });
       }
-      assert.equal(operation, 'callCoreAsync');
-      return new Promise((resolve) => {
-        resolveQuality = () => resolve({
-          result: true,
-          snapshot: {
-            coreId: 5,
-            source: 'new-source',
-            quality: { realQ: 64 },
-            supportsCoreEvents: false,
-            capabilities: capabilities(),
-          },
-        });
-      });
+      throw new Error(`unexpected async bridge operation: ${operation}`);
     },
-    callSync() {
-      throw new Error('unexpected synchronous bridge call');
+    callSync(operation, args) {
+      assert.equal(operation, 'callPlayerSync');
+      assert.deepEqual(args, ['getQuality', []]);
+      return playerQuality;
     },
   };
   const adapter = createPageWindowAdapter(client, {
@@ -279,12 +260,9 @@ test('a fresh bridge snapshot stales the old core before old async quality compl
   const [firstCore, secondCore] = await Promise.all([firstRefresh, secondRefresh]);
   assert.strictEqual(firstCore, secondCore);
   assert.equal(snapshotCalls, 1);
-  const oldQualityRequest = firstCore.requestQuality(64);
-  assert.equal(typeof resolveQuality, 'function');
+  assert.deepEqual(adapter.pageWindow.player.getQuality(), { realQ: 32 });
   const currentCore = await adapter.refreshCore();
   assert.notStrictEqual(currentCore, firstCore);
   assert.equal(firstCore.stale, true);
-  resolveQuality();
-  await assert.rejects(oldQualityRequest, (error) => error.code === 'BRIDGE_CORE_STALE');
   assert.equal(firstCore.snapshot.source, 'old-source');
 });

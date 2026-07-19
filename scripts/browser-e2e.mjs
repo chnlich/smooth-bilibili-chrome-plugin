@@ -206,21 +206,24 @@ window.__bridgeTraffic = [];
 document.addEventListener('bilibili-buffer:bridge-request-v1', (event) => {
   window.__bridgeTraffic.push(JSON.parse(event.detail));
 });
-window.__fakeVodState = { qn: 32, calls: [], stable: [], pausedScheduling: [], core: undefined };
+window.__fakeVodState = { qn: 32, stable: [], pausedScheduling: [], qualityWrites: [], core: undefined };
 const core = {
   getQuality() { return { nowQ: this.qn, realQ: this.qn, accept_qn: [64, 32, 16] }; },
   getSupportedQualityList() { return [64, 32, 16]; },
   getMediaInfo() { return { bitrate: 1000000 }; },
   setStableBufferTime(value) { window.__fakeVodState.stable.push(value); },
   setScheduleWhilePaused(value) { window.__fakeVodState.pausedScheduling.push(value); },
-  requestQuality(value) {
-    window.__fakeVodState.calls.push(value);
-    if (value === 64) { this.qn = 64; }
-    return Promise.resolve(true);
-  },
   get qn() { return window.__fakeVodState.qn; },
   set qn(value) { window.__fakeVodState.qn = value; },
 };
+for (const method of [
+  ['request', 'Quality'].join(''),
+  ['set', 'Quality'].join(''),
+  ['set', 'Qn'].join(''),
+  ['set', 'VideoQuality'].join(''),
+]) {
+  core[method] = (...args) => window.__fakeVodState.qualityWrites.push({ method, args });
+}
 window.__fakeVodState.core = core;
 window.player = { __core: () => core };
 const video = document.createElement('video');
@@ -726,9 +729,9 @@ async function runVodScenario(context, page) {
     muted: document.querySelector('video').muted,
     volume: document.querySelector('video').volume,
     qn: window.__fakeVodState.qn,
-    qualityCalls: window.__fakeVodState.calls,
     stable: window.__fakeVodState.stable,
     pausedScheduling: window.__fakeVodState.pausedScheduling,
+    qualityWrites: window.__fakeVodState.qualityWrites,
     bridgeTraffic: window.__bridgeTraffic,
   }), { beforeAdvance: currentTimeBeforeAdvance, afterAdvance: currentTimeAfterAdvance });
   assert.ok(actual.currentSrc.length > 0);
@@ -737,17 +740,16 @@ async function runVodScenario(context, page) {
   assert.equal(actual.playbackRate, 2);
   assert.equal(actual.muted, true);
   assert.equal(actual.volume, 0);
-  assert.equal(actual.qn, 64);
-  assert.deepEqual(actual.qualityCalls, [64]);
+  assert.equal(actual.qn, 32);
   assert.ok(actual.stable.length >= 1);
   assert.ok(actual.stable.every((value) => value === 180));
   assert.ok(actual.pausedScheduling.length >= 1);
   assert.ok(actual.pausedScheduling.every((value) => value === true));
   assert.equal(firstState.mode, '点播');
   assert.equal(firstState.speed, '2×');
-  assert.match(firstState.quality, /qn64 已生效/);
+  assert.match(firstState.quality, /qn32/);
   assert.ok(actual.bridgeTraffic.some((request) => request.operation === 'getCoreSnapshot'));
-  assert.ok(actual.bridgeTraffic.some((request) => request.operation === 'callCoreAsync'));
+  assert.deepEqual(actual.qualityWrites, []);
   assert.match(extensionId, /^[a-z]{32}$/);
   assert.equal(await popup.locator('input[data-preference="liveEnabled"]').isChecked(), true);
   assert.equal(await popup.locator('input[data-preference="vodEnabled"]').isChecked(), true);
@@ -2147,6 +2149,10 @@ async function runPopupStaleSpaActionScenario(context) {
 
 function isolatedVodPolicyVideoInit() {
   const root = document.documentElement;
+  const pendingPlayResolvers = [];
+  root.addEventListener('bilibili-vod-resolve-play', () => {
+    pendingPlayResolvers.shift()?.();
+  });
   const assertMutedBeforePlay = (video) => {
     video.muted = true;
     video.volume = 0;
@@ -2170,9 +2176,24 @@ function isolatedVodPolicyVideoInit() {
       configurable: true,
       get: () => root.dataset.bilibiliBufferVodPaused === 'true',
     });
+    Object.defineProperty(video, 'videoWidth', {
+      configurable: true,
+      get: () => 1280,
+    });
+    Object.defineProperty(video, 'videoHeight', {
+      configurable: true,
+      get: () => 720,
+    });
     video.play = () => {
       assertMutedBeforePlay(video);
       root.dataset.bilibiliBufferVodPaused = 'false';
+      if (root.dataset.bilibiliBufferVodDeferPlay === 'true') {
+        root.dataset.bilibiliBufferVodPlayPending = 'true';
+        return new Promise((resolve) => pendingPlayResolvers.push(() => {
+          root.dataset.bilibiliBufferVodPlayPending = 'false';
+          resolve();
+        }));
+      }
       video.dispatchEvent(new Event('play'));
       return Promise.resolve();
     };
@@ -2192,6 +2213,14 @@ function isolatedVodPolicyVideoInit() {
 }
 
 function createVodPolicyHtml(qualityMode) {
+  const initialPageQuality = qualityMode === 'qn16'
+    ? 16
+    : qualityMode === 'qn64'
+      ? 64
+      : qualityMode === 'coreFallback' || qualityMode === 'unknown'
+        ? undefined
+        : 32;
+  const initialCoreQuality = qualityMode === 'coreFallback' ? 64 : initialPageQuality;
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>VOD extension policy test</title></head><body>
 <script>
@@ -2206,46 +2235,54 @@ const ranges = (seconds) => ({
 });
 const state = {
   mode: ${JSON.stringify(qualityMode)},
-  nowQ: ${qualityMode === 'realQ' ? 64 : 32},
-  realQ: 32,
-  available: ${qualityMode === 'unavailable' ? '[32, 16]' : '[64, 32, 16]'},
-  calls: [],
-  playerCalls: [],
+  pageQ: ${initialPageQuality === undefined ? 'undefined' : initialPageQuality},
+  coreQ: ${initialCoreQuality === undefined ? 'undefined' : initialCoreQuality},
+  available: [64, 32, 16],
+  qualityReads: { page: 0, core: 0, supportedPage: 0, supportedCore: 0 },
+  qualityWrites: [],
   stableCalls: [],
   pausedScheduling: [],
   videoInventory: 120,
   audioInventory: 120,
   currentTime: 0,
   source: '',
-  pending: [],
   bitrate: 1000000,
 };
+const qualityWriteNames = [
+  ['request', 'Quality'].join(''),
+  ['set', 'Quality'].join(''),
+  ['set', 'Qn'].join(''),
+  ['set', 'VideoQuality'].join(''),
+];
+const recordQualityWrite = (owner, method, args) => {
+  state.qualityWrites.push({ owner, method, args });
+};
+const qualityValue = (value) => value === undefined
+  ? { realQ: NaN, nowQ: null, accept_qn: state.available }
+  : { realQ: value, nowQ: value, accept_qn: state.available };
 class FakeCore extends EventTarget {
   constructor(id) {
     super();
     this.id = id;
-    if (['noCoreQuality', 'pageFallback', 'noBoth'].includes(state.mode)) this.requestQuality = undefined;
     if (state.mode === 'noStable') this.setStableBufferTime = undefined;
     if (state.mode === 'noSchedule') this.setScheduleWhilePaused = undefined;
+    for (const method of qualityWriteNames) {
+      this[method] = (...args) => recordQualityWrite('core', method, args);
+    }
   }
-  getQuality() { return { nowQ: state.nowQ, realQ: state.realQ, accept_qn: state.available }; }
-  getSupportedQualityList() { return state.available; }
+  getQuality() {
+    state.qualityReads.core += 1;
+    return qualityValue(state.coreQ);
+  }
+  getSupportedQualityList() {
+    state.qualityReads.supportedCore += 1;
+    return state.available;
+  }
   getBufferedRanges() { return { video: ranges(state.videoInventory), audio: ranges(state.audioInventory) }; }
   getMediaInfo() { return { bitrate: state.bitrate }; }
   setStableBufferTime(value) { state.stableCalls.push({ core: this.id, value }); }
   getStableBufferTime() { return state.stableCalls.filter((entry) => entry.core === this.id).at(-1)?.value || 0; }
   setScheduleWhilePaused(value) { state.pausedScheduling.push({ core: this.id, value }); }
-  requestQuality(value) {
-    state.calls.push({ core: this.id, value, at: Date.now() });
-    if (state.mode === 'reject') return Promise.resolve(false);
-    if (state.mode === 'timeout') return new Promise(() => {});
-    if (state.mode === 'deferred') {
-      return new Promise((resolve, reject) => state.pending.push({ core: this.id, value, resolve, reject }));
-    }
-    state.nowQ = value;
-    state.realQ = value;
-    return Promise.resolve(true);
-  }
   emitQuota() {
     const event = new Event('error');
     event.error = { name: 'QuotaExceededError', message: 'deterministic quota' };
@@ -2269,6 +2306,12 @@ Object.defineProperty(video, 'currentTime', {
 });
 Object.defineProperty(video, 'buffered', { configurable: true, get: () => ranges(Math.min(state.videoInventory, state.audioInventory)) });
 Object.defineProperty(video, 'duration', { configurable: true, get: () => 600 });
+Object.defineProperty(video, 'videoWidth', { configurable: true, get: () => 1280 });
+Object.defineProperty(video, 'videoHeight', { configurable: true, get: () => 720 });
+Object.defineProperty(video, 'seeking', {
+  configurable: true,
+  get: () => document.documentElement.dataset.bilibiliBufferVodSeeking === 'true',
+});
 Object.defineProperty(video, 'paused', {
   configurable: true,
   get: () => document.documentElement.dataset.bilibiliBufferVodPaused === 'true',
@@ -2288,9 +2331,45 @@ state.setInventory = (videoSeconds, audioSeconds = videoSeconds) => {
   state.videoInventory = videoSeconds;
   state.audioInventory = audioSeconds;
 };
-state.forceQuality = (value, nowQ = value) => {
-  state.nowQ = nowQ;
-  state.realQ = value;
+state.setManualQuality = (value) => {
+  state.pageQ = value;
+  state.coreQ = value;
+};
+state.userPause = () => {
+  document.documentElement.dataset.bilibiliBufferVodPaused = 'true';
+  video.dispatchEvent(new Event('pause'));
+};
+state.manualPlay = () => {
+  window.__bilibiliAudioGuard.assertSilentBeforePlay();
+  document.documentElement.dataset.bilibiliBufferVodPaused = 'false';
+  video.dispatchEvent(new Event('play'));
+};
+state.browserPauseForSeek = () => {
+  document.documentElement.dataset.bilibiliBufferVodPaused = 'true';
+};
+state.latePlayEvent = () => {
+  window.__bilibiliAudioGuard.assertSilentBeforePlay();
+  document.documentElement.dataset.bilibiliBufferVodPaused = 'false';
+  video.dispatchEvent(new Event('play'));
+};
+state.beginSeek = (target) => {
+  state.currentTime = Number(target);
+  video.currentTime = state.currentTime;
+  document.documentElement.dataset.bilibiliBufferVodSeeking = 'true';
+  video.dispatchEvent(new Event('seeking'));
+};
+state.finishSeek = (target = state.currentTime) => {
+  state.currentTime = Number(target);
+  video.currentTime = state.currentTime;
+  document.documentElement.dataset.bilibiliBufferVodSeeking = 'false';
+  video.dispatchEvent(new Event('seeked'));
+};
+state.deferNextPlay = () => {
+  document.documentElement.dataset.bilibiliBufferVodDeferPlay = 'true';
+};
+state.resolvePlay = () => {
+  document.documentElement.dataset.bilibiliBufferVodDeferPlay = 'false';
+  document.documentElement.dispatchEvent(new Event('bilibili-vod-resolve-play'));
 };
 const replaceSource = (label) => {
   state.source = URL.createObjectURL(new Blob([label], { type: 'video/webm' }));
@@ -2300,26 +2379,25 @@ state.replaceCore = (source = 'vod-policy-source-' + nextCoreId) => {
   state.core = new FakeCore(nextCoreId++);
   replaceSource(source);
 };
-state.resolvePending = (result = true) => {
-  const pending = state.pending.shift();
-  if (pending === undefined) throw new Error('no deferred quality request to resolve');
-  if (result === false) {
-    pending.resolve(false);
-    return;
-  }
-  state.nowQ = pending.value;
-  state.realQ = pending.value;
-  pending.resolve(true);
+state.pushPart = () => {
+  history.pushState({}, '', '/video/BVpolicy-' + state.mode + '?p=2');
+  state.replaceCore('vod-policy-source-part-2');
 };
 window.__fakeVodPolicy = state;
-window.player = { __core: () => state.core };
-if (['pageFallback', 'corePriority'].includes(state.mode)) {
-  window.player.requestQuality = (value) => {
-    state.playerCalls.push({ value, at: Date.now() });
-    state.nowQ = value;
-    state.realQ = value;
-    return Promise.resolve(true);
-  };
+window.player = {
+  __core: () => state.core,
+  getQuality() {
+    state.qualityReads.page += 1;
+    if (state.mode === 'coreFallback') throw new Error('page quality getter unavailable');
+    return qualityValue(state.pageQ);
+  },
+  getSupportedQualityList() {
+    state.qualityReads.supportedPage += 1;
+    return state.available;
+  },
+};
+for (const method of qualityWriteNames) {
+  window.player[method] = (...args) => recordQualityWrite('page', method, args);
 }
 replaceSource('vod-policy-source-1');
 window.__startVodPolicyFixture = () => {
@@ -2392,15 +2470,16 @@ async function readVodPolicyFixture(page) {
   const fixture = await page.evaluate(() => {
     const state = window.__fakeVodPolicy;
     return {
-      calls: state.calls,
-      playerCalls: state.playerCalls,
+      qualityWrites: state.qualityWrites,
+      qualityReads: state.qualityReads,
       stableCalls: state.stableCalls,
       pausedScheduling: state.pausedScheduling,
-      qn: state.realQ,
-      nowQ: state.nowQ,
-      paused: state.video.paused,
+      pageQ: state.pageQ,
+      coreQ: state.coreQ,
+      paused: document.documentElement.dataset.bilibiliBufferVodPaused === 'true',
       playbackRate: state.video.playbackRate,
       source: state.source,
+      currentTime: state.video.currentTime,
       videoSource: {
         attribute: state.video.getAttribute('src'),
         currentSrc: state.video.currentSrc,
@@ -2421,80 +2500,71 @@ async function closeVodPolicyFixture(fixture, label) {
   throwCleanupFailures(failures);
 }
 
-async function runVodQualityScenario(context, qualityMode) {
+async function runVodQualityReadScenario(context, qualityMode) {
   const fixture = await openVodPolicyFixture(context, qualityMode);
   try {
-    const expectedText = qualityMode === 'success' || qualityMode === 'realQ' ? '已生效' : '未生效';
     try {
       await fixture.popup.waitForFunction(
-        (text) => document.querySelector('[data-status-field="quality"]')?.textContent.includes(text),
-        expectedText,
+        (mode) => {
+          const text = document.querySelector('[data-status-field="quality"]')?.textContent || '';
+          return mode === 'unknown' ? text.includes('当前画质未知') : text.includes(`qn${mode}`);
+        },
+        qualityMode === 'qn16' ? 16 : qualityMode === 'qn64' ? 64 : qualityMode === 'coreFallback' ? 64 : qualityMode === 'unknown' ? 'unknown' : 32,
         { timeout: qualityMode === 'timeout' ? 10000 : 5000 },
       );
     } catch (error) {
       const snapshot = await readVodPolicyFixture(fixture.page);
-      error.message = `${error.message}; VOD quality fixture snapshot: ${JSON.stringify(snapshot)}`;
+      error.message = `${error.message}; VOD readonly quality fixture snapshot: ${JSON.stringify(snapshot)}`;
       throw error;
     }
+    const initial = await readVodPolicyFixture(fixture.page);
+    assert.equal(initial.panel.speed, '2×');
+    assert.ok(initial.bridgeTraffic.some((request) => request.operation === 'getCoreSnapshot'));
+    assert.ok(initial.bridgeTraffic.some((request) => request.operation === 'callPlayerSync'));
+    assert.ok(initial.bridgeTraffic.some((request) => request.operation === 'callCoreSync'));
+    assert.deepEqual(initial.qualityWrites, [], 'the extension must not write quality through page or core APIs');
+    assert.ok(initial.qualityReads.page > 0);
+    assert.ok(initial.qualityReads.core > 0);
+    if (qualityMode === 'unknown') {
+      assert.match(initial.panel.quality, /当前画质未知/);
+      assert.match(initial.panel.quality, /video 1280×720/);
+      assert.match(initial.panel.quality, /来源 未知/);
+    } else if (qualityMode === 'coreFallback') {
+      assert.equal(initial.coreQ, 64);
+      assert.match(initial.panel.quality, /来源 core/);
+    } else {
+      const expectedQn = qualityMode === 'qn16' ? 16 : qualityMode === 'qn64' ? 64 : 32;
+      assert.equal(initial.pageQ, expectedQn);
+    }
+    const manualQuality = qualityMode === 'unknown' ? 16 : qualityMode === 'qn16' ? 64 : 16;
+    await fixture.page.evaluate((value) => window.__fakeVodPolicy.setManualQuality(value), manualQuality);
+    await fixture.popup.waitForFunction(
+      (value) => document.querySelector('[data-status-field="quality"]')?.textContent.includes(`qn${value}`),
+      manualQuality,
+      { timeout: 10000 },
+    );
     const result = await readVodPolicyFixture(fixture.page);
     assert.equal(result.panel.speed, '2×');
-    assert.ok(result.bridgeTraffic.some((request) => request.operation === 'getCoreSnapshot'));
-    assert.ok(result.bridgeTraffic.some((request) => request.operation === 'callCoreAsync') || qualityMode === 'unavailable');
-    if (qualityMode === 'unavailable') {
-      assert.deepEqual(result.calls, []);
-      assert.equal(result.qn, 32);
-    } else {
-      assert.equal(result.calls.length, 1);
-      assert.equal(result.calls[0].value, 64);
-      assert.equal(result.qn, qualityMode === 'success' || qualityMode === 'realQ' ? 64 : 32);
-    }
-    if (qualityMode === 'realQ') {
-      assert.equal(result.nowQ, 64, 'realQ must override nowQ during the initial observation');
-    }
-    assert.match(result.panel.quality, new RegExp(expectedText));
+    assert.match(result.panel.quality, new RegExp(`qn${manualQuality}`));
+    assert.deepEqual(result.qualityWrites, [], 'manual page quality changes must remain read-only to the extension');
+    assert.equal(result.playbackRate, 2);
     const diagnostics = {
       page: assertDiagnostics(fixture.diagnostics),
       popup: assertDiagnostics(fixture.popupDiagnostics),
     };
-    return { status: 'PASS', qualityMode, result, requestTimeline: fixture.requestTimeline, diagnostics };
+    return { status: 'PASS', qualityMode, initial, result, requestTimeline: fixture.requestTimeline, diagnostics };
   } finally {
-    await closeVodPolicyFixture(fixture, `VOD quality ${qualityMode}`);
+    await closeVodPolicyFixture(fixture, `VOD readonly quality ${qualityMode}`);
   }
 }
 
 async function runVodCapabilityScenario(context, capabilityMode) {
   const fixture = await openVodPolicyFixture(context, capabilityMode);
   try {
-    const success = capabilityMode !== 'noBoth';
-    const expectedText = success ? '已生效' : '未生效';
-    try {
-      await fixture.popup.waitForFunction(
-        (text) => document.querySelector('[data-status-field="quality"]')?.textContent.includes(text),
-        expectedText,
-        { timeout: 10000 },
-      );
-    } catch (error) {
-      const snapshot = await readVodPolicyFixture(fixture.page);
-      error.message = `${error.message}; VOD capability fixture snapshot: ${JSON.stringify(snapshot)}`;
-      throw error;
-    }
     const result = await readVodPolicyFixture(fixture.page);
     assert.equal(result.panel.speed, '2×');
     assert.ok(result.bridgeTraffic.some((request) => request.operation === 'getCoreSnapshot'));
-    if (capabilityMode === 'corePriority') {
-      assert.equal(result.calls.length, 1, 'core requestQuality must win when both paths exist');
-      assert.equal(result.playerCalls.length, 0, 'page-player fallback must stay unused when core is available');
-      assert.equal(result.qn, 64);
-    } else if (capabilityMode === 'pageFallback') {
-      assert.equal(result.calls.length, 0, 'core requestQuality must not be called when its snapshot flag is false');
-      assert.equal(result.playerCalls.length, 1, 'page-player requestQuality fallback must be used once');
-      assert.equal(result.qn, 64);
-    } else if (capabilityMode === 'noBoth') {
-      assert.equal(result.calls.length, 0);
-      assert.equal(result.playerCalls.length, 0);
-      assert.equal(result.qn, 32);
-      assert.match(result.panel.quality, /请在 Bilibili 播放器手动选择 720P/);
-    }
+    assert.deepEqual(result.qualityWrites, []);
     if (capabilityMode === 'noStable') {
       assert.equal(result.stableCalls.length, 0, 'missing stable-buffer setter must not be invoked');
       assert.equal(result.pausedScheduling.length, 1, 'paused scheduling must remain independently enabled');
@@ -2519,11 +2589,11 @@ async function runVodCapabilityScenario(context, capabilityMode) {
 }
 
 async function runVodPolicyScenario(context) {
-  const fixture = await openVodPolicyFixture(context, 'success');
+  const fixture = await openVodPolicyFixture(context, 'qn32');
   try {
     const { page } = fixture;
     await fixture.popup.waitForFunction(
-      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('已生效'),
+      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('qn32'),
       undefined,
       { timeout: 10000 },
     );
@@ -2542,22 +2612,15 @@ async function runVodPolicyScenario(context) {
     assert.equal(at119.paused, false, '119 seconds after startup must not trigger a refill pause');
 
     await page.evaluate(() => window.__fakeVodPolicy.setInventory(29, 29));
-    await page.waitForFunction(() => window.__fakeVodPolicy.video.paused === true);
+    await page.waitForFunction(() => document.documentElement.dataset.bilibiliBufferVodPaused === 'true');
     await waitForPanelState(page, 'REFILLING');
     const at29 = await readVodPolicyFixture(page);
     assert.equal(at29.panel.state, 'REFILLING');
-    await page.evaluate(async () => {
-      window.__bilibiliAudioGuard.assertSilentBeforePlay();
-      await window.__fakeVodPolicy.video.play();
-    });
-    await page.waitForFunction(() => window.__fakeVodPolicy.video.paused === true);
-    const earlyPlay = await readVodPolicyFixture(page);
-    assert.equal(earlyPlay.paused, true, 'a user play before the 120 second refill target must pause again');
 
     await page.evaluate(() => window.__fakeVodPolicy.setInventory(120, 120));
     await page.waitForFunction(() => window.__fakeVodPolicy.video.paused === false);
     await page.evaluate(() => {
-      window.__fakeVodPolicy.video.pause();
+      window.__fakeVodPolicy.userPause();
       window.__fakeVodPolicy.setInventory(0, 0);
     });
     await waitForPanelState(page, 'USER_PAUSED');
@@ -2573,19 +2636,18 @@ async function runVodPolicyScenario(context) {
     const quota = await readVodPolicyFixture(page);
     assert.deepEqual(quota.stableCalls.slice(-2).map((entry) => entry.value), [120, 90]);
 
+    const qualityWritesBeforeRebuild = quota.qualityWrites.length;
     await page.evaluate(() => window.__fakeVodPolicy.replaceCore('vod-policy-source-2'));
     await page.waitForFunction(() => window.__fakeVodPolicy.stableCalls.at(-1)?.value === 90);
-    await page.evaluate(() => window.__fakeVodPolicy.forceQuality(32, 64));
-    await page.waitForFunction(() => window.__fakeVodPolicy.calls.filter((entry) => entry.value === 64).length >= 2);
     const rebuilt = await readVodPolicyFixture(page);
     assert.equal(rebuilt.stableCalls.at(-1).value, 90, 'quota fallback must survive a core/source rebuild');
-    assert.equal(rebuilt.qn, 64, 'a real qn32 drift must request qn64 again');
-    const oldCore = rebuilt.stableCalls.at(-1).core;
-    const oldCoreRequests = rebuilt.calls.filter((entry) => entry.core === oldCore).length;
+    assert.equal(rebuilt.panel.state, 'USER_PAUSED', 'same-session core/source rebuild must preserve user pause ownership');
+    assert.equal(rebuilt.paused, true);
+    assert.equal(rebuilt.qualityWrites.length, qualityWritesBeforeRebuild);
+    assert.match(rebuilt.panel.quality, /qn32/);
 
     await page.evaluate(() => {
-      history.pushState({}, '', '/video/BVpolicy-success?p=2');
-      window.__fakeVodPolicy.replaceCore('vod-policy-source-3');
+      window.__fakeVodPolicy.pushPart();
       window.__fakeVodPolicy.setInventory(120, 120);
     });
     await page.waitForFunction(() => window.__fakeVodPolicy.stableCalls.at(-1)?.value === 180, undefined, {
@@ -2595,13 +2657,9 @@ async function runVodPolicyScenario(context) {
     assert.equal(newPart.stableCalls.at(-1).value, 180, 'only a true BVID/part change resets the quota ladder');
     await wait(800);
     const afterTeardown = await readVodPolicyFixture(page);
-    assert.equal(
-      afterTeardown.calls.filter((entry) => entry.core === oldCore).length,
-      oldCoreRequests,
-      'the prior core must not retain a reconcile timer after same-tab source/part replacement',
-    );
+    assert.deepEqual(afterTeardown.qualityWrites, []);
     assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
-    assert.equal(afterTeardown.panel.state === 'VOD_READY' || afterTeardown.panel.state === 'USER_PAUSED', true);
+    assert.equal(afterTeardown.panel.state, 'VOD_READY');
     assert.match(throughput.panel.multiplier, /30 秒 .*60 秒/);
     assert.match(throughput.panel.message, /下载不足以覆盖当前 2× 消耗/);
     const diagnostics = assertDiagnostics(fixture.diagnostics);
@@ -2609,7 +2667,6 @@ async function runVodPolicyScenario(context) {
       status: 'PASS',
       at119,
       at29,
-      earlyPlay,
       userPaused,
       quota,
       throughput,
@@ -2625,39 +2682,107 @@ async function runVodPolicyScenario(context) {
 }
 
 async function runVodStaleCompletionScenario(context) {
-  const fixture = await openVodPolicyFixture(context, 'deferred');
+  const fixture = await openVodPolicyFixture(context, 'qn32');
   try {
     const { page } = fixture;
-    await page.waitForFunction(() => window.__fakeVodPolicy.calls.length === 1);
-    const beforeReplacement = await readVodPolicyFixture(page);
-    assert.equal(beforeReplacement.calls[0].value, 64);
+    await waitForPanelState(page, 'VOD_READY');
+    await page.evaluate(() => {
+      window.__fakeVodPolicy.deferNextPlay();
+      window.__fakeVodPolicy.beginSeek(220);
+      window.__fakeVodPolicy.browserPauseForSeek();
+      window.__fakeVodPolicy.finishSeek(220);
+    });
+    await page.waitForFunction(() => document.documentElement.dataset.bilibiliBufferVodPlayPending === 'true');
+    await wait(100);
+    await page.evaluate(() => window.__fakeVodPolicy.resolvePlay());
+    await wait(100);
+    await page.evaluate(() => window.__fakeVodPolicy.userPause());
+    await waitForPanelState(page, 'USER_PAUSED');
+    await page.evaluate(() => window.__fakeVodPolicy.latePlayEvent());
+    try {
+      await page.waitForFunction(() => document.documentElement.dataset.bilibiliBufferVodPaused === 'true', undefined, {
+        timeout: 3000,
+      });
+    } catch (error) {
+      const snapshot = await readVodPolicyFixture(page);
+      throw new Error(`${error.message}; stale-play snapshot=${JSON.stringify(snapshot)}`, { cause: error });
+    }
+    const lateEvent = await readVodPolicyFixture(page);
+    assert.equal(lateEvent.panel.state, 'USER_PAUSED');
+    await wait(500);
+    const staleCompletion = await readVodPolicyFixture(page);
+    assert.equal(staleCompletion.panel.state, 'USER_PAUSED');
+    assert.equal(staleCompletion.paused, true, 'a stale play completion must not override a user pause');
+
+    await page.evaluate(() => {
+      window.__fakeVodPolicy.setInventory(120, 120);
+      window.__fakeVodPolicy.manualPlay();
+    });
+    await waitForPanelState(page, 'VOD_READY');
+    await page.evaluate(() => window.__fakeVodPolicy.setInventory(29, 29));
+    await waitForPanelState(page, 'REFILLING');
+    await page.evaluate(() => {
+      window.__fakeVodPolicy.beginSeek(240);
+      window.__fakeVodPolicy.browserPauseForSeek();
+      window.__fakeVodPolicy.replaceCore('vod-policy-source-seek-script');
+      window.__fakeVodPolicy.finishSeek(240);
+    });
+    await page.evaluate(() => window.__fakeVodPolicy.setInventory(120, 120));
+    await waitForPanelState(page, 'VOD_READY');
+    const scriptOwnerAfterRebuild = await readVodPolicyFixture(page);
+    assert.equal(scriptOwnerAfterRebuild.paused, false, 'script-owned pause may resume after seek/core rebuild');
+    assert.equal(scriptOwnerAfterRebuild.panel.state, 'VOD_READY');
+
+    await page.evaluate(() => window.__fakeVodPolicy.userPause());
+    await waitForPanelState(page, 'USER_PAUSED');
+    await page.evaluate(() => {
+      window.__fakeVodPolicy.beginSeek(300);
+      window.__fakeVodPolicy.browserPauseForSeek();
+      window.__fakeVodPolicy.replaceCore('vod-policy-source-seek-user');
+      window.__fakeVodPolicy.finishSeek(300);
+    });
     await wait(800);
-    assert.equal(
-      (await readVodPolicyFixture(page)).calls.length,
-      1,
-      'one quality observation must suppress concurrent reconcile requests while its request is pending',
-    );
-    await page.evaluate(() => window.__fakeVodPolicy.replaceCore('vod-policy-source-stale-new'));
-    await page.evaluate(() => window.__fakeVodPolicy.resolvePending(false));
-    await page.waitForFunction(() => window.__fakeVodPolicy.calls.length >= 2, undefined, { timeout: 10000 });
-    const afterNewRequest = await readVodPolicyFixture(page);
-    assert.notEqual(afterNewRequest.calls[0].core, afterNewRequest.calls[1].core);
-    assert.equal(afterNewRequest.calls[1].value, 64);
-    await page.evaluate(() => window.__fakeVodPolicy.resolvePending(true));
-    await page.waitForFunction(() => window.__fakeVodPolicy.realQ === 64);
+    const userOwnerAfterRebuild = await readVodPolicyFixture(page);
+    assert.equal(userOwnerAfterRebuild.panel.state, 'USER_PAUSED');
+    assert.equal(userOwnerAfterRebuild.paused, true, 'user pause ownership must survive seek/core rebuild');
+
+    await page.evaluate(() => {
+      window.__fakeVodPolicy.beginSeek(310);
+      window.__fakeVodPolicy.beginSeek(320);
+      window.__fakeVodPolicy.replaceCore('vod-policy-source-rapid');
+      window.__fakeVodPolicy.finishSeek(320);
+      window.__fakeVodPolicy.resolvePlay();
+    });
+    await wait(800);
+    const rapidSeek = await readVodPolicyFixture(page);
+    assert.equal(rapidSeek.panel.state, 'USER_PAUSED');
+    assert.deepEqual(rapidSeek.qualityWrites, []);
+
+    const beforeDestroy = await readVodPolicyFixture(page);
+    await page.evaluate(() => window.__fakeVodPolicy.pushPart());
+    await wait(1200);
+    await page.evaluate(() => window.__fakeVodPolicy.resolvePlay());
+    await wait(800);
+    const afterDestroy = await readVodPolicyFixture(page);
+    assert.deepEqual(afterDestroy.qualityWrites, beforeDestroy.qualityWrites);
+    assert.equal(await page.locator('[data-bilibili-buffer-panel="true"]').count(), 0);
     await fixture.popup.waitForFunction(
-      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('qn64 已生效'),
+      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('qn32'),
       undefined,
       { timeout: 10000 },
     );
     const final = await readVodPolicyFixture(page);
-    assert.match(final.panel.quality, /qn64 已生效/);
-    assert.equal(final.calls.length, 2, 'the stale completion must not suppress or duplicate the new-core request');
+    assert.equal(final.panel.state, 'VOD_READY');
     const diagnostics = assertDiagnostics(fixture.diagnostics);
     return {
       status: 'PASS',
-      beforeReplacement,
-      afterNewRequest,
+      lateEvent,
+      staleCompletion,
+      scriptOwnerAfterRebuild,
+      userOwnerAfterRebuild,
+      rapidSeek,
+      beforeDestroy,
+      afterDestroy,
       final,
       requestTimeline: fixture.requestTimeline,
       diagnostics,
@@ -2668,48 +2793,38 @@ async function runVodStaleCompletionScenario(context) {
 }
 
 async function runVodImmediateDisableScenario(context) {
-  const fixture = await openVodPolicyFixture(context, 'deferred');
+  const fixture = await openVodPolicyFixture(context, 'qn32');
   try {
     const { page } = fixture;
-    await page.waitForFunction(() => window.__fakeVodPolicy.calls.length === 1);
-    await fixture.popup.waitForFunction(
-      () => document.querySelector('[data-status-field="quality"]')?.textContent.includes('正在请求 720P'),
-      undefined,
-      { timeout: 10000 },
-    );
+    await waitForPanelState(page, 'VOD_READY');
     const beforeDisable = await readVodPolicyFixture(page);
-    assert.match(beforeDisable.panel.quality, /正在请求 720P/);
+    assert.match(beforeDisable.panel.quality, /qn32/);
     await clickPanelAction(page, 'toggle');
     await waitForPopupAction(page, 'toggle', '启用', 5000);
     await page.evaluate(() => {
       const video = window.__fakeVodPolicy.video;
       video.playbackRate = 1;
       video.dispatchEvent(new Event('ratechange'));
-      window.__fakeVodPolicy.resolvePending(true);
+      window.__fakeVodPolicy.setManualQuality(64);
     });
     await wait(800);
     const disabled = await readVodPolicyFixture(page);
     assert.equal(disabled.panel.toggleLabel, '启用');
     assert.equal(disabled.playbackRate, 1, 'disabling must stop the VOD 2× rate guard immediately');
-    assert.equal(disabled.calls.length, 1, 'disabling must not launch another quality request');
-    assert.equal(disabled.qn, 64, 'the already-issued page request may complete physically');
-    assert.equal(
-      disabled.panel.quality,
-      beforeDisable.panel.quality,
-      'a stale quality completion must not mutate the disabled controller status',
-    );
-    assert.doesNotMatch(disabled.panel.quality, /qn64 已生效/);
+    assert.equal(disabled.panel.quality, beforeDisable.panel.quality);
+    assert.deepEqual(disabled.qualityWrites, []);
 
     await clickPanelAction(page, 'toggle');
     await fixture.popup.waitForFunction(
       () => document.querySelector('[data-actions] [data-action="toggle"]')?.textContent === '停用' &&
-        document.querySelector('[data-status-field="quality"]')?.textContent.includes('qn64 已生效'),
+        document.querySelector('[data-status-field="quality"]')?.textContent.includes('qn64'),
       undefined,
       { timeout: 10000 },
     );
     const reenabled = await readVodPolicyFixture(page);
     assert.equal(reenabled.playbackRate, 2, 're-enabling must restore the VOD 2× policy');
-    assert.match(reenabled.panel.quality, /qn64 已生效/);
+    assert.match(reenabled.panel.quality, /qn64/);
+    assert.deepEqual(reenabled.qualityWrites, []);
     const diagnostics = assertDiagnostics(fixture.diagnostics);
     return {
       status: 'PASS',
@@ -2849,10 +2964,10 @@ try {
   await runScenario('liveSignatureRenewal', () => runLiveSignatureScenario(context));
   await runScenario('liveTemporaryManifest503', () => runTemporaryManifestScenario(context, 'manifest503'));
   await runScenario('liveTemporaryManifestTimeout', () => runTemporaryManifestScenario(context, 'manifestTimeout'));
-  for (const qualityMode of ['success', 'reject', 'unavailable', 'timeout', 'realQ']) {
-    await runScenario(`vodQuality${qualityMode}`, () => runVodQualityScenario(context, qualityMode));
+  for (const qualityMode of ['qn16', 'qn32', 'qn64', 'coreFallback', 'unknown']) {
+    await runScenario(`vodReadonlyQuality${qualityMode}`, () => runVodQualityReadScenario(context, qualityMode));
   }
-  for (const capabilityMode of ['corePriority', 'pageFallback', 'noBoth', 'noStable', 'noSchedule']) {
+  for (const capabilityMode of ['noStable', 'noSchedule']) {
     await runScenario(`vodCapability${capabilityMode}`, () => runVodCapabilityScenario(context, capabilityMode));
   }
   await runScenario('vodPolicyAndSpaReplacement', () => runVodPolicyScenario(context));

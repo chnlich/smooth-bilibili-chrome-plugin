@@ -43,15 +43,12 @@
     metricsWindowsSeconds: Object.freeze([30, 60])
   });
   var VOD_CONFIG = Object.freeze({
-    qualityNumber: 64,
     playbackRate: 2,
     stableBufferSeconds: 180,
     startupBufferSeconds: 120,
     lowBufferSeconds: 30,
     quotaFallbackSeconds: Object.freeze([120, 90]),
-    metricsWindowsSeconds: Object.freeze([30, 60]),
-    qualityConfirmTimeoutMilliseconds: 5e3,
-    qualityConfirmPollMilliseconds: 100
+    metricsWindowsSeconds: Object.freeze([30, 60])
   });
 
   // src/extension/popup.js

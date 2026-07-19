@@ -19,7 +19,7 @@ import { MseAppendPipeline, validateInitSegmentTracks } from '../src/live/mse.js
 import { OrderedSegmentQueue } from '../src/live/queue.js';
 import { LiveStateMachine } from '../src/live/state.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
-import { VodBufferPolicy, callQualityMethod, readQualitySnapshot } from '../src/vod/policy.js';
+import { VodBufferPolicy, readQualitySnapshot } from '../src/vod/policy.js';
 import { VodController } from '../src/vod/controller.js';
 
 const MEDIA_URL = 'https://cdn-a.example/live/index.m3u8?expires=123&sign=abc';
@@ -299,6 +299,132 @@ function createStartupController(fetchImpl, appendState = { failAppend: false })
   });
   controller.scheduleDownloads = () => {};
   return { controller, actions, appendState, stages };
+}
+
+function createVodRuntimeFixture({
+  duration = 600,
+  currentTime = 0,
+  videoInventory = 200,
+  audioInventory = 200,
+  deferredPlay = false,
+  scheduleSupported = true,
+} = {}) {
+  const listeners = new Map();
+  const models = [];
+  const state = {
+    videoInventory,
+    audioInventory,
+    pendingPlays: [],
+    core: undefined,
+  };
+  const emit = (name) => {
+    for (const listener of listeners.get(name) || []) {
+      listener({ type: name });
+    }
+  };
+  const video = {
+    currentSrc: 'vod-source-1',
+    currentTime,
+    duration,
+    playbackRate: 1,
+    paused: false,
+    pauseCalls: 0,
+    playCalls: 0,
+    buffered: {
+      get length() {
+        return state.videoInventory > 0 ? 1 : 0;
+      },
+      start: () => video.currentTime,
+      end: () => video.currentTime + state.videoInventory,
+    },
+    addEventListener(name, listener) {
+      const callbacks = listeners.get(name) || new Set();
+      callbacks.add(listener);
+      listeners.set(name, callbacks);
+    },
+    removeEventListener(name, listener) {
+      listeners.get(name)?.delete(listener);
+    },
+    dispatchEvent(event) {
+      emit(typeof event === 'string' ? event : event.type);
+      return true;
+    },
+    pause() {
+      this.pauseCalls += 1;
+      this.paused = true;
+      emit('pause');
+    },
+    play() {
+      this.playCalls += 1;
+      if (deferredPlay) {
+        return new Promise((resolve, reject) => state.pendingPlays.push({ resolve, reject }));
+      }
+      this.paused = false;
+      emit('play');
+      return Promise.resolve();
+    },
+  };
+  const ranges = (inventory) => ({
+    length: inventory > 0 ? 1 : 0,
+    start: () => video.currentTime,
+    end: () => video.currentTime + inventory,
+  });
+  const core = {
+    setStableBufferTime() {},
+    ...(scheduleSupported ? { setScheduleWhilePaused() {} } : {}),
+    getQuality: () => ({ realQ: 32, accept_qn: [64, 32, 16] }),
+    getSupportedQualityList: () => [64, 32, 16],
+    getBufferedRanges: () => ({ video: ranges(state.videoInventory), audio: ranges(state.audioInventory) }),
+    getMediaInfo: () => ({ bitrate: 1_000_000 }),
+  };
+  state.core = core;
+  const windowObject = {
+    player: { __core: () => state.core },
+    location: { href: 'https://www.bilibili.com/video/BVseek?p=1' },
+    performance: { now: () => 1000, getEntriesByType: () => [] },
+  };
+  const controller = new VodController({
+    windowObject,
+    documentObject: {},
+    video,
+    panel: {
+      setModel(model) {
+        models.push(model);
+      },
+      setAction() {},
+    },
+    logger: { warn() {}, error() {} },
+  });
+  controller.started = true;
+  controller.currentCore = core;
+  controller.currentSrc = video.currentSrc;
+  controller.currentLocation = windowObject.location.href;
+  controller.currentSessionKey = 'BVseek#p=1';
+  controller.installVideoGuards();
+  state.setInventory = (nextVideoInventory, nextAudioInventory = nextVideoInventory) => {
+    state.videoInventory = nextVideoInventory;
+    state.audioInventory = nextAudioInventory;
+  };
+  state.seek = (targetTime) => {
+    video.currentTime = targetTime;
+    video.dispatchEvent({ type: 'seeking' });
+  };
+  state.seeked = () => video.dispatchEvent({ type: 'seeked' });
+  state.resolvePlay = ({ emitPlay = true } = {}) => {
+    const pending = state.pendingPlays.shift();
+    assert.ok(pending !== undefined, 'no pending VOD play promise');
+    if (emitPlay) {
+      video.paused = false;
+      emit('play');
+    }
+    pending.resolve();
+  };
+  state.rejectPlay = () => {
+    const pending = state.pendingPlays.shift();
+    assert.ok(pending !== undefined, 'no pending VOD play promise');
+    pending.reject(new Error('deterministic VOD play rejection'));
+  };
+  return { controller, video, core, state, models };
 }
 
 test('manifest parser retains media sequence, init map, and signed query parameters', () => {
@@ -1998,45 +2124,8 @@ test('VOD policy applies each core once and degrades quota exactly 180 to 120 to
   ]);
 });
 
-test('VOD quality chooses capability flags over proxy method existence and prefers core', async () => {
+test('VOD waits for a nonempty currentSrc or src before binding policy and only reads quality', async () => {
   const calls = [];
-  const player = {
-    requestQuality() {
-      calls.push('player');
-    },
-    supports: () => true,
-  };
-  const core = {
-    requestQuality() {
-      calls.push('core');
-      return Promise.resolve(true);
-    },
-    supports: (method) => method === 'requestQuality',
-  };
-  await callQualityMethod(player, core, 64);
-  assert.deepEqual(calls, ['core']);
-
-  const coreWithoutRequest = {
-    requestQuality() {
-      calls.push('hidden-core');
-    },
-    supports: () => false,
-  };
-  await callQualityMethod(player, coreWithoutRequest, 64);
-  assert.deepEqual(calls, ['core', 'player']);
-  await assert.rejects(
-    callQualityMethod({ requestQuality() {}, supports: () => false }, coreWithoutRequest, 64),
-    (error) => error.code === 'VOD_QUALITY_UNAVAILABLE',
-  );
-  await assert.rejects(
-    callQualityMethod(player, core, 0),
-    (error) => error.code === 'VOD_QUALITY_ARGUMENT_INVALID',
-  );
-});
-
-test('VOD waits for a nonempty currentSrc or src before binding policy and requesting qn64', async () => {
-  const calls = [];
-  let qn = 32;
   let coreReads = 0;
   const core = {
     setStableBufferTime(value) {
@@ -2046,11 +2135,7 @@ test('VOD waits for a nonempty currentSrc or src before binding policy and reque
       calls.push(['schedule', value]);
     },
     getQuality() {
-      return { realQ: qn, accept_quality: [64, 32] };
-    },
-    async requestQuality(value) {
-      calls.push(['quality', value]);
-      qn = value;
+      return { realQ: 32, accept_quality: [64, 32] };
     },
   };
   const video = {
@@ -2093,19 +2178,16 @@ test('VOD waits for a nonempty currentSrc or src before binding policy and reque
   assert.deepEqual(calls, [
     ['stable', 180],
     ['schedule', true],
-    ['quality', 64],
   ]);
   assert.equal(controller.currentSrc, 'blob:vod-source');
 });
 
-test('VOD panel disable stops rate and quota policy and invalidates an in-flight qn64 observation', async () => {
+test('VOD panel disable stops the rate guard and re-enable performs a fresh read-only status', async () => {
   const actions = new Map();
   const videoListeners = new Map();
   const coreListeners = new Map();
   const calls = [];
   const models = [];
-  let qn = 32;
-  let resolveQuality;
   const core = {
     setStableBufferTime(value) {
       calls.push(['stable', value]);
@@ -2114,16 +2196,7 @@ test('VOD panel disable stops rate and quota policy and invalidates an in-flight
       calls.push(['schedule', value]);
     },
     getQuality() {
-      return { realQ: qn, accept_quality: [64, 32] };
-    },
-    requestQuality(value) {
-      calls.push(['quality', value]);
-      return new Promise((resolve) => {
-        resolveQuality = () => {
-          qn = value;
-          resolve(true);
-        };
-      });
+      return { realQ: 32, accept_quality: [64, 32] };
     },
     on(name, callback) {
       coreListeners.set(name, callback);
@@ -2179,8 +2252,7 @@ test('VOD panel disable stops rate and quota policy and invalidates an in-flight
   controller.started = true;
   controller.installVideoGuards();
   controller.updateStatus();
-  const reconciling = controller.reconcile();
-  assert.equal(typeof resolveQuality, 'function');
+  await controller.reconcile();
 
   actions.get('toggle').callback();
   assert.equal(controller.enabled, false);
@@ -2194,20 +2266,15 @@ test('VOD panel disable stops rate and quota policy and invalidates an in-flight
   assert.deepEqual(calls, [
     ['stable', 180],
     ['schedule', true],
-    ['quality', 64],
   ]);
   assert.equal(video.playbackRate, 1);
-
-  resolveQuality();
-  await reconciling;
-  assert.equal(controller.qualityConfirmed, false);
   assert.equal(models.length, modelsBeforeCompletion);
 
   actions.get('toggle').callback();
   await controller.reconcile();
   assert.equal(controller.enabled, true);
   assert.equal(video.playbackRate, 2);
-  assert.equal(controller.qualityStatus, '720P/qn64 已生效');
+  assert.match(controller.qualityStatus, /qn32/);
   controller.destroy();
 });
 
@@ -2539,339 +2606,229 @@ test('VOD does not re-pause an early user play while initial inventory is low', 
   assert.equal(controller.userPaused, false);
 });
 
-test('VOD reports known non-64 quality when the official request is rejected', async () => {
+test('VOD quality evidence prefers page realQ and falls back after independent getter failures', () => {
   const warnings = [];
-  const core = { getCurrentQn: () => 80 };
-  core.requestQuality = async () => false;
-  const controller = new VodController({
-    windowObject: { player: {} },
-    documentObject: {},
-    video: { addEventListener() {} },
-    panel: { setModel() {}, setAction() {} },
-    logger: {
-      warn(...args) {
-        warnings.push(args);
-      },
-      error() {},
-    },
-  });
-  await controller.requestQuality(core);
-  assert.match(controller.qualityStatus, /^720P\/qn64 未生效，保持原画质 qn80/);
-  assert.equal(warnings.length, 1);
-});
-
-test('VOD reports a failed original-quality restore with the actual current qn', async () => {
-  let qn = 32;
-  const calls = [];
-  const core = {
-    getQuality: () => ({ nowQ: qn, accept_quality: [64, 32, 16] }),
-    async requestQuality(requested) {
-      calls.push(requested);
-      if (requested === 64) {
-        qn = 16;
-      }
-      return false;
-    },
-  };
-  const controller = new VodController({
-    windowObject: { player: {} },
-    documentObject: {},
-    video: { addEventListener() {} },
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-
-  await controller.requestQuality(core);
-
-  assert.deepEqual(calls, [64, 32]);
-  assert.equal(qn, 16);
-  assert.match(controller.qualityStatus, /^720P\/qn64 未生效，恢复原画质失败，当前实际画质 qn16/);
-});
-
-test('VOD parses object-shaped getQuality and confirms qn64 through requestQuality once', async () => {
-  let qn = 32;
-  let calls = 0;
-  const core = {
-    getQuality: () => ({ nowQ: qn, realQ: qn, accept_qn: [64, 32] }),
-    requestQuality: async (requested) => {
-      calls += 1;
-      qn = requested;
-    },
-  };
-  assert.deepEqual(readQualitySnapshot(core), {
-    getter: 'getQuality',
-    raw: { nowQ: 32, realQ: 32, accept_qn: [64, 32] },
-    qn: 32,
-    availableQns: [64, 32],
-  });
-  const controller = new VodController({
-    windowObject: { player: {} },
-    documentObject: {},
-    video: { addEventListener() {} },
-    panel: { setModel() {}, setAction() {} },
-  });
-  await controller.requestQuality(core);
-  await controller.requestQuality(core);
-  assert.equal(calls, 1);
-  assert.equal(controller.qualityStatus, '720P/qn64 已生效');
-});
-
-test('VOD uses the public supported-quality list with the current scalar getQuality shape', async () => {
-  let qn = 80;
-  const calls = [];
-  const core = {
+  const player = {
     getQuality() {
-      return {
-        oldA: 30280,
-        nowA: 30280,
-        newA: 30280,
-        oldQ: 80,
-        nowQ: qn,
-        newQ: qn,
-        realQ: qn,
-        oldRQ: 80,
-      };
+      return { nowQ: 32, realQ: 250 };
     },
     getSupportedQualityList() {
-      return [80, 64, 32, 16];
-    },
-    requestQuality(requested) {
-      calls.push(requested);
-      qn = requested;
+      return [250, 32];
     },
   };
-  const snapshot = readQualitySnapshot(core);
-  assert.equal(snapshot.qn, 80);
-  assert.deepEqual(snapshot.availableQns, [80, 64, 32, 16]);
-  const controller = new VodController({
-    windowObject: { player: {}, location: { href: 'https://www.bilibili.com/video/BVtest' } },
-    documentObject: {},
-    video: { currentSrc: 'source-1', addEventListener() {} },
-    panel: { setModel() {}, setAction() {} },
-  });
-
-  await controller.requestQuality(core);
-
-  assert.deepEqual(calls, [64]);
-  assert.equal(qn, 64);
-  assert.equal(controller.qualityStatus, '720P/qn64 已生效');
-});
-
-test('VOD re-requests qn64 after same-session drift, reports failed drift truthfully, and preserves quota 90', async () => {
-  let qn = 32;
-  let rejectRequests = false;
-  const calls = [];
   const core = {
-    setStableBufferTime() {},
-    setScheduleWhilePaused() {},
     getQuality() {
-      return { nowQ: qn, realQ: qn, accept_qn: [64, 32] };
+      return { nowQ: 64, realQ: 64 };
     },
-    requestQuality(requested) {
-      calls.push(requested);
-      if (rejectRequests) {
-        return false;
-      }
-      qn = requested;
-      return undefined;
+    getSupportedQualityList() {
+      return [64, 32];
     },
   };
-  const video = {
-    currentSrc: 'source-1',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const windowObject = {
-    player: { __core: () => core },
-    location: { href: 'https://www.bilibili.com/video/BVdrift?p=1' },
-    performance: { now: () => 1000, getEntriesByType: () => [] },
-  };
-  const controller = new VodController({
-    windowObject,
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
+  const preferred = readQualitySnapshot(player, core, {
+    logger: { warn(...args) { warnings.push(args); } },
+    video: { videoWidth: 1920, videoHeight: 1080 },
   });
+  assert.equal(preferred.source, '页面播放器');
+  assert.equal(preferred.actualQn, 250);
+  assert.deepEqual(preferred.availableQns, [250, 32, 64]);
+  assert.deepEqual({ width: preferred.width, height: preferred.height }, { width: 1920, height: 1080 });
 
-  await controller.reconcile();
-  assert.deepEqual(calls, [64]);
-  assert.equal(qn, 64);
-  controller.bufferPolicy.handleQuota(core);
-  controller.bufferPolicy.handleQuota(core);
-  assert.equal(controller.bufferPolicy.targetSeconds, 90);
-
-  qn = 32;
-  await controller.reconcile();
-  assert.deepEqual(calls, [64, 64]);
-  assert.equal(qn, 64);
-  assert.equal(controller.qualityStatus, '720P/qn64 已生效');
-  assert.equal(controller.bufferPolicy.targetSeconds, 90);
-
-  qn = 32;
-  rejectRequests = true;
-  await controller.reconcile();
-  assert.deepEqual(calls, [64, 64, 64]);
-  assert.equal(qn, 32);
-  assert.match(controller.qualityStatus, /^720P\/qn64 未生效，保持原画质 qn32/);
-  await controller.reconcile();
-  await controller.reconcile();
-  assert.deepEqual(calls, [64, 64, 64]);
-  assert.equal(controller.bufferPolicy.targetSeconds, 90);
+  const fallback = readQualitySnapshot(
+    {
+      getQuality() {
+        throw new Error('page getter failed');
+      },
+      getSupportedQualityList() {
+        throw new Error('page list failed');
+      },
+    },
+    {
+      getQuality() {
+        return { nowQ: 80, realQ: Number.NaN };
+      },
+      getSupportedQualityList() {
+        return [80];
+      },
+    },
+    { logger: { warn(...args) { warnings.push(args); } } },
+  );
+  assert.equal(fallback.source, 'core');
+  assert.equal(fallback.actualQn, 80);
+  assert.equal(warnings.length, 2);
 });
 
-test('VOD recognizes official getQuality availability fields', () => {
-  const snapshot = readQualitySnapshot({
-    getQuality: () => ({ oldA: [32], nowA: [64, 32], newA: [80], oldQ: 32, nowQ: 32, newQ: 64, realQ: 32 }),
-  });
-  assert.equal(snapshot.qn, 32);
-  assert.deepEqual(snapshot.availableQns, [32, 64, 80]);
+test('VOD quality unknown diagnostics never turn pixels into a qn', () => {
+  const evidence = readQualitySnapshot(
+    { getQuality: () => ({ realQ: Number.NaN }), getSupportedQualityList: () => [32] },
+    { getQuality: () => null, getSupportedQualityList: () => null },
+    { video: { videoWidth: 1280, videoHeight: 720 } },
+  );
+  assert.equal(evidence.actualQn, undefined);
+  assert.equal(evidence.source, '未知');
+  assert.deepEqual({ width: evidence.width, height: evidence.height }, { width: 1280, height: 720 });
 });
 
-test('VOD re-requests from actual realQ drift even when nowQ remains 64', async () => {
-  let realQ = 64;
-  let rejectRequests = false;
-  const calls = [];
-  const core = {
-    setStableBufferTime() {},
-    setScheduleWhilePaused() {},
-    getQuality() {
-      return { nowQ: 64, realQ, accept_qn: [64, 32] };
-    },
-    requestQuality(requested) {
-      calls.push(requested);
-      return rejectRequests ? false : undefined;
-    },
-  };
-  const video = {
-    currentSrc: 'source-1',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const windowObject = {
-    player: { __core: () => core },
-    location: { href: 'https://www.bilibili.com/video/BVrealq?p=1' },
-    performance: { now: () => 1000, getEntriesByType: () => [] },
-  };
-  const controller = new VodController({
-    windowObject,
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-
+test('VOD tries to play immediately at 2x even with zero initial inventory', async () => {
+  const { controller, video } = createVodRuntimeFixture({ videoInventory: 0, audioInventory: 0 });
+  video.paused = true;
   await controller.reconcile();
-  assert.equal(controller.qualityStatus, '720P/qn64 已生效');
-  assert.deepEqual(calls, []);
-
-  realQ = 32;
-  rejectRequests = true;
-  assert.equal(readQualitySnapshot(core).qn, 32);
-  await controller.reconcile();
-  assert.deepEqual(calls, [64]);
-  assert.match(controller.qualityStatus, /^720P\/qn64 未生效，保持原画质 qn32/);
-  await controller.reconcile();
-  assert.deepEqual(calls, [64]);
+  await Promise.resolve();
+  assert.equal(video.playCalls, 1);
+  assert.equal(video.pauseCalls, 0);
+  assert.equal(video.paused, false);
+  assert.equal(video.playbackRate, 2);
+  controller.destroy();
 });
 
-test('VOD retries a newer same-session drift after an older qn64 request rejects', async () => {
-  let qn = 32;
-  let resolveFirstRequest;
-  const calls = [];
-  const core = {
-    setStableBufferTime() {},
-    setScheduleWhilePaused() {},
-    getQuality() {
-      return { nowQ: qn, realQ: qn, accept_qn: [64, 32, 16] };
-    },
-    requestQuality(requested) {
-      calls.push([qn, requested]);
-      if (calls.length === 1) {
-        return new Promise((resolve) => {
-          resolveFirstRequest = () => resolve(false);
-        });
-      }
-      return false;
-    },
-  };
-  const video = {
-    currentSrc: 'source-1',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const windowObject = {
-    player: { __core: () => core },
-    location: { href: 'https://www.bilibili.com/video/BVpendingdrift?p=1' },
-    performance: { now: () => 1000, getEntriesByType: () => [] },
-  };
-  const controller = new VodController({
-    windowObject,
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-
-  const firstReconcile = controller.reconcile();
-  assert.equal(typeof resolveFirstRequest, 'function');
-  qn = 16;
-  const secondReconcile = controller.reconcile();
-  resolveFirstRequest();
-  await Promise.all([firstReconcile, secondReconcile]);
-
-  assert.deepEqual(calls, [
-    [32, 64],
-    [16, 64],
-  ]);
-  assert.equal(qn, 16);
-  assert.equal(controller.qualityConfirmed, false);
-  assert.match(controller.qualityStatus, /^720P\/qn64 未生效，保持原画质 qn16/);
-  await controller.reconcile();
-  await controller.reconcile();
-  assert.deepEqual(calls, [
-    [32, 64],
-    [16, 64],
-  ]);
+test('VOD independently degrades when paused scheduling is unavailable without pausing', () => {
+  const { controller, video, state } = createVodRuntimeFixture({ scheduleSupported: false });
+  controller.startupComplete = true;
+  controller.pausedSchedulingSupported = false;
+  state.setInventory(20, 20);
+  controller.enforceStartupAndRefill(state.core);
+  assert.equal(video.pauseCalls, 0);
+  assert.equal(video.paused, false);
+  assert.match(controller.policyMessage, /不支持暂停时继续下载/);
+  controller.destroy();
 });
 
-test('VOD quality timeout keeps the original quality and never reports request-sent success', async () => {
-  let calls = 0;
-  let qn = 32;
-  const core = {
-    getQuality: () => ({ nowQ: qn, accept_quality: [64, 32] }),
-    requestQuality: async () => {
-      calls += 1;
-    },
+test('VOD seek uses only the new position and the smaller audio/video inventory', () => {
+  const { controller, video, state, models } = createVodRuntimeFixture();
+  controller.startupComplete = true;
+  state.setInventory(0, 0);
+  state.seek(300);
+  assert.equal(controller.seekEpoch, 1);
+  assert.equal(controller.seekWarmupActive, true);
+  assert.equal(video.pauseCalls, 0);
+  state.seeked();
+  state.setInventory(90, 60);
+  controller.enforceStartupAndRefill(state.core);
+  controller.updateStatus();
+  assert.equal(models.at(-1).inventory, '60.0 秒');
+  assert.equal(video.pauseCalls, 0);
+  controller.destroy();
+});
+
+test('VOD locks the seek boundary classification at 120 seconds', () => {
+  const short = createVodRuntimeFixture();
+  short.state.setInventory(0, 0);
+  short.state.seek(short.video.duration - 120);
+  short.state.seeked();
+  short.video.currentTime += 1;
+  short.state.setInventory(29, 29);
+  short.controller.enforceStartupAndRefill(short.core);
+  assert.equal(short.controller.seekClassification, 'short');
+  assert.equal(short.video.pauseCalls, 0);
+  short.controller.destroy();
+
+  const long = createVodRuntimeFixture();
+  long.state.setInventory(0, 0);
+  long.state.seek(long.video.duration - 121);
+  long.state.seeked();
+  long.video.currentTime += 1;
+  long.state.setInventory(29, 29);
+  long.controller.enforceStartupAndRefill(long.core);
+  assert.equal(long.controller.seekClassification, 'long');
+  assert.equal(long.controller.seekWarmupActive, true);
+  assert.equal(long.video.pauseCalls, 0);
+  long.state.setInventory(120, 120);
+  long.controller.enforceStartupAndRefill(long.core);
+  long.state.setInventory(29, 29);
+  long.controller.enforceStartupAndRefill(long.core);
+  assert.equal(long.video.pauseCalls, 1);
+  long.controller.destroy();
+});
+
+test('VOD user pause wins over a stale play completion after seek', async () => {
+  const { controller, video, state } = createVodRuntimeFixture({ deferredPlay: true });
+  video.paused = true;
+  const reconcile = controller.reconcile();
+  assert.equal(video.playCalls, 1);
+  video.pause();
+  assert.equal(controller.userPaused, true);
+  state.seek(300);
+  state.seeked();
+  state.resolvePlay();
+  await reconcile;
+  await Promise.resolve();
+  assert.equal(controller.userPaused, true);
+  assert.equal(video.paused, true);
+  assert.equal(controller.seekPlaybackOwner, 'user-paused');
+  controller.destroy();
+});
+
+test('VOD user pause wins when a play promise settles before its late play event', async () => {
+  const { controller, video, state } = createVodRuntimeFixture({ deferredPlay: true });
+  video.paused = true;
+  const reconcile = controller.reconcile();
+  assert.equal(video.playCalls, 1);
+  video.paused = false;
+  state.resolvePlay({ emitPlay: false });
+  await Promise.resolve();
+  video.pause();
+  video.dispatchEvent({ type: 'play' });
+  await reconcile;
+  await Promise.resolve();
+  assert.equal(controller.userPaused, true);
+  assert.equal(video.paused, true);
+  controller.destroy();
+});
+
+test('VOD preserves script pause ownership through a seek-time core/source rebuild', async () => {
+  const { controller, video, state } = createVodRuntimeFixture({ videoInventory: 29, audioInventory: 29 });
+  controller.startupComplete = true;
+  controller.enforceStartupAndRefill(state.core);
+  assert.equal(controller.scriptPaused, true);
+  state.setInventory(0, 0);
+  state.seek(200);
+  const replacementCore = {
+    ...state.core,
+    getBufferedRanges: () => ({
+      video: { length: 0, start() { throw new Error('no range'); }, end() { throw new Error('no range'); } },
+      audio: { length: 0, start() { throw new Error('no range'); }, end() { throw new Error('no range'); } },
+    }),
   };
-  const controller = new VodController({
-    windowObject: { player: {} },
-    documentObject: {},
-    video: { addEventListener() {} },
-    panel: { setModel() {}, setAction() {} },
-    config: { ...VOD_CONFIG, qualityConfirmTimeoutMilliseconds: 25, qualityConfirmPollMilliseconds: 5 },
-    logger: { warn() {}, error() {} },
-  });
-  await controller.requestQuality(core);
-  assert.equal(calls, 1);
-  assert.equal(qn, 32);
-  assert.match(controller.qualityStatus, /^720P\/qn64 未生效，保持原画质 qn32/);
-  assert.doesNotMatch(controller.qualityStatus, /请求已发送/);
+  state.core = replacementCore;
+  video.currentSrc = 'vod-source-2';
+  await controller.reconcile();
+  assert.equal(controller.scriptPaused, true);
+  state.setInventory(120, 120);
+  state.seeked();
+  await Promise.resolve();
+  assert.equal(video.playCalls, 1);
+  assert.equal(controller.scriptPaused, false);
+  assert.equal(video.paused, false);
+  controller.destroy();
+});
+
+test('VOD preserves user pause through a seek-time core/source rebuild', async () => {
+  const { controller, video, state } = createVodRuntimeFixture();
+  video.pause();
+  state.seek(200);
+  state.core = { ...state.core };
+  video.currentSrc = 'vod-source-2';
+  await controller.reconcile();
+  state.seeked();
+  await Promise.resolve();
+  assert.equal(controller.userPaused, true);
+  assert.equal(video.playCalls, 0);
+  assert.equal(video.paused, true);
+  controller.destroy();
+});
+
+test('VOD rapid seek and destroy invalidate pending reconcile writes', async () => {
+  let releasePreparation;
+  const { controller, state, models } = createVodRuntimeFixture();
+  controller.beforeReconcile = () => new Promise((resolve) => { releasePreparation = resolve; });
+  const pending = controller.reconcile();
+  state.seek(200);
+  state.seek(400);
+  const modelCountBeforeDestroy = models.length;
+  controller.destroy();
+  releasePreparation();
+  await pending;
+  assert.equal(models.length, modelCountBeforeDestroy);
+  assert.equal(controller.destroyed, true);
 });
 
 test('VOD handles quota emitted by the current core without reapplying 180 seconds', async () => {
@@ -2884,10 +2841,6 @@ test('VOD handles quota emitted by the current core without reapplying 180 secon
     setScheduleWhilePaused(value) {
       calls.push(['paused', value]);
     },
-    getCurrentQn() {
-      return 64;
-    },
-    requestQuality() {},
     on(name, callback) {
       listeners.set(name, callback);
     },
@@ -2936,62 +2889,6 @@ test('VOD handles quota emitted by the current core without reapplying 180 secon
   assert.equal(listeners.has('error'), false);
 });
 
-test('VOD retains a quota fallback when only quality changes on the same core and source', async () => {
-  const stableCalls = [];
-  let currentQuality = 64;
-  let coreErrorListener;
-  const core = {
-    setStableBufferTime(value) {
-      stableCalls.push(value);
-    },
-    setScheduleWhilePaused() {},
-    getCurrentQn() {
-      return currentQuality;
-    },
-    requestQuality() {
-      currentQuality = 64;
-    },
-    on(name, callback) {
-      assert.equal(name, 'error');
-      coreErrorListener = callback;
-    },
-    off() {},
-  };
-  const video = {
-    currentSrc: 'source-1',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const controller = new VodController({
-    windowObject: {
-      player: { __core: () => core },
-      location: { href: 'https://www.bilibili.com/video/BVtest' },
-    },
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-
-  await controller.reconcile();
-  coreErrorListener({ name: 'QuotaExceededError', message: 'quota' });
-  assert.equal(controller.bufferPolicy.targetSeconds, 120);
-  assert.equal(controller.startupComplete, true);
-
-  currentQuality = 80;
-  await controller.reconcile();
-
-  assert.deepEqual(stableCalls, [180, 120]);
-  assert.equal(controller.bufferPolicy.targetSeconds, 120);
-  assert.equal(controller.startupComplete, true);
-  controller.destroy();
-});
-
 test('VOD bandwidth feedback excludes old-session resources and clears only its own recovered warning', () => {
   let entries = [
     { name: 'https://cdn.example/old.m4s', initiatorType: 'video', responseEnd: 119999, transferSize: 100000 },
@@ -3032,359 +2929,6 @@ test('VOD bandwidth feedback excludes old-session resources and clears only its 
   controller.message = '保留的产品消息';
   controller.updateStatus();
   assert.equal(models.at(-1).message, '保留的产品消息');
-});
-
-test('VOD quota fallback survives same-BVID core/source rebuild and resets only on a new part', async () => {
-  const stableCalls = [];
-  const listeners = new Map();
-  const makeCore = (name) => ({
-    setStableBufferTime(value) {
-      stableCalls.push([name, value]);
-    },
-    setScheduleWhilePaused() {},
-    getCurrentQn() {
-      return 64;
-    },
-    requestQuality() {},
-    on(event, callback) {
-      listeners.set(name, { event, callback });
-    },
-    off() {},
-  });
-  let core = makeCore('one');
-  const video = {
-    currentSrc: 'source-1',
-    currentTime: 0,
-    duration: 600,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const windowObject = {
-    player: { __core: () => core },
-    location: { href: 'https://www.bilibili.com/video/BVsame?p=1' },
-    performance: { now: () => 1000, getEntriesByType: () => [] },
-  };
-  const controller = new VodController({
-    windowObject,
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-  await controller.reconcile();
-  listeners.get('one').callback({ name: 'QuotaExceededError', message: 'quota' });
-  core = makeCore('two');
-  video.currentSrc = 'source-2';
-  await controller.reconcile();
-  assert.equal(controller.bufferPolicy.targetSeconds, 120);
-  assert.deepEqual(stableCalls, [['one', 180], ['one', 120], ['two', 120]]);
-
-  core = makeCore('three');
-  video.currentSrc = 'source-3';
-  windowObject.location.href = 'https://www.bilibili.com/video/BVsame?p=2';
-  await controller.reconcile();
-  assert.equal(controller.bufferPolicy.targetSeconds, 180);
-  assert.deepEqual(stableCalls, [['one', 180], ['one', 120], ['two', 120], ['three', 180]]);
-  controller.destroy();
-});
-
-test('VOD controller reapplies policy and quality request after core and source rebuild', async () => {
-  const listeners = new Map();
-  const video = {
-    currentSrc: 'source-1',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    error: null,
-    addEventListener(name, callback) {
-      listeners.set(name, callback);
-    },
-    removeEventListener() {},
-    pause() {
-      this.paused = true;
-      listeners.get('pause')?.();
-    },
-    play() {
-      this.paused = false;
-      listeners.get('play')?.();
-      return Promise.resolve();
-    },
-  };
-  const calls = [];
-  const makeCore = (name) => {
-    let quality = 32;
-    return {
-      name,
-      setStableBufferTime(value) {
-        calls.push([name, 'stable', value]);
-      },
-      setScheduleWhilePaused(value) {
-        calls.push([name, 'paused', value]);
-      },
-      getQuality() {
-        return { nowQ: quality, accept_qn: [64, 32] };
-      },
-      requestQuality(requestedQuality) {
-        quality = requestedQuality;
-        calls.push([name, 'quality', requestedQuality]);
-      },
-      getMediaInfo() {
-        return { bitrate: 1000 };
-      },
-    };
-  };
-  let core = makeCore('one');
-  const windowObject = {
-    player: {
-      __core: () => core,
-    },
-    location: { href: 'https://www.bilibili.com/video/BVtest' },
-    setInterval: () => 1,
-    clearInterval() {},
-    performance: { now: () => 1000, getEntriesByType: () => [] },
-  };
-  const panel = { setModel() {}, setAction() {} };
-  const controller = new VodController({ windowObject, documentObject: {}, video, panel });
-  await controller.reconcile();
-  await controller.reconcile();
-  core = makeCore('two');
-  video.currentSrc = 'source-2';
-  await controller.reconcile();
-  assert.deepEqual(
-    calls.filter((call) => call[1] === 'stable'),
-    [
-      ['one', 'stable', 180],
-      ['two', 'stable', 180],
-    ],
-  );
-  assert.deepEqual(
-    calls.filter((call) => call[1] === 'quality'),
-    [
-      ['one', 'quality', 64],
-      ['two', 'quality', 64],
-    ],
-  );
-});
-
-test('VOD sends a distinct qn64 request after an in-flight core and source rebuild', async () => {
-  let resolveFirstRequest;
-  const calls = [];
-  const makeCore = (name, pending = false) => {
-    let qn = 32;
-    return {
-      setStableBufferTime() {},
-      setScheduleWhilePaused() {},
-      getQuality() {
-        return { nowQ: qn, accept_qn: [64, 32] };
-      },
-      requestQuality(requested) {
-        calls.push([name, requested]);
-        if (pending) {
-          return new Promise((resolve) => {
-            resolveFirstRequest = () => {
-              qn = requested;
-              resolve();
-            };
-          });
-        }
-        qn = requested;
-        return undefined;
-      },
-    };
-  };
-  const firstCore = makeCore('first', true);
-  const secondCore = makeCore('second');
-  let core = firstCore;
-  const video = {
-    currentSrc: 'source-1',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const windowObject = {
-    player: { __core: () => core },
-    location: { href: 'https://www.bilibili.com/video/BVfirst?p=1' },
-    performance: { now: () => 0, getEntriesByType: () => [] },
-  };
-  const controller = new VodController({
-    windowObject,
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-
-  const firstReconcile = controller.reconcile();
-  assert.equal(typeof resolveFirstRequest, 'function');
-  core = secondCore;
-  video.currentSrc = 'source-2';
-  windowObject.location.href = 'https://www.bilibili.com/video/BVfirst?p=1';
-  const secondReconcile = controller.reconcile();
-  await Promise.resolve();
-  assert.deepEqual(calls, [
-    ['first', 64],
-    ['second', 64],
-  ]);
-  resolveFirstRequest();
-  await Promise.all([firstReconcile, secondReconcile]);
-
-  assert.deepEqual(calls, [
-    ['first', 64],
-    ['second', 64],
-  ]);
-  assert.equal(secondCore.getQuality().nowQ, 64);
-  assert.equal(controller.qualitySettledCore, secondCore);
-});
-
-test('VOD ignores an old quality request after a new BVID session begins', async () => {
-  let resolveOldRequest;
-  let oldQualityReads = 0;
-  let oldStableReads = 0;
-  const calls = [];
-  const makeCore = (name, { pending = false, stableBufferSeconds = 180 } = {}) => {
-    let qn = 32;
-    return {
-      setStableBufferTime(value) {
-        calls.push([name, 'stable', value]);
-      },
-      setScheduleWhilePaused(value) {
-        calls.push([name, 'paused', value]);
-      },
-      getStableBufferTime() {
-        if (name === 'old') {
-          oldStableReads += 1;
-        }
-        return stableBufferSeconds;
-      },
-      getQuality() {
-        if (name === 'old') {
-          oldQualityReads += 1;
-        }
-        return { nowQ: qn, realQ: qn, accept_qn: [64, 32] };
-      },
-      requestQuality(requested) {
-        calls.push([name, 'quality', requested]);
-        if (pending) {
-          return new Promise((resolve) => {
-            resolveOldRequest = () => {
-              qn = requested;
-              resolve();
-            };
-          });
-        }
-        qn = requested;
-        return undefined;
-      },
-    };
-  };
-  const oldCore = makeCore('old', { pending: true, stableBufferSeconds: 90 });
-  const newCore = makeCore('new');
-  let core = oldCore;
-  const video = {
-    currentSrc: 'source-old',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const windowObject = {
-    player: { __core: () => core },
-    location: { href: 'https://www.bilibili.com/video/BVold?p=1' },
-    performance: { now: () => 1000, getEntriesByType: () => [] },
-  };
-  const controller = new VodController({
-    windowObject,
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-
-  const oldReconcile = controller.reconcile();
-  assert.equal(typeof resolveOldRequest, 'function');
-  core = newCore;
-  video.currentSrc = 'source-new';
-  windowObject.location.href = 'https://www.bilibili.com/video/BVnew?p=1';
-  const newReconcile = controller.reconcile();
-  resolveOldRequest();
-  await Promise.all([oldReconcile, newReconcile]);
-
-  assert.equal(controller.currentCore, newCore);
-  assert.equal(controller.bufferPolicy.targetSeconds, 180);
-  assert.equal(oldQualityReads, 2);
-  assert.equal(oldStableReads, 0);
-  assert.deepEqual(
-    calls.filter(([name, kind]) => name === 'new' && kind === 'stable'),
-    [['new', 'stable', 180]],
-  );
-});
-
-test('VOD does not restore an old quality request into a changed source', async () => {
-  let resolveOldRequest;
-  let qn = 32;
-  const calls = [];
-  const video = {
-    currentSrc: 'source-a',
-    currentTime: 0,
-    duration: 600,
-    playbackRate: 1,
-    paused: false,
-    buffered: { length: 1, start: () => 0, end: () => 200 },
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const core = {
-    setStableBufferTime() {},
-    setScheduleWhilePaused() {},
-    getQuality() {
-      return { nowQ: qn, realQ: qn, accept_qn: [64, 32] };
-    },
-    requestQuality(requested) {
-      calls.push([video.currentSrc, requested]);
-      if (requested === 64) {
-        return new Promise((resolve) => {
-          resolveOldRequest = () => {
-            qn = 64;
-            resolve(false);
-          };
-        });
-      }
-      qn = requested;
-      return undefined;
-    },
-  };
-  const windowObject = {
-    player: { __core: () => core },
-    location: { href: 'https://www.bilibili.com/video/BVsame?p=1' },
-    performance: { now: () => 1000, getEntriesByType: () => [] },
-  };
-  const controller = new VodController({
-    windowObject,
-    documentObject: {},
-    video,
-    panel: { setModel() {}, setAction() {} },
-    logger: { warn() {}, error() {} },
-  });
-
-  const reconcile = controller.reconcile();
-  assert.equal(typeof resolveOldRequest, 'function');
-  video.currentSrc = 'source-b';
-  resolveOldRequest();
-  await reconcile;
-
-  assert.deepEqual(calls, [['source-a', 64]]);
-  assert.equal(qn, 64);
 });
 
 test('pinned dependency contract stays exact', () => {

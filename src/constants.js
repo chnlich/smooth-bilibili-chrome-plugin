@@ -48,13 +48,10 @@ export const LIVE_CONFIG = Object.freeze({
 });
 
 export const VOD_CONFIG = Object.freeze({
-  qualityNumber: 64,
   playbackRate: 2,
   stableBufferSeconds: 180,
   startupBufferSeconds: 120,
   lowBufferSeconds: 30,
   quotaFallbackSeconds: Object.freeze([120, 90]),
   metricsWindowsSeconds: Object.freeze([30, 60]),
-  qualityConfirmTimeoutMilliseconds: 5000,
-  qualityConfirmPollMilliseconds: 100,
 });

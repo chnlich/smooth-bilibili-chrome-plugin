@@ -12,19 +12,6 @@ export function coreSupports(core, method) {
   return typeof core[method] === 'function';
 }
 
-function playerSupports(player, method) {
-  if (player === undefined || player === null) {
-    return false;
-  }
-  if (typeof player.supports === 'function') {
-    return player.supports(method) === true;
-  }
-  if (player.capabilities !== undefined && Object.prototype.hasOwnProperty.call(player.capabilities, method)) {
-    return player.capabilities[method] === true;
-  }
-  return typeof player[method] === 'function';
-}
-
 export class VodBufferPolicy {
   constructor(config = VOD_CONFIG) {
     this.config = config;
@@ -95,27 +82,6 @@ export class VodBufferPolicy {
   }
 }
 
-export async function callQualityMethod(player, core, qualityNumber) {
-  if (!Number.isInteger(qualityNumber) || qualityNumber <= 0) {
-    fail('VOD_QUALITY_ARGUMENT_INVALID', `qn${qualityNumber} 不是正整数清晰度`);
-  }
-  let method;
-  if (coreSupports(core, 'requestQuality')) {
-    method = 'core.requestQuality';
-  } else if (playerSupports(player, 'requestQuality')) {
-    method = 'player.requestQuality';
-  } else {
-    fail('VOD_QUALITY_UNAVAILABLE', `当前播放器没有权限感知的 qn${qualityNumber} 请求接口`);
-  }
-  const result = method === 'core.requestQuality'
-    ? await core.requestQuality(qualityNumber)
-    : await player.requestQuality(qualityNumber);
-  if (result === false) {
-    fail('VOD_QUALITY_REJECTED', `服务端或播放器拒绝 qn${qualityNumber}`);
-  }
-  return { method, qualityNumber };
-}
-
 function qualityNumberFromValue(value) {
   if (Number.isInteger(value) && value > 0) {
     return value;
@@ -161,17 +127,74 @@ function collectQualityNumbers(value, target) {
   }
 }
 
-export function readQualitySnapshot(core) {
-  let value;
-  let getter;
-  for (const name of ['getQuality', 'getCurrentQuality', 'getCurrentQn']) {
-    if (coreSupports(core, name)) {
-      getter = name;
-      value = core[name]();
-      break;
-    }
+export function readQualitySnapshot(player, core, options = {}) {
+  if (arguments.length === 1) {
+    core = player;
+    player = undefined;
   }
+  const logger = options.logger || { warn() {} };
+  const video = options.video;
+  const playerObservation = readQualitySource(player, '页面播放器', logger);
+  const coreObservation = readQualitySource(core, 'core', logger);
+  const selected = playerObservation.qn === undefined ? coreObservation : playerObservation;
+  const selectedSource = selected.qn === undefined ? '未知' : selected.source;
+  const availableQns = [...new Set([...playerObservation.availableQns, ...coreObservation.availableQns])];
+  return {
+    source: selectedSource,
+    getter: selected.getter,
+    raw: selected.raw,
+    qn: selected.qn,
+    actualQn: selected.qn,
+    availableQns,
+    width: qualityDimension(video?.videoWidth, selected.raw?.width ?? selected.raw?.videoWidth),
+    height: qualityDimension(video?.videoHeight, selected.raw?.height ?? selected.raw?.videoHeight),
+    capabilities: {
+      player: playerObservation.capabilities,
+      core: coreObservation.capabilities,
+    },
+  };
+}
+
+function qualityDimension(videoValue, qualityValue) {
+  const value = Number(videoValue ?? qualityValue);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function supportsQualityMethod(source, method, logger, sourceName) {
+  if (source === undefined || source === null) {
+    return false;
+  }
+  try {
+    if (typeof source.supports === 'function') {
+      return source.supports(method) === true;
+    }
+    if (source.capabilities !== undefined && Object.prototype.hasOwnProperty.call(source.capabilities, method)) {
+      return source.capabilities[method] === true;
+    }
+    return typeof source[method] === 'function';
+  } catch (error) {
+    logger.warn(`读取${sourceName}画质能力失败`, error);
+    return false;
+  }
+}
+
+function readQualityGetter(source, method, logger, sourceName) {
+  if (!supportsQualityMethod(source, method, logger, sourceName)) {
+    return { available: false, value: undefined };
+  }
+  try {
+    return { available: true, value: source[method]() };
+  } catch (error) {
+    logger.warn(`读取${sourceName}画质 getter ${method} 失败`, error);
+    return { available: true, value: undefined };
+  }
+}
+
+function readQualitySource(source, sourceName, logger) {
+  const quality = readQualityGetter(source, 'getQuality', logger, sourceName);
+  const supported = readQualityGetter(source, 'getSupportedQualityList', logger, sourceName);
   const availableQns = new Set();
+  const value = quality.value;
   if (value !== undefined && value !== null && typeof value === 'object') {
     for (const field of [
       'oldA',
@@ -193,17 +216,18 @@ export function readQualitySnapshot(core) {
       }
     }
   }
-  if (coreSupports(core, 'getSupportedQualityList')) {
-    collectQualityNumbers(core.getSupportedQualityList(), availableQns);
-  }
-  if (coreSupports(core, 'getQualityList')) {
-    collectQualityNumbers(core.getQualityList('video'), availableQns);
-  }
+  collectQualityNumbers(supported.value, availableQns);
+  const currentQn = actualQualityNumberFromValue(value);
   return {
-    getter,
+    source: sourceName,
+    getter: quality.available ? 'getQuality' : undefined,
     raw: value,
-    qn: actualQualityNumberFromValue(value),
+    qn: currentQn,
     availableQns: [...availableQns],
+    capabilities: {
+      getQuality: quality.available,
+      getSupportedQualityList: supported.available,
+    },
   };
 }
 

@@ -284,6 +284,7 @@ export class ExtensionCoordinator {
           beforeReconcile: () => pageAdapter.refreshCore(),
         });
         this.active.controller = controller;
+        panel.setSnapshotRefresh(() => controller.refreshQualityStatus());
         controller.start();
         if (!routeStillCurrent()) {
           controller.destroy();

@@ -76,7 +76,7 @@ const forbidden = [
   /window\.Hls\b/,
   /document\.cookie\b/,
   /\b(?:localStorage|sessionStorage|indexedDB|caches|sendBeacon)\b/,
-  /\b(?:setQuality|setQn|setVideoQuality)\b/,
+  /\b(?:requestQuality|setQuality|setQn|setVideoQuality)\b/,
   /(?:fetch|XMLHttpRequest|MediaSource|SourceBuffer)\.prototype/,
   /\*:\/\/\*\/\*/,
   /https?:\/\/[^\s"']+\.js(?:[?#]|$)/,
@@ -86,7 +86,6 @@ for (const pattern of forbidden) {
   assert.doesNotMatch(productOutput, pattern, `dist contains forbidden pattern ${pattern}`);
 }
 assert.match(controller, /credentials:\s*"omit"/);
-assert.match(controller, /requestQuality/);
 assert.match(controller, /realQ/);
 assert.match(controller, /GAP_MANIFEST_SEQUENCE_ROLLBACK/);
 assert.match(controller, /quotaFallbackSeconds/);
@@ -99,7 +98,6 @@ assert.doesNotMatch(controller, /\.(?:muted|volume)\s*=/);
 assert.equal(LIVE_CONFIG.recoveryWatermarkSeconds, 15);
 assert.equal(LIVE_CONFIG.aggressiveBufferSeconds, 60);
 assert.equal(LIVE_CONFIG.hideDanmakuAfterSeconds, 3);
-assert.equal(VOD_CONFIG.qualityNumber, 64);
 assert.equal(VOD_CONFIG.playbackRate, 2);
 assert.equal(VOD_CONFIG.stableBufferSeconds, 180);
 assert.equal(VOD_CONFIG.startupBufferSeconds, 120);

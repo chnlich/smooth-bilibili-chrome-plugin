@@ -53,6 +53,7 @@ export class StatusPanel {
     this.destroyed = false;
     this.boundTabId = undefined;
     this.freshnessCheck = () => true;
+    this.snapshotRefresh = () => {};
     for (const [name, action] of Object.entries(actions)) {
       this.setAction(name, action.label, action.callback, action.visible !== false);
     }
@@ -97,6 +98,16 @@ export class StatusPanel {
     this.freshnessCheck = callback;
   }
 
+  setSnapshotRefresh(callback) {
+    if (this.destroyed) {
+      fail('UI_SURFACE_DESTROYED', '状态 surface 已销毁');
+    }
+    if (typeof callback !== 'function') {
+      fail('UI_SNAPSHOT_REFRESH_INVALID', '状态 surface 缺少有效刷新回调');
+    }
+    this.snapshotRefresh = callback;
+  }
+
   assertFresh() {
     if (this.freshnessCheck() !== true) {
       fail('UI_SURFACE_STALE', '状态 surface 已不属于当前页面');
@@ -117,6 +128,8 @@ export class StatusPanel {
     if (this.destroyed) {
       fail('UI_SURFACE_DESTROYED', '状态 surface 已销毁');
     }
+    this.assertFresh();
+    this.snapshotRefresh();
     this.assertFresh();
     const actions = {};
     for (const [name, action] of this.actions) {

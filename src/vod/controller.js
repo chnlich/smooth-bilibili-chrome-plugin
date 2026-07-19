@@ -1,8 +1,8 @@
 import { VOD_CONFIG } from '../constants.js';
-import { BufferScriptError, fail, toBufferScriptError } from '../errors.js';
+import { fail, toBufferScriptError } from '../errors.js';
 import { readForwardInventory } from './buffer.js';
 import { calculateDownloadMultiplier } from './metrics.js';
-import { VodBufferPolicy, callQualityMethod, coreSupports, readMediaBitrate, readQualitySnapshot } from './policy.js';
+import { VodBufferPolicy, coreSupports, readMediaBitrate, readQualitySnapshot } from './policy.js';
 
 function createLogger() {
   return {
@@ -33,8 +33,8 @@ function isQuotaError(error) {
   return name === 'QuotaExceededError' || /quota|buffer.?full|mse/i.test(`${name} ${message}`);
 }
 
-function currentQualityNumber(core) {
-  return readQualitySnapshot(core).qn;
+function isStaleCoreError(error) {
+  return error?.code === 'BRIDGE_CORE_STALE' || /播放器内核 .*已过期|桥接内核 .*已过期/.test(error?.message || '');
 }
 
 function currentMediaSource(video) {
@@ -54,37 +54,8 @@ function logicalVideoSession(locationObject) {
   return `${pathMatch[1]}#p=${url.searchParams.get('p') || '1'}`;
 }
 
-function delay(milliseconds, runtimeObject) {
-  return new Promise((resolve) => runtimeObject.setTimeout(resolve, milliseconds));
-}
-
-async function withTimeout(promise, milliseconds, runtimeObject, message) {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = runtimeObject.setTimeout(
-          () => reject(new BufferScriptError('VOD_QUALITY_CONFIRM_TIMEOUT', message)),
-          milliseconds,
-        );
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) {
-      runtimeObject.clearTimeout(timer);
-    }
-  }
-}
-
 function errorFromCoreEvent(event) {
   return event?.error ?? event?.detail?.error ?? event?.detail ?? event;
-}
-
-const BANDWIDTH_INSUFFICIENT_MESSAGE = '下载不足以覆盖当前 2× 消耗，有限缓冲最终会耗尽';
-
-function qualityRequestKey({ requestToken, observationToken }) {
-  return `${requestToken}:${observationToken}`;
 }
 
 function activeSessionPerformance(performanceObject, startedAtMilliseconds) {
@@ -97,6 +68,37 @@ function activeSessionPerformance(performanceObject, startedAtMilliseconds) {
       return entries.filter((entry) => (entry.responseEnd || entry.startTime) >= startedAtMilliseconds);
     },
   };
+}
+
+const BANDWIDTH_INSUFFICIENT_MESSAGE = '下载不足以覆盖当前 2× 消耗，有限缓冲最终会耗尽';
+
+function qualitySourceLabel(source) {
+  if (source === '页面播放器') {
+    return '页面播放器';
+  }
+  if (source === 'core') {
+    return 'core';
+  }
+  return '未知';
+}
+
+function formatQualityEvidence(evidence) {
+  const actual = evidence.actualQn === undefined ? '当前画质未知' : `qn${evidence.actualQn}`;
+  const dimensions = evidence.width === undefined || evidence.height === undefined
+    ? 'videoWidth/videoHeight 未提供'
+    : `video ${evidence.width}×${evidence.height}`;
+  const playerCapabilities = evidence.capabilities.player;
+  const coreCapabilities = evidence.capabilities.core;
+  const capability = [
+    `页面 getQuality=${playerCapabilities.getQuality ? '可用' : '不可用'}`,
+    `页面 getSupportedQualityList=${playerCapabilities.getSupportedQualityList ? '可用' : '不可用'}`,
+    `core getQuality=${coreCapabilities.getQuality ? '可用' : '不可用'}`,
+    `core getSupportedQualityList=${coreCapabilities.getSupportedQualityList ? '可用' : '不可用'}`,
+  ].join('/');
+  const supported = evidence.availableQns.length === 0
+    ? '可用画质列表未提供'
+    : `可用 qn ${evidence.availableQns.join(',')}`;
+  return `${actual}；来源 ${qualitySourceLabel(evidence.source)}；${dimensions}；能力 ${capability}；${supported}`;
 }
 
 export class VodController {
@@ -124,24 +126,16 @@ export class VodController {
     this.currentCore;
     this.currentSrc = '';
     this.currentLocation = '';
-    this.currentQuality = '';
     this.currentSessionKey;
-    this.qualityRequestPromises = new Map();
-    this.qualitySettledCore;
-    this.qualitySettledSource = '';
-    this.qualitySettledSession = '';
-    this.qualitySessionToken = 0;
-    this.qualityObservationToken = 0;
-    this.qualityObserved = false;
-    this.qualityObservedQn;
-    this.qualityAttemptedForObservation = false;
-    this.qualityConfirmed = false;
     this.pollTimer;
     this.statusTimer;
     this.enabled = true;
     this.userPaused = false;
     this.scriptPaused = false;
     this.scriptPauseEvent = false;
+    this.scriptPauseEpoch;
+    this.userPauseGuard = false;
+    this.pendingPlayGuards = [];
     this.startupComplete = false;
     this.stableBufferSupported = true;
     this.pausedSchedulingSupported = true;
@@ -157,6 +151,18 @@ export class VodController {
     this.destroyed = false;
     this.boundEvents = [];
     this.removeCoreErrorListener;
+    this.seekEpoch = 0;
+    this.seekActive = false;
+    this.seekClassification = 'none';
+    this.seekWarmupActive = false;
+    this.seekWarmupComplete = false;
+    this.seekRefillDisabled = false;
+    this.seekPlaybackOwner = 'none';
+    this.seekResumePending = false;
+    this.seekTargetTime;
+    this.seekPauseSuppressed = false;
+    this.playbackAttemptToken = 0;
+    this.lastKnownPlaying = this.video.paused !== true;
   }
 
   start() {
@@ -186,35 +192,73 @@ export class VodController {
       this.setPlaybackRate();
     };
     const onPause = () => {
-      if (this.scriptPauseEvent) {
-        this.scriptPauseEvent = false;
+      const scriptPauseEpoch = this.scriptPauseEpoch;
+      this.scriptPauseEpoch = undefined;
+      this.scriptPauseEvent = false;
+      if (scriptPauseEpoch === this.seekEpoch) {
+        this.lastKnownPlaying = false;
         return;
       }
+      if (this.userPauseGuard) {
+        this.userPauseGuard = false;
+        this.lastKnownPlaying = false;
+        return;
+      }
+      if (this.seekPauseSuppressed) {
+        this.lastKnownPlaying = false;
+        return;
+      }
+      this.lastKnownPlaying = false;
       this.scriptPaused = false;
       this.userPaused = true;
+      this.seekResumePending = false;
+      this.playbackAttemptToken += 1;
     };
     const onPlay = () => {
+      this.lastKnownPlaying = true;
+      const guard = this.pendingPlayGuards.shift();
+      if (guard !== undefined) {
+        guard.playEventSeen = true;
+        if (guard.epoch !== this.seekEpoch || guard.token !== this.playbackAttemptToken) {
+          if (this.userPaused) {
+            this.enforceUserPause();
+          }
+          this.finalizePlayGuard(guard);
+          return;
+        }
+        this.finalizePlayGuard(guard);
+        return;
+      }
       if (!this.enabled) {
-        this.scriptPauseEvent = false;
         this.scriptPaused = false;
         this.userPaused = false;
         return;
       }
+      this.playbackAttemptToken += 1;
+      this.seekResumePending = false;
       this.userPaused = false;
-      if (this.scriptPaused && this.startupComplete && this.currentCore !== undefined) {
-        const inventory = readForwardInventory(this.video, this.currentCore);
-        const remaining = Number.isFinite(this.video.duration)
-          ? Math.max(0, this.video.duration - this.video.currentTime)
-          : Number.POSITIVE_INFINITY;
-        const target = Math.min(this.config.startupBufferSeconds, Math.max(0, remaining - 1));
-        if (remaining > 30 && this.pausedSchedulingSupported && inventory < target) {
-          this.pauseForRefill();
-        }
-      }
+      this.scriptPaused = false;
     };
+    const onSeeking = () => this.handleSeeking();
+    const onSeeked = () => this.handleSeeked();
     const onEnded = () => {
       this.ended = true;
+      this.seekEpoch += 1;
+      this.playbackAttemptToken += 1;
+      this.pendingPlayGuards = [];
+      this.scriptPauseEpoch = undefined;
+      this.scriptPauseEvent = false;
       this.scriptPaused = false;
+      this.seekActive = false;
+      this.seekClassification = 'none';
+      this.seekWarmupActive = false;
+      this.seekWarmupComplete = false;
+      this.seekRefillDisabled = false;
+      this.seekPlaybackOwner = 'none';
+      this.seekResumePending = false;
+      this.seekTargetTime = undefined;
+      this.seekPauseSuppressed = false;
+      this.lastKnownPlaying = false;
       this.updateStatus();
     };
     const onError = () => {
@@ -229,6 +273,8 @@ export class VodController {
     this.addVideoListener('ratechange', onRateChange);
     this.addVideoListener('pause', onPause);
     this.addVideoListener('play', onPlay);
+    this.addVideoListener('seeking', onSeeking);
+    this.addVideoListener('seeked', onSeeked);
     this.addVideoListener('ended', onEnded);
     this.addVideoListener('error', onError);
   }
@@ -238,12 +284,51 @@ export class VodController {
     this.boundEvents.push([name, callback]);
   }
 
-  pauseForRefill() {
-    if (this.video.paused) {
+  remainingDuration() {
+    return Number.isFinite(this.video.duration)
+      ? Math.max(0, this.video.duration - this.video.currentTime)
+      : Number.POSITIVE_INFINITY;
+  }
+
+  readInventory(core) {
+    try {
+      return readForwardInventory(this.video, core);
+    } catch (error) {
+      if (isStaleCoreError(error)) {
+        this.logger.warn('忽略已过期点播库存回调', error);
+        return 0;
+      }
+      this.logger.error('读取点播库存失败', error);
+      this.message = `库存不可用: ${error.message || error}`;
+      return 0;
+    }
+  }
+
+  enforceUserPause() {
+    if (!this.userPaused || this.video.paused || this.userPauseGuard) {
       return;
     }
-    this.scriptPauseEvent = true;
+    this.userPauseGuard = true;
+    this.video.pause();
+  }
+
+  pauseForRefill() {
+    if (
+      !this.enabled ||
+      this.destroyed ||
+      this.userPaused ||
+      this.ended ||
+      this.video.paused ||
+      !this.pausedSchedulingSupported ||
+      this.seekWarmupActive ||
+      this.seekRefillDisabled
+    ) {
+      return;
+    }
     this.scriptPaused = true;
+    this.scriptPauseEpoch = this.seekEpoch;
+    this.scriptPauseEvent = true;
+    this.lastKnownPlaying = false;
     this.video.pause();
   }
 
@@ -253,7 +338,7 @@ export class VodController {
       this.removeCoreErrorListener = undefined;
     }
     const onCoreError = (event) => {
-      if (!this.enabled || core !== this.currentCore) {
+      if (!this.enabled || core !== this.currentCore || this.destroyed) {
         return;
       }
       const error = errorFromCoreEvent(event);
@@ -297,58 +382,121 @@ export class VodController {
     this.coreEventsSupported = false;
   }
 
-  createQualityRequestIdentity(
-    core,
-    requestToken = this.qualitySessionToken,
-    observationToken = this.qualityObservationToken,
-  ) {
-    return {
-      core,
-      source: currentMediaSource(this.video),
-      session: logicalVideoSession(this.windowObject.location),
-      requestToken,
-      observationToken,
-      verifyCore: typeof this.windowObject.player?.__core === 'function',
-    };
+  updateSeekWarmup(inventory) {
+    if (!this.seekActive || this.seekClassification !== 'long' || this.seekWarmupComplete) {
+      return;
+    }
+    if (inventory < this.config.startupBufferSeconds) {
+      return;
+    }
+    this.seekWarmupComplete = true;
+    this.seekWarmupActive = false;
+    this.startupComplete = true;
   }
 
-  isQualityRequestCurrent({ core, source, session, requestToken, verifyCore }) {
+  handleSeeking() {
+    const previousUserPaused = this.userPaused;
+    const previousScriptPaused = this.scriptPaused && !previousUserPaused;
+    const previousPlaying = this.lastKnownPlaying || !this.video.paused;
+    const previousOwner = previousUserPaused
+      ? 'user-paused'
+      : previousScriptPaused
+        ? 'script-paused'
+        : previousPlaying
+          ? 'playing'
+          : 'paused';
+    this.seekEpoch += 1;
+    this.playbackAttemptToken += 1;
+    this.scriptPauseEpoch = undefined;
+    this.scriptPauseEvent = false;
+    this.userPauseGuard = false;
+    this.seekPauseSuppressed = true;
+    this.seekActive = true;
+    this.seekTargetTime = this.video.currentTime;
+    this.seekClassification = this.remainingDuration() <= this.config.startupBufferSeconds ? 'short' : 'long';
+    this.seekRefillDisabled = this.seekClassification === 'short';
+    this.seekWarmupComplete = this.seekClassification === 'short';
+    this.seekWarmupActive = this.seekClassification === 'long';
+    this.seekPlaybackOwner = previousOwner;
+    this.seekResumePending = previousOwner === 'playing' || previousOwner === 'script-paused';
+    this.userPaused = previousOwner === 'user-paused';
+    this.scriptPaused = previousOwner === 'script-paused';
+    this.startupComplete = this.seekClassification === 'short';
+    this.ended = false;
+    this.mediaMetricsBoundaryPending = true;
+    if (this.message === BANDWIDTH_INSUFFICIENT_MESSAGE) {
+      this.message = '';
+    }
+    if (this.enabled) {
+      this.setPlaybackRate();
+    }
+    this.updateStatus();
+  }
+
+  handleSeeked() {
+    if (this.destroyed || !this.enabled || !this.seekActive || this.video.seeking === true) {
+      return;
+    }
     if (
-      this.destroyed ||
-      !this.enabled ||
-      core?.stale === true ||
-      requestToken !== this.qualitySessionToken ||
-      source !== currentMediaSource(this.video) ||
-      session !== logicalVideoSession(this.windowObject.location)
+      this.currentCore === undefined ||
+      this.currentCore.stale === true ||
+      currentMediaSource(this.video) !== this.currentSrc
     ) {
-      return false;
+      this.seekPauseSuppressed = false;
+      if (this.started) {
+        void this.reconcile();
+      }
+      return;
     }
-    const readCore = this.windowObject.player?.__core;
-    return !verifyCore || (typeof readCore === 'function' && readCore() === core);
+    const epoch = this.seekEpoch;
+    this.seekPauseSuppressed = false;
+    const inventory = this.readInventory(this.currentCore);
+    if (epoch !== this.seekEpoch || this.destroyed || !this.enabled) {
+      return;
+    }
+    this.updateSeekWarmup(inventory);
+    this.setPlaybackRate();
+    if (!this.userPaused && this.seekResumePending) {
+      if (this.video.paused) {
+        this.attemptPlay(epoch);
+      } else {
+        this.seekResumePending = false;
+      }
+    }
+    if (this.currentCore !== undefined) {
+      this.enforceStartupAndRefill(this.currentCore, epoch);
+    }
+    this.updateStatus();
+    if (this.started) {
+      void this.reconcile();
+    }
   }
 
-  isQualityObservationCurrent(requestIdentity) {
-    return (
-      this.isQualityRequestCurrent(requestIdentity) &&
-      requestIdentity.observationToken === this.qualityObservationToken
-    );
+  invalidateSeekCallbacksForRebuild() {
+    this.seekEpoch += 1;
+    this.playbackAttemptToken += 1;
+    this.scriptPauseEpoch = undefined;
+    this.scriptPauseEvent = false;
+    this.userPauseGuard = false;
   }
 
-  observeQuality(qualityNumber) {
-    const changed = !this.qualityObserved || this.qualityObservedQn !== qualityNumber;
-    this.qualityObserved = true;
-    this.qualityObservedQn = qualityNumber;
-    if (changed) {
-      this.qualityObservationToken += 1;
-      this.qualityAttemptedForObservation = false;
-    }
-    return changed;
+  clearSeekState() {
+    this.seekActive = false;
+    this.seekClassification = 'none';
+    this.seekWarmupActive = false;
+    this.seekWarmupComplete = false;
+    this.seekRefillDisabled = false;
+    this.seekPlaybackOwner = 'none';
+    this.seekResumePending = false;
+    this.seekTargetTime = undefined;
+    this.seekPauseSuppressed = false;
   }
 
   async reconcile() {
     if (this.destroyed || !this.enabled) {
       return;
     }
+    let reconcileEpoch = this.seekEpoch;
     try {
       if (currentMediaSource(this.video) === '') {
         return;
@@ -357,7 +505,7 @@ export class VodController {
       if (preparation instanceof Promise) {
         await preparation;
       }
-      if (this.destroyed || !this.enabled) {
+      if (this.destroyed || !this.enabled || reconcileEpoch !== this.seekEpoch) {
         return;
       }
       const core = getCore(this.windowObject);
@@ -365,43 +513,44 @@ export class VodController {
       if (source === '') {
         return;
       }
-      this.setPlaybackRate();
       const location = this.windowObject.location?.href || '';
       const sessionKey = logicalVideoSession(this.windowObject.location);
-      const qualityNumber = currentQualityNumber(core);
-      const quality = qualityNumber === undefined ? '页面当前画质' : String(qualityNumber);
       const coreChanged = core !== this.currentCore;
       const sourceChanged = source !== this.currentSrc;
-      const sessionChanged =
-        coreChanged || sourceChanged || location !== this.currentLocation;
+      const sessionChanged = coreChanged || sourceChanged || location !== this.currentLocation;
       const logicalSessionChanged =
         this.currentSessionKey === undefined || sessionKey !== this.currentSessionKey;
       const rebuilt = sessionChanged;
-      this.currentQuality = quality;
-      this.currentSessionKey = sessionKey;
       if (rebuilt) {
+        this.invalidateSeekCallbacksForRebuild();
+        reconcileEpoch = this.seekEpoch;
         this.currentCore = core;
         this.currentSrc = source;
         this.currentLocation = location;
+        this.currentSessionKey = sessionKey;
         if (logicalSessionChanged) {
           this.bufferPolicy.resetForNewSession();
           this.startupComplete = false;
+          this.clearSeekState();
+          if (!this.userPaused) {
+            this.scriptPaused = false;
+          }
         }
         this.ended = false;
         if (coreChanged || sourceChanged) {
           this.replaceCoreErrorListener(core);
         }
         this.mediaMetricsBoundaryPending = true;
-        this.qualitySessionToken += 1;
-        this.qualityRequestPromises.clear();
-        this.qualityObserved = false;
-        this.qualityObservedQn = undefined;
-        this.qualityAttemptedForObservation = false;
-        this.qualityConfirmed = false;
-        this.qualitySettledCore = undefined;
-        this.qualitySettledSource = '';
-        this.qualitySettledSession = '';
+      } else {
+        this.currentSessionKey = sessionKey;
       }
+      this.setPlaybackRate();
+      this.ensurePlayback(reconcileEpoch);
+      const evidence = readQualitySnapshot(this.windowObject.player, core, {
+        logger: this.logger,
+        video: this.video,
+      });
+      this.qualityStatus = formatQualityEvidence(evidence);
       const policyResult = this.bufferPolicy.apply(core);
       this.stableBufferSupported = policyResult.stableBufferSupported;
       this.pausedSchedulingSupported = policyResult.pausedSchedulingSupported;
@@ -410,18 +559,16 @@ export class VodController {
         policyWarnings.push('当前内核没有错误事件能力，quota 仅依赖 video error');
       }
       this.policyMessage = policyWarnings.join('；');
-      const requestIdentity = this.createQualityRequestIdentity(core);
-      await this.reconcileQuality(core, qualityNumber, requestIdentity);
-      if (!this.isQualityObservationCurrent(requestIdentity)) {
+      if (this.destroyed || !this.enabled || reconcileEpoch !== this.seekEpoch) {
         return;
       }
-      if (rebuilt) {
+      if (rebuilt && logicalSessionChanged && this.message.length > 0) {
         this.message = '';
       }
       this.detectExternalBufferDowngrade(core);
-      this.enforceStartupAndRefill(core);
+      this.enforceStartupAndRefill(core, reconcileEpoch);
     } catch (error) {
-      if (this.destroyed || !this.enabled) {
+      if (this.destroyed || !this.enabled || reconcileEpoch !== this.seekEpoch) {
         return;
       }
       const normalized = toBufferScriptError(error, 'VOD_RECONCILE_FAILED', '点播策略施加失败');
@@ -431,202 +578,26 @@ export class VodController {
     this.updateStatus();
   }
 
-  async reconcileQuality(core, qualityNumber, requestIdentity = this.createQualityRequestIdentity(core)) {
-    if (!this.isQualityRequestCurrent(requestIdentity)) {
+  enforceStartupAndRefill(core, epoch = this.seekEpoch) {
+    if (this.destroyed || !this.enabled || epoch !== this.seekEpoch) {
       return;
     }
-    const observationChanged = this.observeQuality(qualityNumber);
-    requestIdentity.observationToken = this.qualityObservationToken;
-    if (qualityNumber === this.config.qualityNumber) {
-      this.qualityConfirmed = true;
-      this.qualityAttemptedForObservation = false;
-      this.qualityStatus = `720P/qn${this.config.qualityNumber} 已生效`;
-      return;
-    }
-    this.qualityConfirmed = false;
-    if (!observationChanged && this.qualityAttemptedForObservation) {
-      return;
-    }
-    this.qualityAttemptedForObservation = true;
-    const actual = qualityNumber === undefined ? '未知' : `qn${qualityNumber}`;
-    this.qualityStatus = `正在请求 720P/qn${this.config.qualityNumber}（检测到实际画质 ${actual}）`;
-    await this.requestQuality(core, { force: true, requestIdentity });
-    if (!this.isQualityObservationCurrent(requestIdentity)) {
-      return;
-    }
-    const after = currentQualityNumber(core);
-    this.observeQuality(after);
-    requestIdentity.observationToken = this.qualityObservationToken;
-    if (after === this.config.qualityNumber) {
-      this.qualityConfirmed = true;
-      this.qualityAttemptedForObservation = false;
-      this.qualityStatus = `720P/qn${this.config.qualityNumber} 已生效`;
-    } else {
-      this.qualityConfirmed = false;
-    }
-  }
-
-  async requestQuality(core, { force = false, requestIdentity = this.createQualityRequestIdentity(core) } = {}) {
-    if (!this.isQualityObservationCurrent(requestIdentity)) {
-      return;
-    }
-    const { session, source } = requestIdentity;
-    if (
-      !force &&
-      this.isQualityRequestCurrent(requestIdentity) &&
-      this.qualitySettledCore === core &&
-      this.qualitySettledSource === source &&
-      this.qualitySettledSession === session
-    ) {
-      return;
-    }
-    const requestKey = qualityRequestKey(requestIdentity);
-    const pending = this.qualityRequestPromises.get(requestKey);
-    if (pending !== undefined) {
-      return pending;
-    }
-    let requestPromise;
-    requestPromise = this.performQualityRequest(core, requestIdentity).finally(() => {
-      if (this.isQualityObservationCurrent(requestIdentity)) {
-        this.qualitySettledCore = core;
-        this.qualitySettledSource = source;
-        this.qualitySettledSession = session;
-      }
-      if (this.qualityRequestPromises.get(requestKey) === requestPromise) {
-        this.qualityRequestPromises.delete(requestKey);
-      }
-    });
-    this.qualityRequestPromises.set(requestKey, requestPromise);
-    return requestPromise;
-  }
-
-  async performQualityRequest(core, requestIdentity = this.createQualityRequestIdentity(core)) {
-    if (!this.isQualityObservationCurrent(requestIdentity)) {
-      return;
-    }
-    const before = readQualitySnapshot(core);
-    try {
-      if (before.qn === this.config.qualityNumber) {
-        if (this.isQualityObservationCurrent(requestIdentity)) {
-          this.qualityStatus = `720P/qn${this.config.qualityNumber} 已生效`;
-        }
-        return;
-      }
-      if (before.availableQns.length > 0 && !before.availableQns.includes(this.config.qualityNumber)) {
-        fail(
-          'VOD_QUALITY_UNAVAILABLE',
-          `当前播放器可用清晰度不包含 qn${this.config.qualityNumber}`,
-        );
-      }
-      const request = callQualityMethod(this.windowObject.player, core, this.config.qualityNumber);
-      await withTimeout(
-        request,
-        this.config.qualityConfirmTimeoutMilliseconds,
-        this.runtimeObject,
-        `qn${this.config.qualityNumber} 请求未在限定时间内完成`,
-      );
-      if (!this.isQualityObservationCurrent(requestIdentity)) {
-        return;
-      }
-      const confirmed = await this.waitForQualityConfirmation(core, this.config.qualityNumber, requestIdentity);
-      if (!confirmed || !this.isQualityObservationCurrent(requestIdentity)) {
-        return;
-      }
-      this.qualityStatus = `720P/qn${this.config.qualityNumber} 已生效`;
-    } catch (error) {
-      const normalized = toBufferScriptError(error, 'VOD_QUALITY_UNAVAILABLE', '720P 不可用');
-      if (!this.isQualityObservationCurrent(requestIdentity)) {
-        this.logger.warn('忽略过期的点播 qn64 请求结果', normalized);
-        return;
-      }
-      const after = readQualitySnapshot(core);
-      if (before.qn === undefined) {
-        const actual = after.qn === undefined ? '未知' : `qn${after.qn}`;
-        this.qualityStatus =
-          `720P/qn${this.config.qualityNumber} 未生效，当前实际画质 ${actual}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
-      } else if (after.qn === before.qn) {
-        this.qualityStatus =
-          `720P/qn${this.config.qualityNumber} 未生效，保持原画质 qn${before.qn}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
-      } else {
-        const restored = await this.restoreQuality(core, before.qn, requestIdentity);
-        if (!this.isQualityObservationCurrent(requestIdentity)) {
-          return;
-        }
-        const current = readQualitySnapshot(core).qn;
-        if (restored) {
-          this.qualityStatus =
-            `720P/qn${this.config.qualityNumber} 未生效，已恢复原画质 qn${before.qn}（${normalized.message}）`;
-        } else {
-          const actual = current === undefined ? '未知' : `qn${current}`;
-          this.qualityStatus =
-            `720P/qn${this.config.qualityNumber} 未生效，恢复原画质失败，当前实际画质 ${actual}（${normalized.message}）。请在 Bilibili 播放器手动选择 720P`;
-        }
-      }
-      this.logger.warn('点播 qn64 未确认', normalized);
-    }
-  }
-
-  async waitForQualityConfirmation(core, qualityNumber, requestIdentity = this.createQualityRequestIdentity(core)) {
-    const deadline = Date.now() + this.config.qualityConfirmTimeoutMilliseconds;
-    while (Date.now() <= deadline) {
-      if (!this.isQualityObservationCurrent(requestIdentity)) {
-        return false;
-      }
-      if (readQualitySnapshot(core).qn === qualityNumber) {
-        return true;
-      }
-      await delay(this.config.qualityConfirmPollMilliseconds, this.runtimeObject);
-    }
-    fail('VOD_QUALITY_CONFIRM_TIMEOUT', `qn${qualityNumber} 请求完成但真实画质未确认`);
-  }
-
-  async restoreQuality(core, qualityNumber, requestIdentity = this.createQualityRequestIdentity(core)) {
-    if (!this.isQualityObservationCurrent(requestIdentity)) {
-      return false;
-    }
-    try {
-      const request = callQualityMethod(this.windowObject.player, core, qualityNumber);
-      await withTimeout(
-        request,
-        this.config.qualityConfirmTimeoutMilliseconds,
-        this.runtimeObject,
-        `原画质 qn${qualityNumber} 恢复超时`,
-      );
-      if (!this.isQualityObservationCurrent(requestIdentity)) {
-        return false;
-      }
-      return this.waitForQualityConfirmation(core, qualityNumber, requestIdentity);
-    } catch (error) {
-      this.logger.error(`原画质 qn${qualityNumber} 恢复失败`, error);
-      return false;
-    }
-  }
-
-  setPlaybackRate() {
-    if (!this.enabled) {
-      return;
-    }
-    this.internalRateChange = true;
-    this.video.playbackRate = this.config.playbackRate;
-    this.internalRateChange = false;
-  }
-
-  enforceStartupAndRefill(core) {
-    if (!this.enabled) {
-      return;
-    }
-    const inventory = readForwardInventory(this.video, core);
-    const remaining = Number.isFinite(this.video.duration)
-      ? Math.max(0, this.video.duration - this.video.currentTime)
-      : Number.POSITIVE_INFINITY;
+    const inventory = this.readInventory(core);
+    const remaining = this.remainingDuration();
     const initialFillTarget = Math.min(this.config.startupBufferSeconds, remaining);
     const refillResumeTarget = Math.min(this.config.startupBufferSeconds, Math.max(0, remaining - 1));
     if (this.userPaused) {
       return;
     }
+    if (this.seekActive) {
+      this.updateSeekWarmup(inventory);
+      if (this.seekWarmupActive || this.seekRefillDisabled) {
+        return;
+      }
+    }
     if (remaining <= 30) {
       if (this.scriptPaused) {
-        this.attemptPlay();
+        this.attemptPlay(epoch);
       }
       return;
     }
@@ -638,7 +609,7 @@ export class VodController {
     }
     if (this.scriptPaused) {
       if (inventory >= refillResumeTarget) {
-        this.attemptPlay();
+        this.attemptPlay(epoch);
       }
       return;
     }
@@ -649,45 +620,143 @@ export class VodController {
     }
   }
 
-  attemptPlay() {
-    if (!this.enabled || this.userPaused || !this.video.paused) {
+  setPlaybackRate() {
+    if (!this.enabled || this.destroyed) {
       return;
     }
-    Promise.resolve(this.video.play())
+    this.internalRateChange = true;
+    try {
+      this.video.playbackRate = this.config.playbackRate;
+    } finally {
+      this.internalRateChange = false;
+    }
+  }
+
+  ensurePlayback(epoch = this.seekEpoch) {
+    if (
+      !this.enabled ||
+      this.destroyed ||
+      this.userPaused ||
+      this.scriptPaused ||
+      this.ended ||
+      epoch !== this.seekEpoch ||
+      !this.video.paused
+    ) {
+      return;
+    }
+    this.attemptPlay(epoch);
+  }
+
+  removePendingPlayGuard(guard) {
+    const index = this.pendingPlayGuards.indexOf(guard);
+    if (index >= 0) {
+      this.pendingPlayGuards.splice(index, 1);
+    }
+  }
+
+  finalizePlayGuard(guard) {
+    if (guard.promiseSettled && guard.playEventSeen) {
+      this.removePendingPlayGuard(guard);
+    }
+  }
+
+  attemptPlay(epoch = this.seekEpoch) {
+    if (
+      !this.enabled ||
+      this.destroyed ||
+      this.userPaused ||
+      this.ended ||
+      epoch !== this.seekEpoch ||
+      !this.video.paused
+    ) {
+      return;
+    }
+    if (this.pendingPlayGuards.length > 0) {
+      return;
+    }
+    const token = this.playbackAttemptToken + 1;
+    this.playbackAttemptToken = token;
+    const guard = {
+      epoch,
+      token,
+      releasesScriptPause: this.scriptPaused,
+      promiseSettled: false,
+      playEventSeen: false,
+    };
+    this.pendingPlayGuards.push(guard);
+    let playPromise;
+    try {
+      playPromise = this.video.play();
+    } catch (error) {
+      playPromise = Promise.reject(error);
+    }
+    Promise.resolve(playPromise)
       .then(() => {
-        if (this.enabled && !this.userPaused) {
-          this.scriptPaused = false;
-        }
-      })
-      .catch((error) => {
-        if (!this.enabled) {
+        guard.promiseSettled = true;
+        if (
+          this.destroyed ||
+          !this.enabled ||
+          this.userPaused ||
+          this.ended ||
+          epoch !== this.seekEpoch ||
+          token !== this.playbackAttemptToken
+        ) {
+          if (this.userPaused) {
+            this.enforceUserPause();
+          }
+          this.finalizePlayGuard(guard);
           return;
         }
-        this.scriptPaused = true;
-        this.logger.error('点播补水完成后自动播放被拒绝', error);
+        if (guard.releasesScriptPause) {
+          this.scriptPaused = false;
+        }
+        this.seekResumePending = false;
+        this.setPlaybackRate();
+        this.finalizePlayGuard(guard);
+      })
+      .catch((error) => {
+        this.removePendingPlayGuard(guard);
+        if (
+          this.destroyed ||
+          !this.enabled ||
+          this.userPaused ||
+          this.ended ||
+          epoch !== this.seekEpoch ||
+          token !== this.playbackAttemptToken
+        ) {
+          return;
+        }
+        if (guard.releasesScriptPause) {
+          this.scriptPaused = true;
+        }
+        this.logger.error('点播自动播放被拒绝', error);
         this.message = `浏览器未允许自动播放: ${error.message || error}`;
       });
   }
 
   detectExternalBufferDowngrade(core) {
-    if (!this.enabled) {
+    if (!this.enabled || this.destroyed) {
       return;
     }
     for (const getter of ['getStableBufferTime', 'getStableBufferSeconds']) {
       if (!coreSupports(core, getter)) {
         continue;
       }
-      const target = Number(core[getter]());
-      if (Number.isFinite(target) && target < this.bufferPolicy.targetSeconds) {
-        this.bufferPolicy.targetSeconds = target;
-        this.message = `内核主动将稳定缓冲降为 ${target} 秒，脚本不循环强设 180 秒`;
-        this.logger.warn(this.message);
+      try {
+        const target = Number(core[getter]());
+        if (Number.isFinite(target) && target < this.bufferPolicy.targetSeconds) {
+          this.bufferPolicy.targetSeconds = target;
+          this.message = `内核主动将稳定缓冲降为 ${target} 秒，脚本不循环强设更大缓冲`;
+          this.logger.warn(this.message);
+        }
+      } catch (error) {
+        this.logger.warn(`读取点播 ${getter} 失败`, error);
       }
     }
   }
 
   handleQuotaError(error) {
-    if (!this.enabled) {
+    if (!this.enabled || this.destroyed) {
       return;
     }
     if (this.currentCore === undefined) {
@@ -705,6 +774,23 @@ export class VodController {
     }
   }
 
+  refreshQualityStatus() {
+    if (this.destroyed || !this.enabled || this.currentCore === undefined) {
+      return;
+    }
+    try {
+      const evidence = readQualitySnapshot(this.windowObject.player, this.currentCore, {
+        logger: this.logger,
+        video: this.video,
+      });
+      this.qualityStatus = formatQualityEvidence(evidence);
+      this.panel.setModel({ quality: this.qualityStatus });
+    } catch (error) {
+      this.logger.error('刷新点播画质诊断失败', error);
+      this.message = `画质诊断不可用: ${error.message || error}`;
+    }
+  }
+
   updateStatus() {
     if (this.destroyed || !this.started) {
       return;
@@ -715,6 +801,7 @@ export class VodController {
       this.panel.setAction('return-live', '', () => {}, false);
       return;
     }
+    this.refreshQualityStatus();
     let inventory = 0;
     let metrics = {};
     if (this.currentCore !== undefined) {
@@ -733,8 +820,12 @@ export class VodController {
           this.config.playbackRate,
         );
       } catch (error) {
-        this.logger.error('读取点播缓冲或下载指标失败', error);
-        this.message = `指标不可用: ${error.message || error}`;
+        if (isStaleCoreError(error)) {
+          this.logger.warn('忽略已过期点播缓冲指标回调', error);
+        } else {
+          this.logger.error('读取点播缓冲或下载指标失败', error);
+          this.message = `指标不可用: ${error.message || error}`;
+        }
       }
     }
     const thirty = metrics[30]?.multiplier;
@@ -767,17 +858,10 @@ export class VodController {
 
   toggleEnabled() {
     this.enabled = !this.enabled;
+    this.invalidateSeekCallbacksForRebuild();
     if (!this.enabled) {
-      this.qualitySessionToken += 1;
-      this.qualityObservationToken += 1;
-      this.qualityRequestPromises.clear();
-      this.qualityObserved = false;
-      this.qualityObservedQn = undefined;
-      this.qualityAttemptedForObservation = false;
-      this.qualityConfirmed = false;
-      this.qualitySettledCore = undefined;
-      this.qualitySettledSource = '';
-      this.qualitySettledSession = '';
+      this.scriptPaused = false;
+      this.seekResumePending = false;
     } else {
       void this.reconcile();
     }
@@ -790,7 +874,8 @@ export class VodController {
     }
     this.destroyed = true;
     this.enabled = false;
-    this.qualitySessionToken += 1;
+    this.invalidateSeekCallbacksForRebuild();
+    this.clearSeekState();
     this.started = false;
     if (this.pollTimer !== undefined) {
       this.runtimeObject.clearInterval(this.pollTimer);

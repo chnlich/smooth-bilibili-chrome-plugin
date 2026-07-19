@@ -18,7 +18,6 @@ const CORE_SNAPSHOT_FIELDS = Object.freeze([
   'source',
   'quality',
   'supportedQualityList',
-  'qualityList',
   'bufferedRanges',
   'mediaInfo',
   'stableBufferTime',
@@ -97,11 +96,7 @@ function validateCoreSnapshot(snapshot) {
   }
   for (const field of [
     'getQuality',
-    'getCurrentQuality',
-    'getCurrentQn',
     'getSupportedQualityList',
-    'getQualityList',
-    'requestQuality',
     'getBufferedRanges',
     'getMediaInfo',
     'getCurrentMediaInfo',
@@ -442,21 +437,17 @@ export class BridgeCore {
       }
     }
     if (unavailable !== undefined) {
-      return this.snapshot[snapshotField];
+      return undefined;
     }
     return undefined;
   }
 
   getQuality() {
-    return this.readFirstAvailable(['getQuality', 'getCurrentQuality', 'getCurrentQn'], 'quality');
+    return this.readFirstAvailable(['getQuality'], 'quality');
   }
 
   getSupportedQualityList() {
     return this.readFirstAvailable(['getSupportedQualityList'], 'supportedQualityList');
-  }
-
-  getQualityList(...args) {
-    return this.readFirstAvailable(['getQualityList'], 'qualityList', args);
   }
 
   getBufferedRanges() {
@@ -502,36 +493,6 @@ export class BridgeCore {
     } catch (error) {
       remapUnavailable(error, 'VOD_PAUSED_SCHEDULE_UNAVAILABLE', '点播内核没有暂停时继续调度能力');
     }
-  }
-
-  requestQuality(qualityNumber) {
-    this.assertActive();
-    if (!this.supports('requestQuality')) {
-      fail('VOD_QUALITY_UNAVAILABLE', '当前播放器内核没有权限感知的画质请求能力');
-    }
-    const source = this.snapshot.source;
-    return this.client
-      .callAsync('callCoreAsync', [this.coreId, 'requestQuality', [qualityNumber]])
-      .then((value) => {
-        if (value?.snapshot !== undefined) {
-          validateCoreSnapshot(value.snapshot);
-          if (value.snapshot.coreId !== this.coreId || value.snapshot.source !== source || this.stale) {
-            this.markStale();
-            fail('BRIDGE_CORE_STALE', `桥接内核 ${this.coreId} 的异步画质请求已过期`);
-          }
-          this.update(value.snapshot);
-        }
-        return value?.result === undefined ? value : value.result;
-      })
-      .catch((error) => {
-        if (error?.code === 'BRIDGE_METHOD_UNAVAILABLE') {
-          fail('VOD_QUALITY_UNAVAILABLE', '当前播放器内核没有权限感知的画质请求能力', error);
-        }
-        if (error?.code === 'BRIDGE_CORE_STALE') {
-          this.markStale();
-        }
-        throw error;
-      });
   }
 
   addEventListener(name, callback) {
@@ -580,12 +541,11 @@ export function createPageWindowAdapter(client, windowObject = window) {
     pause() {
       return client.callAsync('callPlayer', ['pause']);
     },
-    requestQuality(qualityNumber) {
-      if (!Number.isInteger(qualityNumber) || qualityNumber <= 0) {
-        fail('VOD_QUALITY_ARGUMENT_INVALID', '页面播放器画质请求必须是正整数');
-      }
-      return client.callAsync('callPlayer', ['requestQuality', qualityNumber]).then((value) =>
-        value?.result === undefined ? value : value.result);
+    getQuality() {
+      return client.callSync('callPlayerSync', ['getQuality', []]);
+    },
+    getSupportedQualityList() {
+      return client.callSync('callPlayerSync', ['getSupportedQualityList', []]);
     },
     supports(method) {
       if (!BRIDGE_PLAYER_CAPABILITIES.includes(method)) {
