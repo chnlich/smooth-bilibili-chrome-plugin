@@ -184,6 +184,7 @@
   // src/diagnostics/privacy.js
   var UNKNOWN_VALUE = "未提供";
   var RESOURCE_FIELDS = Object.freeze([...allowedDataFields("resource.observed")]);
+  var MEDIA_RESOURCE_INITIATOR_TYPES = /* @__PURE__ */ new Set(["audio", "video"]);
   function finiteOrUnknown(value) {
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }
@@ -364,13 +365,17 @@
     if (entry === null || typeof entry !== "object") {
       throw new Error("PerformanceResourceTiming 条目无效");
     }
+    const initiatorType = entry.initiatorType;
     const fields = {};
-    for (const field of RESOURCE_FIELDS) fields[field] = entry[field];
+    for (const field of RESOURCE_FIELDS) {
+      if (field === "name" && !MEDIA_RESOURCE_INITIATOR_TYPES.has(initiatorType)) continue;
+      fields[field] = field === "initiatorType" ? initiatorType : entry[field];
+    }
     return fields;
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-888cd5d967e07b796404e055" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-1de6642f571f59083be45211" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }

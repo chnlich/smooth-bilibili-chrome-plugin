@@ -866,3 +866,90 @@ test('resource timing observer snapshots prototype fields before privacy filteri
   client.destroy();
   assert.ok(timers.some((timer) => timer.milliseconds === 30000));
 });
+
+test('resource timing omits non-media and unknown resource names while retaining metrics', async () => {
+  const sent = [];
+  let resourceObserverCallback;
+  class FakePerformanceObserver {
+    constructor(callback) {
+      resourceObserverCallback = callback;
+    }
+
+    observe() {}
+
+    disconnect() {}
+  }
+  const locationObject = {
+    origin: 'https://www.bilibili.com',
+    hostname: 'www.bilibili.com',
+    pathname: '/video/BVresource-privacy',
+  };
+  const client = new DiagnosticsClient({
+    documentObject: { defaultView: { addEventListener() {} } },
+    windowObject: {
+      location: locationObject,
+      PerformanceObserver: FakePerformanceObserver,
+      setTimeout() { return 1; },
+      clearTimeout() {},
+    },
+    runtimeObject: {
+      sendMessage(message, callback) {
+        sent.push(message);
+        callback({ ok: true, status: 'PERSISTED', eventCount: message.events.length });
+      },
+    },
+    locationObject,
+    loggerObject: { log() {}, warn() {}, error() {} },
+  });
+  const scriptEntry = Object.create({
+    get name() { return 'https://api.bilibili.com/account/private?token=secret#fragment'; },
+    get initiatorType() { return 'script'; },
+    get startTime() { return 0; },
+    get duration() { return 1; },
+    get responseStart() { return 0; },
+    get responseEnd() { return 2; },
+    get transferSize() { return 0; },
+    get encodedBodySize() { return 3; },
+    get decodedBodySize() { return 0; },
+  });
+  const unknownEntry = Object.create({
+    get name() { return 'https://api.bilibili.com/x/web-interface/nav?cookie=secret#fragment'; },
+    get initiatorType() { return 'other'; },
+    get startTime() { return 4; },
+    get duration() { return 0; },
+    get responseStart() { return 5; },
+    get responseEnd() { return 6; },
+    get transferSize() { return 7; },
+    get encodedBodySize() { return 0; },
+    get decodedBodySize() { return 8; },
+  });
+  resourceObserverCallback({ getEntries() { return [scriptEntry, unknownEntry]; } });
+  await client.flush();
+  const resourceEvents = sent.flatMap((message) => message.events)
+    .filter((event) => event.code === 'resource.observed');
+  assert.deepEqual(resourceEvents.map((event) => event.data), [
+    {
+      initiatorType: 'script',
+      startTime: { value: 0, reportedBy: 'browser' },
+      duration: 1,
+      responseStart: { value: 0, reportedBy: 'browser' },
+      responseEnd: 2,
+      transferSize: { value: 0, reportedBy: 'browser' },
+      encodedBodySize: 3,
+      decodedBodySize: { value: 0, reportedBy: 'browser' },
+    },
+    {
+      initiatorType: 'other',
+      startTime: 4,
+      duration: { value: 0, reportedBy: 'browser' },
+      responseStart: 5,
+      responseEnd: 6,
+      transferSize: 7,
+      encodedBodySize: { value: 0, reportedBy: 'browser' },
+      decodedBodySize: 8,
+    },
+  ]);
+  assert.equal(JSON.stringify(resourceEvents).includes('account'), false);
+  assert.equal(JSON.stringify(resourceEvents).includes('cookie'), false);
+  client.destroy();
+});
