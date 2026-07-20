@@ -22,9 +22,29 @@ async function readTree(directory) {
   return content;
 }
 
+async function readJavaScriptFiles(directory, prefix = '') {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const entryPath = path.join(directory, entry.name);
+    const relativePath = path.join(prefix, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await readJavaScriptFiles(entryPath, relativePath));
+    } else if (entry.name.endsWith('.js')) {
+      files.push({
+        relativePath: relativePath.replaceAll(path.sep, '/'),
+        content: await fs.readFile(entryPath, 'utf8'),
+      });
+    }
+  }
+  return files;
+}
+
 const source = await readTree(path.join(root, 'src'));
+const sourceFiles = await readJavaScriptFiles(path.join(root, 'src'));
 const controller = await fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8');
 const bridge = await fs.readFile(path.join(extensionDirectory, 'main-bridge.js'), 'utf8');
+const popup = await fs.readFile(path.join(extensionDirectory, 'popup.js'), 'utf8');
 const worker = await fs.readFile(path.join(extensionDirectory, 'worker.js'), 'utf8');
 const logs = await fs.readFile(path.join(extensionDirectory, 'logs.js'), 'utf8');
 const vodSource = await fs.readFile(path.join(root, 'src/vod/controller.js'), 'utf8');
@@ -97,6 +117,26 @@ for (const oldModule of ['api', 'controller', 'danmaku', 'fetcher', 'guard', 'hl
 }
 assert.doesNotMatch(bridge, /chrome\./);
 assert.doesNotMatch(bridge, /\b(?:fetch|MediaSource|SourceBuffer)\b/);
+const indexedDbReference = /\bindexedDB\b|['"]indexedDB['"]/;
+const indexedDbSourceAllowlist = new Set([
+  'diagnostics/idb.js',
+  'diagnostics/worker.js',
+  'diagnostics/logs.js',
+]);
+for (const { relativePath, content } of sourceFiles) {
+  if (!indexedDbSourceAllowlist.has(relativePath)) {
+    assert.doesNotMatch(content, indexedDbReference, `${relativePath} 不得直接使用 IndexedDB`);
+  }
+}
+assert.match(await fs.readFile(path.join(root, 'src/diagnostics/idb.js'), 'utf8'), indexedDbReference);
+assert.match(worker, indexedDbReference);
+for (const [bundleName, bundle] of Object.entries({
+  'main bridge': bridge,
+  controller,
+  popup,
+})) {
+  assert.doesNotMatch(bundle, indexedDbReference, `${bundleName} bundle 不得使用 IndexedDB`);
+}
 assert.doesNotMatch(liveSource, /\b(?:play|pause)\s*\(/);
 assert.doesNotMatch(liveSource, /playbackRate\s*=/);
 assert.doesNotMatch(liveSource, /(?:\.src|\.currentSrc|\.muted|\.volume)\s*=/);
