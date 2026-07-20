@@ -395,7 +395,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-3e157e08141e57a474385997" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-681c2b0de2cfc8ce40af4197" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1166,7 +1166,7 @@
   }
   var SEEK_KEYS = /* @__PURE__ */ new Set(["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"]);
   var CONTROL_EXCLUSIONS = /volume|音量|quality|画质|speed|倍速|rate|播放速度|chat|comment|弹幕/i;
-  var TIMELINE_MARKERS = /seek|timeline|progress|time|position|进度|时间轴|时间/i;
+  var TIMELINE_MARKERS = /seek|timeline|progress|position|进度|时间轴/i;
   function eventPath(event) {
     if (typeof event?.composedPath === "function") return event.composedPath();
     const path = [];
@@ -1185,7 +1185,7 @@
     if (element === void 0 || element === null || typeof element !== "object") return false;
     const text = elementText(element);
     const explicit = ["data-seek", "data-timeline", "data-progress"].some((attribute) => typeof element.getAttribute === "function" && element.getAttribute(attribute) !== null);
-    if (CONTROL_EXCLUSIONS.test(text) && !explicit) return false;
+    if (CONTROL_EXCLUSIONS.test(text)) return false;
     if (explicit) return true;
     const tagName = String(element.tagName || "").toLowerCase();
     const inputType = String(element.type || element.getAttribute?.("type") || "").toLowerCase();

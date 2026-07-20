@@ -51,6 +51,33 @@ async function readAllEvents(indexedDb, maxEventId) {
   }, indexedDb);
 }
 
+test('append acknowledgement stays pending until the IndexedDB transaction commits', async () => {
+  const indexedDb = new FakeIndexedDB();
+  const identity = session('session-idb-commit');
+  const releaseCommit = indexedDb.database.holdNextCommit();
+  let settled = false;
+  const pending = appendBatch(message(identity, [event(identity.sessionId, 1)]), sender(1), indexedDb)
+    .then((result) => {
+      settled = true;
+      return result;
+    });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.deepEqual(
+    await readLogs({ type: 'logs:max-event-id', version: 1 }, indexedDb),
+    { maxEventId: 0 },
+  );
+
+  releaseCommit();
+  const persisted = await pending;
+  assert.equal(persisted.status, 'PERSISTED');
+  assert.deepEqual(
+    await readLogs({ type: 'logs:max-event-id', version: 1 }, indexedDb),
+    { maxEventId: 1 },
+  );
+});
+
 test('realistic IDB transaction semantics preserve append-only isolation and restart-readable data', async () => {
   const indexedDb = new FakeIndexedDB();
   const firstSession = session('session-idb-first');

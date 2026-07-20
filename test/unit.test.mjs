@@ -856,7 +856,17 @@ test('only timeline intent and seek keys authorize user control; video, quality,
   assertAutomaticCorrection({
     type: 'pointerdown',
     isTrusted: true,
+    target: timelineControl({ id: 'volume-progress', 'aria-label': 'volume', 'data-progress': '' }),
+  });
+  assertAutomaticCorrection({
+    type: 'pointerdown',
+    isTrusted: true,
     target: timelineControl({ id: 'quality', 'aria-label': 'quality' }),
+  });
+  assertAutomaticCorrection({
+    type: 'pointerdown',
+    isTrusted: true,
+    target: timelineControl({ id: 'time-display' }),
   });
   assertAutomaticCorrection({
     type: 'keydown',

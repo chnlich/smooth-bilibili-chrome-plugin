@@ -82,7 +82,7 @@ function seekablePositionForDelay(ranges, targetDelay) {
 
 const SEEK_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']);
 const CONTROL_EXCLUSIONS = /volume|音量|quality|画质|speed|倍速|rate|播放速度|chat|comment|弹幕/i;
-const TIMELINE_MARKERS = /seek|timeline|progress|time|position|进度|时间轴|时间/i;
+const TIMELINE_MARKERS = /seek|timeline|progress|position|进度|时间轴/i;
 
 function eventPath(event) {
   if (typeof event?.composedPath === 'function') return event.composedPath();
@@ -107,7 +107,7 @@ function isTimelineControl(element) {
   const text = elementText(element);
   const explicit = ['data-seek', 'data-timeline', 'data-progress']
     .some((attribute) => typeof element.getAttribute === 'function' && element.getAttribute(attribute) !== null);
-  if (CONTROL_EXCLUSIONS.test(text) && !explicit) return false;
+  if (CONTROL_EXCLUSIONS.test(text)) return false;
   if (explicit) return true;
   const tagName = String(element.tagName || '').toLowerCase();
   const inputType = String(element.type || element.getAttribute?.('type') || '').toLowerCase();

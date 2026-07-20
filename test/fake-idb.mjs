@@ -217,6 +217,7 @@ class FakeTransaction {
     this.running = false;
     this.pending = 0;
     this.queue = [];
+    this.completionPending = false;
     database.scheduleTransaction(this);
   }
 
@@ -258,13 +259,36 @@ class FakeTransaction {
   }
 
   maybeComplete() {
-    if (this.aborted || this.completed || this.pending !== 0 || this.queue.length !== 0 || this.running) return;
+    if (
+      this.aborted ||
+      this.completed ||
+      this.pending !== 0 ||
+      this.queue.length !== 0 ||
+      this.running ||
+      this.completionPending
+    ) {
+      return;
+    }
+    this.completionPending = true;
     queueMicrotask(() => {
-      if (this.aborted || this.completed || this.pending !== 0 || this.queue.length !== 0 || this.running) return;
-      this.completed = true;
-      if (this.mode === 'readwrite') this.database.state = this.state;
-      this.database.releaseTransaction(this);
-      this.oncomplete?.({ target: this });
+      if (this.aborted || this.completed || this.pending !== 0 || this.queue.length !== 0 || this.running) {
+        this.completionPending = false;
+        return;
+      }
+      const complete = () => {
+        if (this.aborted || this.completed) return;
+        this.completionPending = false;
+        this.completed = true;
+        if (this.mode === 'readwrite') this.database.state = this.state;
+        this.database.releaseTransaction(this);
+        this.oncomplete?.({ target: this });
+      };
+      const commitBarrier = this.mode === 'readwrite' ? this.database.takeCommitBarrier() : undefined;
+      if (commitBarrier === undefined) {
+        complete();
+      } else {
+        void commitBarrier.then(complete);
+      }
     });
   }
 
@@ -289,6 +313,7 @@ class FakeDatabase {
     this.state = { sessions: new Map(), events: new Map(), nextEventId: 1 };
     this.activeWrite = false;
     this.pendingWrites = [];
+    this.nextCommitBarrier = undefined;
   }
 
   get objectStoreNames() {
@@ -309,6 +334,20 @@ class FakeDatabase {
   }
 
   close() {}
+
+  holdNextCommit() {
+    if (this.nextCommitBarrier !== undefined) throw new Error('fake IDB 已有待释放的提交栅栏');
+    let release;
+    const barrier = new Promise((resolve) => { release = resolve; });
+    this.nextCommitBarrier = barrier;
+    return release;
+  }
+
+  takeCommitBarrier() {
+    const barrier = this.nextCommitBarrier;
+    this.nextCommitBarrier = undefined;
+    return barrier;
+  }
 
   scheduleTransaction(transaction) {
     if (transaction.mode === 'readwrite') {

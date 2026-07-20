@@ -143,14 +143,18 @@ const videoFixture = `<!doctype html><html><body><div id="stage"></div><script>
 const liveFixture = `<!doctype html><html><body><div id="stage"></div>
   <input id="timeline" data-seek type="range" min="0" max="240" step="1" value="0">
   <button id="quality" type="button">quality</button>
-  <input id="volume" type="range" aria-label="volume" min="0" max="1" step="0.1" value="0">
+  <input id="volume" data-progress type="range" aria-label="volume" min="0" max="1" step="0.1" value="0">
   <script>
     const stage = document.querySelector('#stage');
     const timeline = document.querySelector('#timeline');
     const volume = document.querySelector('#volume');
     let video;
     let clipUrls;
-    let mediaSources;
+    let recordedClips;
+    let initialStallSource;
+    let activeStallSource;
+    let activeStallPromise;
+    let liveEdgeTimer;
     let decodedFrames = 0;
     let decodedNonBlack = false;
     let initialDelay = 0;
@@ -190,6 +194,34 @@ const liveFixture = `<!doctype html><html><body><div id="stage"></div>
       return { chunks, mimeType, requestedDuration: milliseconds / 1000 };
     }
 
+    function appendSourceData(sourceBuffer, chunks, mimeType) {
+      if (chunks.length === 0) throw new Error('fixture MSE 没有可追加的视频数据');
+      return new Promise((resolve, reject) => {
+        const complete = () => {
+          sourceBuffer.removeEventListener('updateend', complete);
+          sourceBuffer.removeEventListener('error', failed);
+          resolve();
+        };
+        const failed = () => {
+          sourceBuffer.removeEventListener('updateend', complete);
+          sourceBuffer.removeEventListener('error', failed);
+          reject(new Error('fixture MSE append 失败'));
+        };
+        sourceBuffer.addEventListener('updateend', complete, { once: true });
+        sourceBuffer.addEventListener('error', failed, { once: true });
+        void new Blob(chunks, { type: mimeType }).arrayBuffer().then(
+          (buffer) => {
+            try {
+              sourceBuffer.appendBuffer(buffer);
+            } catch (error) {
+              failed();
+            }
+          },
+          failed,
+        );
+      });
+    }
+
     function createMediaSourceUrl(recorded) {
       const mediaSource = new MediaSource();
       const url = URL.createObjectURL(mediaSource);
@@ -207,6 +239,50 @@ const liveFixture = `<!doctype html><html><body><div id="stage"></div>
       return { url, mediaSource };
     }
 
+    function createStallingMediaSource(recorded) {
+      if (recorded.chunks.length < 2) throw new Error('fixture MSE 没有足够的视频分段');
+      const mediaSource = new MediaSource();
+      const url = URL.createObjectURL(mediaSource);
+      const initialChunkCount = Math.max(1, Math.min(8, recorded.chunks.length - 1));
+      let sourceBuffer;
+      let resolveInitial;
+      let rejectInitial;
+      const initialReady = new Promise((resolve, reject) => {
+        resolveInitial = resolve;
+        rejectInitial = reject;
+      });
+      mediaSource.addEventListener('sourceopen', () => {
+        try {
+          sourceBuffer = mediaSource.addSourceBuffer(recorded.mimeType);
+          void appendSourceData(sourceBuffer, recorded.chunks.slice(0, initialChunkCount), recorded.mimeType).then(
+            () => {
+              const bufferedEnd = sourceBuffer.buffered.length === 0
+                ? recorded.requestedDuration
+                : sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+              mediaSource.duration = Math.max(recorded.requestedDuration + 3, bufferedEnd + 3);
+              resolveInitial();
+            },
+            rejectInitial,
+          );
+        } catch (error) {
+          rejectInitial(error);
+        }
+      }, { once: true });
+      return {
+        url,
+        mediaSource,
+        initialReady,
+        async appendRemaining() {
+          await initialReady;
+          await appendSourceData(
+            sourceBuffer,
+            recorded.chunks.slice(initialChunkCount),
+            recorded.mimeType,
+          );
+        },
+      };
+    }
+
     function trackDecoded(nextVideo) {
       const probe = document.createElement('canvas');
       probe.width = 320;
@@ -222,7 +298,7 @@ const liveFixture = `<!doctype html><html><body><div id="stage"></div>
       nextVideo.requestVideoFrameCallback(onFrame);
     }
 
-    async function setSource(nextVideo, url, position) {
+    async function setSource(nextVideo, url, position, sourceReady) {
       const metadata = new Promise((resolve, reject) => {
         nextVideo.addEventListener('loadedmetadata', resolve, { once: true });
         nextVideo.addEventListener('error', () => reject(nextVideo.error || new Error('fixture media metadata failed')), { once: true });
@@ -232,22 +308,75 @@ const liveFixture = `<!doctype html><html><body><div id="stage"></div>
         nextVideo.load();
       });
       await metadata;
+      if (sourceReady !== undefined) await sourceReady;
       const target = Math.max(0.1, Math.min(position, nextVideo.duration - 0.1));
       await window.__e2eAudit.fixtureCall('set:currentTime', () => { nextVideo.currentTime = target; });
       timeline.max = String(nextVideo.duration);
       return target;
     }
 
+    function waitForGenuineStall(frameBaseline) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          video.removeEventListener('waiting', onWaiting);
+          reject(new Error('fixture 未出现首帧后的原生 waiting'));
+        }, 10000);
+        const onWaiting = (event) => {
+          if (decodedFrames <= frameBaseline) return;
+          clearTimeout(timer);
+          video.removeEventListener('waiting', onWaiting);
+          resolve({
+            trusted: event.isTrusted,
+            decodedFrames,
+            currentTime: video.currentTime,
+          });
+        };
+        video.addEventListener('waiting', onWaiting);
+      });
+    }
+
+    async function waitForDecodedFrameAfter(frameCount) {
+      const deadline = performance.now() + 10000;
+      while (decodedFrames <= frameCount) {
+        if (performance.now() >= deadline) throw new Error('fixture MSE 恢复后没有新解码帧');
+        await sleep(20);
+      }
+    }
+
+    function startGrowingLiveEdge(source) {
+      if (liveEdgeTimer !== undefined) clearInterval(liveEdgeTimer);
+      liveEdgeTimer = setInterval(() => {
+        if (source.mediaSource.readyState === 'open') source.mediaSource.duration += 0.2;
+      }, 200);
+    }
+
+    function stopGrowingLiveEdge() {
+      if (liveEdgeTimer === undefined) return;
+      clearInterval(liveEdgeTimer);
+      liveEdgeTimer = undefined;
+    }
+
+    async function startStallingSource(position) {
+      activeStallSource = createStallingMediaSource(recordedClips[0]);
+      await setSource(video, activeStallSource.url, position, activeStallSource.initialReady);
+      activeStallPromise = waitForGenuineStall(decodedFrames);
+      await window.__e2eAudit.fixtureCall('play', () => video.play());
+      return activeStallPromise;
+    }
+
     async function boot() {
-      const recordedClips = await Promise.all([
-        recordClip(2200, '#f05a28'),
+      recordedClips = await Promise.all([
+        recordClip(4200, '#f05a28'),
         recordClip(4200, '#18b66a'),
         recordClip(6200, '#5b6ee1'),
       ]);
       const sourceRecords = recordedClips.map(createMediaSourceUrl);
       clipUrls = sourceRecords.map(({ url }) => url);
-      mediaSources = sourceRecords.map(({ mediaSource }) => mediaSource);
       initialClipIndex = location.pathname.includes('input-fixture') ? 2 : 0;
+      if (initialClipIndex === 0) {
+        initialStallSource = createStallingMediaSource(recordedClips[0]);
+        activeStallSource = initialStallSource;
+      }
       video = document.createElement('video');
       video.id = 'media';
       video.preload = 'auto';
@@ -256,7 +385,12 @@ const liveFixture = `<!doctype html><html><body><div id="stage"></div>
       video.volume = 0;
       stage.append(video);
       trackDecoded(video);
-      await setSource(video, clipUrls[initialClipIndex], 0.6);
+      await setSource(
+        video,
+        initialStallSource?.url || clipUrls[initialClipIndex],
+        0.6,
+        initialStallSource?.initialReady,
+      );
     }
 
     const ready = boot();
@@ -271,29 +405,28 @@ const liveFixture = `<!doctype html><html><body><div id="stage"></div>
       async start() {
         await ready;
         window.__e2eAudit.reset();
+        if (activeStallSource !== undefined) activeStallPromise = waitForGenuineStall(decodedFrames);
         await window.__e2eAudit.fixtureCall('play', () => video.play());
       },
       decodedFrames() { return decodedFrames; },
       decodedNonBlack() { return decodedNonBlack; },
       async beginStall() {
+        if (activeStallPromise === undefined) throw new Error('fixture 没有待验证的原生卡顿');
+        const stall = await activeStallPromise;
         initialDelay = video.seekable.end(video.seekable.length - 1) - video.currentTime;
-        video.dispatchEvent(new Event('waiting'));
-        await window.__e2eAudit.fixtureCall('pause', () => video.pause());
+        startGrowingLiveEdge(activeStallSource);
+        return stall;
       },
       async beginProtectedSeek() {
-        const target = Math.max(0.1, video.duration - 1.2);
-        await window.__e2eAudit.fixtureCall('set:currentTime', () => { video.currentTime = target; });
-        await window.__e2eAudit.fixtureCall('play', () => video.play());
-        video.dispatchEvent(new Event('waiting'));
-        await sleep(50);
-        return { target, currentTime: video.currentTime, paused: video.paused, readyState: video.readyState };
+        const stall = await startStallingSource(0.1);
+        return { ...stall, currentTime: video.currentTime, paused: video.paused, readyState: video.readyState };
       },
       async recoverWithDelay() {
-        const currentEnd = video.seekable.end(video.seekable.length - 1);
-        mediaSources[initialClipIndex].duration = currentEnd + 2;
-        await sleep(200);
-        await window.__e2eAudit.fixtureCall('play', () => video.play());
-        await sleep(200);
+        await sleep(1200);
+        const frameCount = decodedFrames;
+        await activeStallSource.appendRemaining();
+        await waitForDecodedFrameAfter(frameCount);
+        stopGrowingLiveEdge();
         recoveredDelay = video.seekable.end(video.seekable.length - 1) - video.currentTime;
       },
       delays() {
@@ -536,7 +669,9 @@ try {
   assert.deepEqual(await livePage.evaluate(() => window.__e2eAudit.extensionOwnership()), []);
   scenarios.push('真实无音轨直播帧解码');
 
-  await livePage.evaluate(() => window.__fixture.beginStall());
+  const nativeStall = await livePage.evaluate(() => window.__fixture.beginStall());
+  assert.equal(nativeStall.trusted, true);
+  assert.ok(nativeStall.decodedFrames > 0);
   await livePage.waitForTimeout(150);
   assert.deepEqual(await livePage.evaluate(() => window.__e2eAudit.extensionOwnership()), []);
   await livePage.evaluate(() => window.__fixture.recoverWithDelay());
@@ -545,7 +680,10 @@ try {
   const recovered = stored.events.find((event) => event.code === 'live.stall.recovered');
   assert.ok(recovered);
   const liveDelays = await livePage.evaluate(() => window.__fixture.delays());
-  assert.ok(liveDelays.recoveredDelay > liveDelays.initialDelay + 1);
+  assert.ok(
+    liveDelays.recoveredDelay > liveDelays.initialDelay + 1,
+    '真实 MSE 卡顿后延迟没有保留 D+T: ' + JSON.stringify(liveDelays),
+  );
   assert.ok(recovered.data.protectedDelay >= liveDelays.initialDelay - 0.5);
   const delayObservation = stored.events
     .filter((event) => event.code === 'live.delay.observed')
@@ -571,6 +709,13 @@ try {
     extensionId,
     (events) => events.some((event) => event.code === 'live.delay.corrected' && event.data.reason === 'source_replaced'),
   );
+  const replacementCorrection = stored.events
+    .filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'source_replaced')
+    .at(-1);
+  const replacementFacts = await livePage.evaluate(() => window.__fixture.delays());
+  assert.ok(Math.abs(
+    replacementFacts.seekableEnd - replacementCorrection.data.targetTime - replacementCorrection.data.protectedDelay,
+  ) <= 0.5);
   scenarios.push('active-stall source clear/replacement overlay and target delay');
 
   await livePage.evaluate(() => window.__fixture.replaceVideo());
@@ -604,7 +749,9 @@ try {
   );
   await livePage.waitForTimeout(500);
   await livePage.evaluate(() => window.__e2eAudit.reset());
-  await livePage.evaluate(() => window.__fixture.beginProtectedSeek());
+  const mouseNativeStall = await livePage.evaluate(() => window.__fixture.beginProtectedSeek());
+  assert.equal(mouseNativeStall.trusted, true);
+  assert.ok(mouseNativeStall.decodedFrames > 0);
   await livePage.locator('#timeline').focus();
   const mouseCorrectionCount = (await readStoredEvents(context, extensionId)).events
     .filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek').length;
@@ -623,7 +770,9 @@ try {
   await livePage.waitForTimeout(250);
   const qualityStallCount = (await readStoredEvents(context, extensionId)).events
     .filter((event) => event.code === 'live.stall.detected').length;
-  await livePage.evaluate(() => window.__fixture.beginProtectedSeek());
+  const keyboardNativeStall = await livePage.evaluate(() => window.__fixture.beginProtectedSeek());
+  assert.equal(keyboardNativeStall.trusted, true);
+  assert.ok(keyboardNativeStall.decodedFrames > 0);
   await waitForStoredEvents(
     context,
     extensionId,
@@ -639,43 +788,43 @@ try {
   await livePage.waitForTimeout(250);
   const negativeStallCount = (await readStoredEvents(context, extensionId)).events
     .filter((event) => event.code === 'live.stall.detected').length;
-  await livePage.evaluate(() => window.__fixture.beginProtectedSeek());
+  const negativeNativeStall = await livePage.evaluate(() => window.__fixture.beginProtectedSeek());
+  assert.equal(negativeNativeStall.trusted, true);
+  assert.ok(negativeNativeStall.decodedFrames > 0);
   await waitForStoredEvents(
     context,
     extensionId,
     (events) => events.filter((event) => event.code === 'live.stall.detected').length > negativeStallCount,
   );
   await livePage.evaluate(() => window.__e2eAudit.reset());
+  const assertAutomaticScriptSeek = async () => {
+    const correctionCount = (await readStoredEvents(context, extensionId)).events
+      .filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek').length;
+    await livePage.evaluate(() => window.__fixture.scriptSeek(110));
+    stored = await waitForStoredEvents(
+      context,
+      extensionId,
+      (events) => events.filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek').length
+        > correctionCount,
+    );
+    const correction = stored.events
+      .filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek')
+      .at(-1);
+    assert.ok(correction.data.targetTime < correction.data.currentTime);
+  };
   await livePage.locator('#quality').click();
+  await assertAutomaticScriptSeek();
   await livePage.locator('#volume').click();
+  await assertAutomaticScriptSeek();
   await livePage.locator('#media').click();
-  const qualityCorrectionCount = (await readStoredEvents(context, extensionId)).events
-    .filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek').length;
-  await livePage.evaluate(() => window.__fixture.scriptSeek(110));
-  stored = await waitForStoredEvents(
-    context,
-    extensionId,
-    (events) => events.filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek').length
-      > qualityCorrectionCount,
-  );
-  const automaticCorrection = stored.events
-    .filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek')
-    .at(-1);
-  assert.ok(automaticCorrection.data.targetTime < automaticCorrection.data.currentTime);
+  await assertAutomaticScriptSeek();
+  assert.deepEqual(await livePage.evaluate(() => window.__e2eAudit.extensionOwnership()), []);
   scenarios.push('quality/volume/video clicks do not authorize script seek');
 
   await livePage.evaluate(() => window.__e2eAudit.reset());
   await livePage.locator('#volume').focus();
   await livePage.keyboard.press('ArrowRight');
-  const keyCorrectionCount = stored.events
-    .filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek').length;
-  await livePage.evaluate(() => window.__fixture.scriptSeek(110));
-  await waitForStoredEvents(
-    context,
-    extensionId,
-    (events) => events.filter((event) => event.code === 'live.delay.corrected' && event.data.reason === 'automatic_forward_seek').length
-      > keyCorrectionCount,
-  );
+  await assertAutomaticScriptSeek();
   scenarios.push('unrelated keyboard input does not authorize script seek');
 
   stored = await readStoredEvents(context, extensionId);
