@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { LIVE_CONFIG, VOD_CONFIG } from '../src/constants.js';
 import { serializeError } from '../src/extension/bridge-contract.js';
 import { LiveObserver } from '../src/live/observer.js';
+import { ExtensionCoordinator } from '../src/extension/controller.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
 import { VodBufferController } from '../src/vod/controller.js';
 import { DiagnosticsClient } from '../src/diagnostics/client.js';
@@ -138,6 +139,42 @@ function diagnosticsRecorder() {
     markVideoAvailable() {},
     getStatus() { return { sessionId: 'session-test', persistence: 'PERSISTED' }; },
   };
+}
+
+function coordinatorFixture({ mode = 'video', diagnostics = diagnosticsRecorder(), enabled = false } = {}) {
+  const video = mediaVideo(`https://media.example/${mode}-passive-1`);
+  const documentObject = eventDocument(video);
+  const callbacks = [];
+  const runtimeObject = {
+    setInterval(callback) {
+      callbacks.push(callback);
+      return callback;
+    },
+    clearInterval() {},
+    setTimeout() { return 1; },
+    clearTimeout() {},
+  };
+  const location = mode === 'live'
+    ? { href: 'https://live.bilibili.com/123', hostname: 'live.bilibili.com', pathname: '/123' }
+    : { href: 'https://www.bilibili.com/video/BVpassive', hostname: 'www.bilibili.com', pathname: '/video/BVpassive' };
+  const bridgeClient = {
+    destroy() {},
+    callAsync() { throw new Error('被动诊断不得调用 bridge'); },
+  };
+  const coordinator = new ExtensionCoordinator({
+    documentObject,
+    windowObject: { location },
+    runtimeObject,
+    storage: {
+      async get() {
+        return { liveEnabled: enabled, vodEnabled: enabled };
+      },
+    },
+    bridgeClient,
+    diagnostics,
+    loggerObject: { error() {}, warn() {} },
+  });
+  return { coordinator, diagnostics, video, callbacks };
 }
 
 async function tick() {
@@ -390,6 +427,65 @@ test('video controller reports zero native buffer when current time has no cover
   fixture.controller.updateStatus();
   assert.equal(fixture.models.at(-1).buffered, '0.0 秒');
   fixture.controller.destroy();
+});
+
+test('disabled video and live routes passively record media without media or bridge ownership', async () => {
+  for (const mode of ['video', 'live']) {
+    const diagnostics = diagnosticsRecorder();
+    let availableCount = 0;
+    let noVideoPending = true;
+    diagnostics.markVideoAvailable = () => {
+      availableCount += 1;
+      noVideoPending = false;
+    };
+    diagnostics.destroy = () => {};
+    const fixture = coordinatorFixture({ mode, diagnostics });
+    const ownership = nativeOwnership(fixture.video);
+
+    await fixture.coordinator.start();
+    assert.equal(fixture.coordinator.active.controller, undefined);
+    assert.notEqual(fixture.coordinator.active.passiveObserver, undefined);
+    assert.equal(availableCount, 1);
+    assert.equal(noVideoPending, false);
+    assert.equal(diagnostics.events.filter((event) => event.code === 'media.sample').length, 1);
+    fixture.video.emit('playing');
+    assert.equal(diagnostics.events.filter((event) => event.code === 'media.playing').length, 1);
+    assert.deepEqual(nativeOwnership(fixture.video), ownership);
+
+    fixture.video.src = `https://media.example/${mode}-passive-2`;
+    fixture.video.currentSrc = fixture.video.src;
+    fixture.coordinator.active.passiveObserver.reconcile();
+    const replacement = diagnostics.events.find((event) => event.code === 'video.source_replaced');
+    assert.equal(replacement.context.videoInstance, 1);
+    assert.equal(replacement.context.sourceInstance, 2);
+    assert.equal(fixture.video.playCalls, 0);
+    assert.equal(fixture.video.pauseCalls, 0);
+    assert.deepEqual(fixture.video.assignments, []);
+
+    await fixture.coordinator.destroy();
+    const eventCount = diagnostics.events.length;
+    fixture.video.emit('timeupdate');
+    assert.equal(diagnostics.events.length, eventCount);
+  }
+});
+
+test('a failed controller boot falls back to passive diagnostics after destroying the partial controller', async () => {
+  const diagnostics = diagnosticsRecorder();
+  let availableCount = 0;
+  diagnostics.markVideoAvailable = () => {
+    availableCount += 1;
+    if (availableCount === 1) throw new Error('diagnostic recorder boot failure');
+  };
+  diagnostics.destroy = () => {};
+  const fixture = coordinatorFixture({ diagnostics, enabled: true });
+
+  await fixture.coordinator.start();
+  assert.equal(fixture.coordinator.active.controller, undefined);
+  assert.notEqual(fixture.coordinator.active.passiveObserver, undefined);
+  assert.equal(availableCount, 2);
+  assert.ok(diagnostics.events.some((event) => event.code === 'extension.boot_error'));
+  assert.ok(diagnostics.events.some((event) => event.code === 'media.sample'));
+  await fixture.coordinator.destroy();
 });
 
 test('native live observer does not touch playback before a genuine post-frame stall', async () => {

@@ -99,6 +99,7 @@ const worker = await fs.readFile(path.join(extensionDirectory, 'worker.js'), 'ut
 const logs = await fs.readFile(path.join(extensionDirectory, 'logs.js'), 'utf8');
 const vodSource = await fs.readFile(path.join(root, 'src/vod/controller.js'), 'utf8');
 const liveSource = await fs.readFile(path.join(root, 'src/live/observer.js'), 'utf8');
+const passiveMediaSource = await fs.readFile(path.join(root, 'src/diagnostics/passive-media-observer.js'), 'utf8');
 const manifestSource = createManifest();
 
 assert.deepEqual(manifest, manifestSource);
@@ -186,6 +187,9 @@ assert.doesNotMatch(liveSource, /playbackRate\s*=/);
 assert.doesNotMatch(liveSource, /(?:\.src|\.currentSrc|\.muted|\.volume)\s*=/);
 assert.doesNotMatch(vodSource, /\b(?:play|pause)\s*\(/);
 assert.doesNotMatch(vodSource, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
+assert.doesNotMatch(passiveMediaSource, /\b(?:play|pause)\s*\(/);
+assert.doesNotMatch(passiveMediaSource, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
+assert.doesNotMatch(passiveMediaSource, /\b(?:fetch|MediaSource|SourceBuffer)\b/);
 assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /document\.cookie|localStorage|sessionStorage|sendBeacon/);
 assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /fetch\s*\(|XMLHttpRequest|MediaSource|SourceBuffer/);
 assert.doesNotMatch(source, /window\.onerror|window\.onunhandledrejection/);

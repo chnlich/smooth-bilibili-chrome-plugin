@@ -375,7 +375,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-e55b3dc7f29ca9acc698899d" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-8592acd44366dc824375c091" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -948,9 +948,128 @@
     }
   };
 
+  // src/diagnostics/passive-media-observer.js
+  function currentSource(video) {
+    return video?.currentSrc || video?.src || "";
+  }
+  var PassiveMediaObserver = class {
+    constructor({
+      documentObject = document,
+      windowObject = window,
+      runtimeObject = windowObject,
+      diagnostics,
+      getVideo,
+      initialVideo
+    }) {
+      if (typeof getVideo !== "function") throw new Error("被动媒体诊断缺少 video 选择器");
+      this.documentObject = documentObject;
+      this.windowObject = windowObject;
+      this.runtimeObject = runtimeObject;
+      this.diagnostics = diagnostics;
+      this.getVideo = getVideo;
+      this.video = initialVideo;
+      this.videoInstance = 0;
+      this.sourceInstance = 0;
+      this.sourceKey = "";
+      this.recorder = void 0;
+      this.mutationObserver = void 0;
+      this.reconcileTimer = void 0;
+      this.started = false;
+      this.destroyed = false;
+      this.boundMutation = () => this.reconcile();
+    }
+    context() {
+      return {
+        videoInstance: this.videoInstance || void 0,
+        sourceInstance: this.sourceInstance || void 0
+      };
+    }
+    start() {
+      if (this.destroyed) throw new Error("被动媒体诊断已经销毁");
+      if (this.started) throw new Error("被动媒体诊断已经启动");
+      this.started = true;
+      if (typeof this.windowObject.MutationObserver === "function") {
+        this.mutationObserver = new this.windowObject.MutationObserver(this.boundMutation);
+        this.mutationObserver.observe(this.documentObject, { childList: true, subtree: true });
+      }
+      this.reconcileTimer = this.runtimeObject.setInterval(() => this.reconcile(), 500);
+      const initialVideo = this.video;
+      this.video = void 0;
+      this.bindVideo(this.getVideo() || initialVideo);
+    }
+    reconcile() {
+      if (this.destroyed || !this.started) return;
+      const nextVideo = this.getVideo();
+      if (nextVideo === void 0) return;
+      if (nextVideo !== this.video) {
+        this.bindVideo(nextVideo);
+        return;
+      }
+      this.rebindSourceIfNeeded();
+    }
+    bindVideo(video) {
+      if (video === void 0) return;
+      const previousVideo = this.video;
+      const previousSource = this.sourceKey;
+      this.recorder?.destroy();
+      this.video = video;
+      this.videoInstance += 1;
+      this.sourceKey = currentSource(video);
+      if (this.sourceKey !== "") this.sourceInstance += 1;
+      if (previousVideo !== void 0) {
+        this.diagnostics?.log("video.replaced", { reason: "passive_video_replaced" }, void 0, this.context());
+        if (previousSource !== this.sourceKey) {
+          this.diagnostics?.log("video.source_replaced", {
+            previousSource,
+            source: this.sourceKey,
+            reason: "video_replaced"
+          }, void 0, this.context());
+        }
+      }
+      this.diagnostics?.markVideoAvailable();
+      this.diagnostics?.log("video.attached", {
+        source: this.sourceKey,
+        reason: "passive_video_bound"
+      }, void 0, this.context());
+      this.recorder = new MediaEventRecorder({
+        video,
+        logger: this.diagnostics,
+        runtimeObject: this.runtimeObject,
+        context: () => this.context()
+      });
+      this.recorder.start();
+    }
+    rebindSourceIfNeeded() {
+      const nextSource = currentSource(this.video);
+      if (nextSource === this.sourceKey) return;
+      const previousSource = this.sourceKey;
+      this.sourceKey = nextSource;
+      this.sourceInstance += 1;
+      this.diagnostics?.log("video.source_replaced", {
+        previousSource,
+        source: nextSource,
+        reason: "passive_source_replaced"
+      }, void 0, this.context());
+    }
+    destroy() {
+      if (this.destroyed) return;
+      this.destroyed = true;
+      this.started = false;
+      this.mutationObserver?.disconnect();
+      this.mutationObserver = void 0;
+      if (this.reconcileTimer !== void 0) {
+        this.runtimeObject.clearInterval(this.reconcileTimer);
+        this.reconcileTimer = void 0;
+      }
+      this.recorder?.destroy();
+      this.recorder = void 0;
+      this.diagnostics?.log("video.destroyed", { reason: "passive_observer_destroyed" }, void 0, this.context());
+    }
+  };
+
   // src/live/observer.js
   var UNKNOWN = "未提供";
-  function currentSource(video) {
+  function currentSource2(video) {
     return video?.currentSrc || video?.src || "";
   }
   function nowMilliseconds(runtimeObject) {
@@ -1124,7 +1243,7 @@
       this.hasDecodedFrame = false;
       this.lastDecodedAtMilliseconds = void 0;
       this.recentError = UNKNOWN;
-      this.sourceKey = currentSource(video);
+      this.sourceKey = currentSource2(video);
       if (this.sourceKey !== "") this.sourceInstance += 1;
       if (previousVideo !== void 0 && previousSource !== this.sourceKey) {
         this.sourceReplacements += 1;
@@ -1169,7 +1288,7 @@
       this.updateStatus();
     }
     rebindSourceIfNeeded() {
-      const nextSource = currentSource(this.video);
+      const nextSource = currentSource2(this.video);
       if (nextSource === this.sourceKey) return;
       const previousSource = this.sourceKey;
       this.sourceKey = nextSource;
@@ -1742,19 +1861,19 @@
         if (selectedVideo !== this.video || selectedVideo !== this.getVideo()) {
           return;
         }
-        const currentSource2 = currentVideoSource(this.video);
-        if (currentSource2 === "" || currentSource2 !== core.snapshot.source) {
+        const currentSource3 = currentVideoSource(this.video);
+        if (currentSource3 === "" || currentSource3 !== core.snapshot.source) {
           this.hintState = "WAITING";
           this.message = WAITING_MESSAGE;
           this.updateStatus();
           return;
         }
-        const generationChanged = core !== this.currentCore || currentSource2 !== this.currentSource;
+        const generationChanged = core !== this.currentCore || currentSource3 !== this.currentSource;
         if (generationChanged) {
           const coreChanged = core !== this.currentCore;
-          const sourceChanged = currentSource2 !== this.currentSource;
+          const sourceChanged = currentSource3 !== this.currentSource;
           this.currentCore = core;
-          this.currentSource = currentSource2;
+          this.currentSource = currentSource3;
           if (this.videoInstance === 0) this.videoInstance = 1;
           if (this.sourceInstance === 0 || sourceChanged) this.sourceInstance += 1;
           if (this.coreInstance === 0 || coreChanged) this.coreInstance += 1;
@@ -1765,13 +1884,13 @@
           this.onGeneration(this.generationContext(sourceChanged ? "source_replaced" : "core_replaced"));
           if (sourceChanged) {
             this.diagnostics?.log("video.source_replaced", {
-              source: currentSource2,
+              source: currentSource3,
               reason: "source_replaced"
             }, void 0, this.generationContext("source_replaced"));
           }
           if (coreChanged) {
             this.diagnostics?.log("video.core_replaced", {
-              source: currentSource2,
+              source: currentSource3,
               reason: "core_replaced"
             }, void 0, this.generationContext("core_replaced"));
           }
@@ -2575,11 +2694,35 @@
           name: preferenceKeyForMode(mode),
           enabled: false
         });
+        this.active = {
+          mode,
+          href,
+          video: findLargestVideo(this.documentObject),
+          controller: void 0,
+          controllerStarted: false,
+          passiveObserver: void 0
+        };
+        try {
+          this.startPassiveObserver();
+        } catch (error) {
+          this.active.passiveObserver?.destroy();
+          this.active.passiveObserver = void 0;
+          this.logger.error("被动媒体诊断启动失败", error);
+          this.diagnostics?.log("extension.boot_error", { action: `${mode}_passive` }, error);
+        }
         this.finishRoute(routeAbort);
         return;
       }
       const panel = createStatusPanel(this.documentObject, mode);
-      this.active = { mode, href, panel, video: findLargestVideo(this.documentObject), controller: void 0 };
+      this.active = {
+        mode,
+        href,
+        panel,
+        video: findLargestVideo(this.documentObject),
+        controller: void 0,
+        controllerStarted: false,
+        passiveObserver: void 0
+      };
       panel.setFreshnessCheck(() => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && this.active?.panel === panel && this.routeKey === href && this.windowObject.location.href === href && modeForLocation(this.windowObject.location) === mode);
       panel.setModel({
         mode: mode === "live" ? "直播" : "视频",
@@ -2588,7 +2731,7 @@
         persistence: this.diagnostics?.getStatus?.().persistence
       });
       this.diagnostics?.log("preference.changed", { name: preferenceKeyForMode(mode), enabled: true });
-      const routeStillCurrent = () => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location);
+      const routeStillCurrent = () => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location) && this.active?.panel === panel;
       try {
         const pageAdapter = createPageWindowAdapter(this.bridgeClient, this.windowObject);
         if (mode === "live") {
@@ -2605,6 +2748,7 @@
           this.active.controller = controller;
           panel.setSnapshotRefresh(() => controller.refreshStatus());
           controller.start();
+          this.active.controllerStarted = true;
         } else {
           const controller = new VodBufferController({
             video: this.active.video,
@@ -2618,12 +2762,31 @@
           this.active.controller = controller;
           panel.setSnapshotRefresh(() => controller.refreshStatus());
           controller.start();
+          this.active.controllerStarted = true;
         }
         if (!routeStillCurrent()) {
           await this.teardownActive();
         }
       } catch (error) {
         if (!routeStillCurrent()) return;
+        const active = this.active;
+        if (active?.controllerStarted !== true) {
+          active?.controller?.destroy();
+          if (this.active !== active || active === void 0) return;
+          active.controller = void 0;
+          panel.setSnapshotRefresh(() => {
+          });
+          try {
+            this.startPassiveObserver();
+          } catch (passiveError) {
+            if (this.active === active) {
+              active.passiveObserver?.destroy();
+              active.passiveObserver = void 0;
+            }
+            this.logger.error("被动媒体诊断启动失败", passiveError);
+            this.diagnostics?.log("extension.boot_error", { action: `${mode}_passive` }, passiveError);
+          }
+        }
         setBootError(panel, error, mode);
         this.diagnostics?.log("extension.boot_error", { action: mode }, error);
       } finally {
@@ -2636,12 +2799,26 @@
         this.pendingRouteHref = "";
       }
     }
+    startPassiveObserver() {
+      if (this.active === void 0 || this.diagnostics === void 0 || this.active.passiveObserver !== void 0) return;
+      const observer = new PassiveMediaObserver({
+        documentObject: this.documentObject,
+        windowObject: this.windowObject,
+        runtimeObject: this.runtimeObject,
+        diagnostics: this.diagnostics,
+        getVideo: () => findLargestVideo(this.documentObject),
+        initialVideo: this.active.video
+      });
+      this.active.passiveObserver = observer;
+      observer.start();
+    }
     async teardownActive() {
       if (this.active === void 0) return;
       const active = this.active;
       this.active = void 0;
       active.controller?.destroy();
-      active.panel.destroy();
+      active.passiveObserver?.destroy();
+      active.panel?.destroy();
     }
     async destroy() {
       if (this.destroyed) return;

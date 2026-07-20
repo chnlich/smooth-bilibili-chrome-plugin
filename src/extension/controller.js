@@ -1,5 +1,6 @@
 import { EXTENSION_PREFERENCES } from '../constants.js';
 import { DiagnosticsClient, createRouteIdentity } from '../diagnostics/client.js';
+import { PassiveMediaObserver } from '../diagnostics/passive-media-observer.js';
 import { LiveObserver } from '../live/observer.js';
 import { VodBufferController } from '../vod/controller.js';
 import { fail, toBufferScriptError } from '../errors.js';
@@ -212,11 +213,35 @@ export class ExtensionCoordinator {
         name: preferenceKeyForMode(mode),
         enabled: false,
       });
+      this.active = {
+        mode,
+        href,
+        video: findLargestVideo(this.documentObject),
+        controller: undefined,
+        controllerStarted: false,
+        passiveObserver: undefined,
+      };
+      try {
+        this.startPassiveObserver();
+      } catch (error) {
+        this.active.passiveObserver?.destroy();
+        this.active.passiveObserver = undefined;
+        this.logger.error('被动媒体诊断启动失败', error);
+        this.diagnostics?.log('extension.boot_error', { action: `${mode}_passive` }, error);
+      }
       this.finishRoute(routeAbort);
       return;
     }
     const panel = createStatusPanel(this.documentObject, mode);
-    this.active = { mode, href, panel, video: findLargestVideo(this.documentObject), controller: undefined };
+    this.active = {
+      mode,
+      href,
+      panel,
+      video: findLargestVideo(this.documentObject),
+      controller: undefined,
+      controllerStarted: false,
+      passiveObserver: undefined,
+    };
     panel.setFreshnessCheck(() =>
       generation === this.routeGeneration &&
       !this.destroyed &&
@@ -236,7 +261,8 @@ export class ExtensionCoordinator {
     this.diagnostics?.log('preference.changed', { name: preferenceKeyForMode(mode), enabled: true });
     const routeStillCurrent = () =>
       generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted &&
-      href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location);
+      href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location) &&
+      this.active?.panel === panel;
     try {
       const pageAdapter = createPageWindowAdapter(this.bridgeClient, this.windowObject);
       if (mode === 'live') {
@@ -253,6 +279,7 @@ export class ExtensionCoordinator {
         this.active.controller = controller;
         panel.setSnapshotRefresh(() => controller.refreshStatus());
         controller.start();
+        this.active.controllerStarted = true;
       } else {
         const controller = new VodBufferController({
           video: this.active.video,
@@ -266,12 +293,30 @@ export class ExtensionCoordinator {
         this.active.controller = controller;
         panel.setSnapshotRefresh(() => controller.refreshStatus());
         controller.start();
+        this.active.controllerStarted = true;
       }
       if (!routeStillCurrent()) {
         await this.teardownActive();
       }
     } catch (error) {
       if (!routeStillCurrent()) return;
+      const active = this.active;
+      if (active?.controllerStarted !== true) {
+        active?.controller?.destroy();
+        if (this.active !== active || active === undefined) return;
+        active.controller = undefined;
+        panel.setSnapshotRefresh(() => {});
+        try {
+          this.startPassiveObserver();
+        } catch (passiveError) {
+          if (this.active === active) {
+            active.passiveObserver?.destroy();
+            active.passiveObserver = undefined;
+          }
+          this.logger.error('被动媒体诊断启动失败', passiveError);
+          this.diagnostics?.log('extension.boot_error', { action: `${mode}_passive` }, passiveError);
+        }
+      }
       setBootError(panel, error, mode);
       this.diagnostics?.log('extension.boot_error', { action: mode }, error);
     } finally {
@@ -286,12 +331,31 @@ export class ExtensionCoordinator {
     }
   }
 
+  startPassiveObserver() {
+    if (
+      this.active === undefined
+      || this.diagnostics === undefined
+      || this.active.passiveObserver !== undefined
+    ) return;
+    const observer = new PassiveMediaObserver({
+      documentObject: this.documentObject,
+      windowObject: this.windowObject,
+      runtimeObject: this.runtimeObject,
+      diagnostics: this.diagnostics,
+      getVideo: () => findLargestVideo(this.documentObject),
+      initialVideo: this.active.video,
+    });
+    this.active.passiveObserver = observer;
+    observer.start();
+  }
+
   async teardownActive() {
     if (this.active === undefined) return;
     const active = this.active;
     this.active = undefined;
     active.controller?.destroy();
-    active.panel.destroy();
+    active.passiveObserver?.destroy();
+    active.panel?.destroy();
   }
 
   async destroy() {
