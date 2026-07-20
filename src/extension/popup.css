@@ -88,13 +88,6 @@ dd {
   color: #ffd38b;
 }
 
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 9px;
-}
-
 button {
   border: 1px solid #5a6c83;
   border-radius: 5px;

@@ -1,8 +1,8 @@
-import { EXTENSION_PREFERENCES, VERSION } from '../constants.js';
-import { toBufferScriptError } from '../errors.js';
-import { LiveController, roomIdFromLocation, waitForVideo } from '../live/controller.js';
-import { getPinnedHls } from '../live/hls.js';
+import { EXTENSION_PREFERENCES } from '../constants.js';
+import { DiagnosticsClient, createRouteIdentity } from '../diagnostics/client.js';
+import { LiveObserver } from '../live/observer.js';
 import { VodBufferController } from '../vod/controller.js';
+import { fail, toBufferScriptError } from '../errors.js';
 import {
   STATUS_MESSAGE_VERSION,
   createStatusPanel,
@@ -15,7 +15,7 @@ export function isLivePage(locationObject) {
   return locationObject.hostname === 'live.bilibili.com';
 }
 
-export function isVodPage(locationObject) {
+export function isVideoPage(locationObject) {
   return locationObject.hostname === 'www.bilibili.com' && (
     locationObject.pathname.startsWith('/video/') ||
     locationObject.pathname === '/list/watchlater' ||
@@ -23,14 +23,21 @@ export function isVodPage(locationObject) {
   );
 }
 
+export const isVodPage = isVideoPage;
+
 export function modeForLocation(locationObject) {
-  if (isLivePage(locationObject)) {
-    return 'live';
-  }
-  if (isVodPage(locationObject)) {
-    return 'vod';
-  }
+  if (isLivePage(locationObject)) return 'live';
+  if (isVideoPage(locationObject)) return 'video';
   return undefined;
+}
+
+export function findLargestVideo(documentObject) {
+  const videos = [...documentObject.querySelectorAll('video')].filter((video) => video.isConnected !== false);
+  return videos.sort((left, right) => {
+    const leftArea = (left.clientWidth || 0) * (left.clientHeight || 0);
+    const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);
+    return rightArea - leftArea;
+  })[0];
 }
 
 function preferenceKeyForMode(mode) {
@@ -50,17 +57,11 @@ function logger() {
 
 function setBootError(panel, error, mode) {
   const normalized = toBufferScriptError(error, 'BOOT_FAILED', '扩展控制器启动失败');
-  logger().error(normalized);
   panel.setModel({
-    mode: mode === 'live' ? '直播' : '点播',
-    state: 'ERROR',
-    inventory: '未提供',
-    delay: '未提供',
-    quality: '未提供',
-    speed: '未提供',
-    multiplier: '未提供',
-    stage: '启动失败',
-    message: `${normalized.code}: ${normalized.message}`,
+    mode: mode === 'live' ? '直播' : '视频',
+    state: 'FAILED',
+    error: `${normalized.code}: ${normalized.message}`,
+    target: '120 秒',
   });
 }
 
@@ -70,54 +71,35 @@ function readPreferences(storage) {
 
 function popupError(error) {
   return {
+    name: typeof error?.name === 'string' ? error.name : 'Error',
     code: typeof error?.code === 'string' ? error.code : 'POPUP_REQUEST_FAILED',
     message: error?.message || String(error),
+    ...(typeof error?.stack === 'string' ? { stack: error.stack } : {}),
   };
 }
 
 function assertPopupMessage(message) {
   if (message === null || typeof message !== 'object' || Array.isArray(message)) {
-    throw Object.assign(new Error('popup 消息必须是对象'), { code: 'POPUP_MESSAGE_INVALID' });
+    fail('POPUP_MESSAGE_INVALID', 'popup 消息必须是对象');
   }
-  if (message.version !== STATUS_MESSAGE_VERSION) {
-    throw Object.assign(new Error(`popup 消息版本不支持: ${message.version}`), { code: 'POPUP_VERSION_UNSUPPORTED' });
+  if (message.version !== STATUS_MESSAGE_VERSION || message.type !== 'status:get') {
+    fail('POPUP_MESSAGE_INVALID', 'popup 消息版本或类型未允许');
   }
-  if (message.type !== 'status:get' && message.type !== 'action:run') {
-    throw Object.assign(new Error(`popup 消息类型未允许: ${message.type}`), { code: 'POPUP_MESSAGE_INVALID' });
+  if (Object.keys(message).some((field) => !['version', 'type'].includes(field))) {
+    fail('POPUP_MESSAGE_INVALID', 'popup 消息包含未允许字段');
   }
   return message;
 }
 
 async function handlePopupMessage(message, sender) {
-  const request = assertPopupMessage(message);
-  const senderTabId = sender?.tab?.id;
-  if (request.tabId !== undefined && request.tabId !== senderTabId) {
-    throw Object.assign(new Error('popup 请求 tab 与消息来源不匹配'), { code: 'POPUP_TAB_MISMATCH' });
+  assertPopupMessage(message);
+  if (sender?.tab?.id === undefined) {
+    throw Object.assign(new Error('popup 消息缺少 sender.tab.id'), { code: 'POPUP_TAB_MISSING' });
   }
   const surface = getCurrentStatusSurface();
-  if (request.type === 'status:get') {
-    if (surface === undefined) {
-      return createUnavailableStatusSnapshot(modeForLocation(window.location));
-    }
-    if (senderTabId !== undefined) {
-      surface.bindTab(senderTabId);
-    }
-    return surface.getSnapshot();
-  }
-  if (surface === undefined) {
-    throw Object.assign(new Error('当前 tab 没有活动状态 surface'), { code: 'POPUP_SURFACE_UNAVAILABLE' });
-  }
-  if (senderTabId !== undefined) {
-    surface.bindTab(senderTabId);
-  }
-  if (request.surfaceId !== surface.surfaceId) {
-    throw Object.assign(new Error('popup 动作属于过期状态 surface'), { code: 'POPUP_SURFACE_STALE' });
-  }
-  if (typeof request.action !== 'string') {
-    throw Object.assign(new Error('popup 动作名称无效'), { code: 'POPUP_ACTION_INVALID' });
-  }
-  await surface.runAction(request.action);
-  return { version: STATUS_MESSAGE_VERSION, ok: true, snapshot: surface.getSnapshot() };
+  if (surface === undefined) return createUnavailableStatusSnapshot(modeForLocation(window.location));
+  surface.bindTab(sender.tab.id);
+  return surface.getSnapshot();
 }
 
 export function installPopupMessageHandler(runtimeObject = chrome.runtime) {
@@ -127,7 +109,11 @@ export function installPopupMessageHandler(runtimeObject = chrome.runtime) {
   runtimeObject.onMessage.addListener((message, sender, sendResponse) => {
     void handlePopupMessage(message, sender)
       .then((response) => sendResponse(response))
-      .catch((error) => sendResponse({ version: STATUS_MESSAGE_VERSION, ok: false, error: popupError(error) }));
+      .catch((error) => sendResponse({
+        version: STATUS_MESSAGE_VERSION,
+        ok: false,
+        error: popupError(error),
+      }));
     return true;
   });
 }
@@ -139,6 +125,7 @@ export class ExtensionCoordinator {
     storage = chrome.storage.local,
     runtimeObject = globalThis,
     bridgeClient = new BridgeClient(documentObject, runtimeObject),
+    diagnostics,
     loggerObject = logger(),
   } = {}) {
     this.documentObject = documentObject;
@@ -146,6 +133,8 @@ export class ExtensionCoordinator {
     this.storage = storage;
     this.runtimeObject = runtimeObject;
     this.bridgeClient = bridgeClient;
+    this.diagnostics = diagnostics;
+    this.bridgeClient.diagnostics = diagnostics;
     this.logger = loggerObject;
     this.preferences = undefined;
     this.active = undefined;
@@ -153,33 +142,43 @@ export class ExtensionCoordinator {
     this.routeGeneration = 0;
     this.syncPromise = undefined;
     this.pendingRouteHref = '';
-    this.routeAbort;
+    this.routeAbort = undefined;
     this.routeTimer = undefined;
     this.destroyed = false;
   }
 
   async start() {
-    if (this.routeTimer !== undefined) {
-      throw new Error('扩展路由协调器已经启动');
-    }
+    if (this.routeTimer !== undefined) throw new Error('扩展路由协调器已经启动');
+    this.diagnostics?.log('extension.started', { action: 'coordinator' });
     this.preferences = await readPreferences(this.storage);
-    this.documentObject.documentElement.dataset.bilibiliBufferExtensionRuntimeId = chrome.runtime.id;
+    this.diagnostics?.log('preference.read', {
+      name: EXTENSION_PREFERENCES.liveEnabled,
+      enabled: this.preferences[EXTENSION_PREFERENCES.liveEnabled] !== false,
+    });
+    this.diagnostics?.log('preference.read', {
+      name: EXTENSION_PREFERENCES.vodEnabled,
+      enabled: this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false,
+    });
+    const runtimeId = this.runtimeObject.chrome?.runtime?.id || this.runtimeObject.runtime?.id;
+    if (this.documentObject.documentElement !== null && runtimeId !== undefined) {
+      this.documentObject.documentElement.dataset.bilibiliBufferExtensionRuntimeId = runtimeId;
+    }
     this.routeTimer = this.runtimeObject.setInterval(() => {
-      void this.syncRoute().catch((error) => this.logger.error('扩展路由同步失败', error));
+      void this.syncRoute().catch((error) => {
+        this.logger.error('扩展路由同步失败', error);
+        this.diagnostics?.log('extension.observer_error', { reason: 'route-sync' }, error);
+      });
     }, 250);
     await this.syncRoute();
   }
 
   enabledFor(mode) {
-    const value = this.preferences[preferenceKeyForMode(mode)];
-    return value !== false;
+    return this.preferences[preferenceKeyForMode(mode)] !== false;
   }
 
   syncRoute() {
     if (this.syncPromise !== undefined) {
-      if (this.pendingRouteHref !== this.windowObject.location.href) {
-        this.routeAbort?.abort();
-      }
+      if (this.pendingRouteHref !== this.windowObject.location.href) this.routeAbort?.abort();
       return this.syncPromise;
     }
     this.syncPromise = this.performSyncRoute().finally(() => {
@@ -189,134 +188,110 @@ export class ExtensionCoordinator {
   }
 
   async performSyncRoute() {
-    if (this.destroyed) {
-      return;
-    }
+    if (this.destroyed) return;
     const href = this.windowObject.location.href;
     const mode = modeForLocation(this.windowObject.location);
-    const videoMissing = this.active?.video !== undefined && !this.active.video.isConnected;
-    if (href === this.routeKey && !videoMissing) {
-      return;
-    }
+    if (href === this.routeKey) return;
     const generation = this.routeGeneration + 1;
     this.routeGeneration = generation;
     this.routeAbort?.abort();
     const routeAbort = new AbortController();
     this.routeAbort = routeAbort;
     this.pendingRouteHref = href;
+    const changedRoute = this.routeKey !== '';
     await this.teardownActive();
-    if (generation !== this.routeGeneration || this.destroyed || routeAbort.signal.aborted) {
-      return;
+    if (changedRoute) {
+      this.diagnostics?.startSession(createRouteIdentity(this.windowObject.location));
+      this.diagnostics?.log('route.changed', { reason: 'location_changed' });
     }
+    if (generation !== this.routeGeneration || this.destroyed || routeAbort.signal.aborted) return;
     this.routeKey = href;
-    if (mode === undefined || !this.enabledFor(mode)) {
+    if (mode === undefined) {
+      this.diagnostics?.log('route.unsupported', { reason: 'no_video_enhancement_route' });
+      this.finishRoute(routeAbort);
       return;
     }
-    const panel = createStatusPanel(this.documentObject, mode === 'live' ? '直播' : '点播');
-    this.active = { mode, href, panel, video: undefined, controller: undefined };
-    panel.setFreshnessCheck(
-      () =>
-        generation === this.routeGeneration &&
-        !this.destroyed &&
-        !routeAbort.signal.aborted &&
-        this.active?.panel === panel &&
-        this.routeKey === href &&
-        this.windowObject.location.href === href &&
-        modeForLocation(this.windowObject.location) === mode,
-    );
-    panel.setModel({
-      mode: mode === 'live' ? '直播' : '点播',
-      state: 'STARTING',
-      stage: '等待 video',
-      message: `版本 ${VERSION} 正在启动`,
-    });
-    const routeStillCurrent = () =>
+    if (!this.enabledFor(mode)) {
+      this.diagnostics?.log('preference.disabled', {
+        name: preferenceKeyForMode(mode),
+        enabled: false,
+      });
+      this.finishRoute(routeAbort);
+      return;
+    }
+    const panel = createStatusPanel(this.documentObject, mode);
+    this.active = { mode, href, panel, video: findLargestVideo(this.documentObject), controller: undefined };
+    panel.setFreshnessCheck(() =>
       generation === this.routeGeneration &&
       !this.destroyed &&
       !routeAbort.signal.aborted &&
-      href === this.windowObject.location.href &&
-      mode === modeForLocation(this.windowObject.location);
-    const destroyActiveControllerForRouteAbort = () => {
-      if (this.active?.href === href) {
-        this.active.controller?.destroy();
-      }
-    };
-    routeAbort.signal.addEventListener('abort', destroyActiveControllerForRouteAbort, { once: true });
+      this.active?.panel === panel &&
+      this.routeKey === href &&
+      this.windowObject.location.href === href &&
+      modeForLocation(this.windowObject.location) === mode);
+    panel.setModel({
+      mode: mode === 'live' ? '直播' : '视频',
+      ...(mode === 'live'
+        ? { paused: '未提供', recentFrame: '未提供', buffered: '未提供', delay: '未提供' }
+        : { state: 'WAITING', buffered: '未提供', target: '120 秒', error: '等待原生 video、媒体 source 和播放器内核' }),
+      sessionId: this.diagnostics?.getStatus?.().sessionId,
+      persistence: this.diagnostics?.getStatus?.().persistence,
+    });
+    this.diagnostics?.log('preference.changed', { name: preferenceKeyForMode(mode), enabled: true });
+    const routeStillCurrent = () =>
+      generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted &&
+      href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location);
     try {
-      const video = await waitForVideo(this.documentObject, 30000, routeAbort.signal);
-      if (!routeStillCurrent()) {
-        if (generation === this.routeGeneration && this.active?.href === href) {
-          await this.teardownActive();
-        }
-        return;
-      }
-      this.active.video = video;
-      panel.setModel({ stage: '配置播放器', message: 'video 已就绪，正在配置播放器' });
       const pageAdapter = createPageWindowAdapter(this.bridgeClient, this.windowObject);
       if (mode === 'live') {
-        const controller = new LiveController({
-          windowObject: pageAdapter.pageWindow,
+        const controller = new LiveObserver({
+          windowObject: this.windowObject,
           documentObject: this.documentObject,
-          video,
-          panel,
-          hls: getPinnedHls(),
-          roomId: roomIdFromLocation(this.windowObject.location),
-          fetchImpl: this.runtimeObject.fetch.bind(this.runtimeObject),
           runtimeObject: this.runtimeObject,
-          mediaSourceFactory: pageAdapter.pageWindow.MediaSource,
-          urlApi: pageAdapter.pageWindow.URL,
+          initialVideo: this.active.video,
+          panel,
+          pageAdapter,
+          diagnostics: this.diagnostics,
           logger: this.logger,
         });
         this.active.controller = controller;
-        await controller.start();
-        if (!routeStillCurrent()) {
-          controller.destroy();
-          if (generation === this.routeGeneration && this.active?.href === href) {
-            await this.teardownActive();
-          }
-          return;
-        }
+        panel.setSnapshotRefresh(() => controller.refreshStatus());
+        controller.start();
       } else {
         const controller = new VodBufferController({
-          video,
+          video: this.active.video,
+          getVideo: () => findLargestVideo(this.documentObject),
           panel,
           runtimeObject: this.runtimeObject,
           logger: this.logger,
+          diagnostics: this.diagnostics,
           refreshCore: () => pageAdapter.refreshCore(),
         });
         this.active.controller = controller;
         panel.setSnapshotRefresh(() => controller.refreshStatus());
         controller.start();
-        if (!routeStillCurrent()) {
-          controller.destroy();
-          if (generation === this.routeGeneration && this.active?.href === href) {
-            await this.teardownActive();
-          }
-        }
+      }
+      if (!routeStillCurrent()) {
+        await this.teardownActive();
       }
     } catch (error) {
-      if (!routeStillCurrent()) {
-        if (generation === this.routeGeneration && this.active?.href === href) {
-          await this.teardownActive();
-        }
-        return;
-      }
-      if (generation === this.routeGeneration && !this.destroyed) {
-        setBootError(panel, error, mode);
-      }
+      if (!routeStillCurrent()) return;
+      setBootError(panel, error, mode);
+      this.diagnostics?.log('extension.boot_error', { action: mode }, error);
     } finally {
-      routeAbort.signal.removeEventListener('abort', destroyActiveControllerForRouteAbort);
-      if (this.routeAbort === routeAbort) {
-        this.routeAbort = undefined;
-        this.pendingRouteHref = '';
-      }
+      this.finishRoute(routeAbort);
+    }
+  }
+
+  finishRoute(routeAbort) {
+    if (this.routeAbort === routeAbort) {
+      this.routeAbort = undefined;
+      this.pendingRouteHref = '';
     }
   }
 
   async teardownActive() {
-    if (this.active === undefined) {
-      return;
-    }
+    if (this.active === undefined) return;
     const active = this.active;
     this.active = undefined;
     active.controller?.destroy();
@@ -324,23 +299,25 @@ export class ExtensionCoordinator {
   }
 
   async destroy() {
-    if (this.destroyed) {
-      return;
-    }
-    this.destroyed = true;
+    if (this.destroyed) return;
     this.routeGeneration += 1;
     this.routeAbort?.abort();
-    if (this.routeTimer !== undefined) {
-      this.runtimeObject.clearInterval(this.routeTimer);
-      this.routeTimer = undefined;
-    }
+    if (this.routeTimer !== undefined) this.runtimeObject.clearInterval(this.routeTimer);
+    this.routeTimer = undefined;
     await this.teardownActive();
+    this.diagnostics?.log('extension.destroyed', { action: 'coordinator' });
+    this.destroyed = true;
+    this.diagnostics?.destroy();
     this.bridgeClient.destroy();
   }
 }
 
 if (typeof chrome !== 'undefined' && typeof document !== 'undefined' && typeof window !== 'undefined') {
+  const diagnostics = new DiagnosticsClient();
   installPopupMessageHandler();
-  const coordinator = new ExtensionCoordinator();
-  void coordinator.start().catch((error) => console.error('[BilibiliBuffer] 扩展启动失败', error));
+  const coordinator = new ExtensionCoordinator({ diagnostics });
+  void coordinator.start().catch((error) => {
+    console.error('[BilibiliBuffer] 扩展启动失败', error);
+    diagnostics.log('extension.boot_error', { action: 'coordinator' }, error);
+  });
 }

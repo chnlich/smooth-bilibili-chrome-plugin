@@ -1,49 +1,86 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as esbuild from 'esbuild';
-import { HLS_DEPENDENCY, VERSION } from '../src/constants.js';
+import { VERSION } from '../src/constants.js';
 import { createManifest } from '../src/extension/manifest-source.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const sourceDirectory = path.join(root, 'src');
 const extensionDirectory = path.join(root, 'dist', 'extension');
 const packageMetadata = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
+
 if (packageMetadata.version !== VERSION) {
   throw new Error(`package.json version ${packageMetadata.version} does not match source version ${VERSION}`);
 }
-if (packageMetadata.dependencies?.['hls.js'] !== HLS_DEPENDENCY.version) {
-  throw new Error(`package.json hls.js dependency does not match source version ${HLS_DEPENDENCY.version}`);
+
+async function sourceEntries(directory, prefix = '') {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  const result = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const relative = path.join(prefix, entry.name);
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      result.push(...await sourceEntries(absolute, relative));
+    } else {
+      result.push({ relative, content: await fs.readFile(absolute) });
+    }
+  }
+  return result;
 }
 
+function calculateBuildId(entries) {
+  const hash = crypto.createHash('sha256');
+  for (const entry of entries) {
+    hash.update(entry.relative.replaceAll(path.sep, '/'));
+    hash.update('\0');
+    hash.update(entry.content);
+    hash.update('\0');
+  }
+  return `src-${hash.digest('hex').slice(0, 24)}`;
+}
+
+const buildId = calculateBuildId(await sourceEntries(sourceDirectory));
 const entries = [
   ['src/extension/main-bridge.js', 'main-bridge.js'],
   ['src/extension/controller.js', 'controller.js'],
   ['src/extension/popup.js', 'popup.js'],
+  ['src/diagnostics/worker.js', 'worker.js'],
+  ['src/diagnostics/logs.js', 'logs.js'],
 ];
 
 await fs.rm(extensionDirectory, { recursive: true, force: true });
 await fs.mkdir(extensionDirectory, { recursive: true });
 
 for (const [entryPoint, outputName] of entries) {
-  const result = await esbuild.build({
+  await esbuild.build({
     absWorkingDir: root,
     entryPoints: [entryPoint],
+    outfile: path.join(extensionDirectory, outputName),
     bundle: true,
     format: 'iife',
     platform: 'browser',
     target: 'chrome120',
     legalComments: 'none',
     minify: false,
-    sourcemap: false,
+    sourcemap: 'external',
     charset: 'utf8',
-    write: false,
+    define: {
+      __BILIBILI_BUILD_ID_LITERAL__: JSON.stringify(buildId),
+    },
+    write: true,
   });
-  const output = result.outputFiles[0].text;
-  await fs.writeFile(path.join(extensionDirectory, outputName), output.endsWith('\n') ? output : `${output}\n`, 'utf8');
+  const bundlePath = path.join(extensionDirectory, outputName);
+  const bundle = await fs.readFile(bundlePath, 'utf8');
+  const sourceMapComment = `//# sourceMappingURL=${outputName}.map`;
+  if (!bundle.includes(sourceMapComment)) {
+    await fs.writeFile(bundlePath, `${bundle.replace(/\n*$/, '')}\n${sourceMapComment}\n`, 'utf8');
+  }
 }
 
-for (const asset of ['popup.html', 'popup.css']) {
-  await fs.copyFile(path.join(root, 'src', 'extension', asset), path.join(extensionDirectory, asset));
+for (const asset of ['popup.html', 'popup.css', 'logs.html', 'logs.css']) {
+  await fs.copyFile(path.join(sourceDirectory, 'extension', asset), path.join(extensionDirectory, asset));
 }
 
 await fs.writeFile(
@@ -52,4 +89,4 @@ await fs.writeFile(
   'utf8',
 );
 
-console.log(`built ${path.relative(root, extensionDirectory)}`);
+console.log(`built ${path.relative(root, extensionDirectory)} buildId=${buildId}`);

@@ -9,7 +9,7 @@
   <body>
     <main>
       <h1>Bilibili 抗卡</h1>
-      <section class="preferences" aria-label="刷新默认值">
+      <section class="preferences" aria-label="增强开关">
         <label class="switch-row">
           <span>直播增强</span>
           <input type="checkbox" data-preference="liveEnabled">
@@ -18,22 +18,29 @@
           <span>视频增强</span>
           <input type="checkbox" data-preference="vodEnabled">
         </label>
-        <p class="hint">这两个开关是下次刷新页面的默认值，不会立即重建当前页面管线。</p>
+        <p class="hint">开关是刷新后的默认值；扩展不接管播放控制。</p>
       </section>
-      <section class="snapshot" aria-label="当前页面状态">
-        <div class="title-row"><span>Bilibili 抗卡</span><strong data-status-field="state">未提供</strong></div>
+      <section class="snapshot" aria-label="当前页面事实">
+        <div class="title-row"><span>当前页面</span><strong data-status-field="mode">未提供</strong></div>
         <dl>
-          <div><dt>模式</dt><dd data-status-field="mode">未提供</dd></div>
-          <div><dt>连续库存</dt><dd data-status-field="inventory">未提供</dd></div>
+          <div data-video-only="true"><dt>增强状态</dt><dd data-status-field="state">未提供</dd></div>
+          <div><dt>连续可播放缓存</dt><dd data-status-field="buffered">未提供</dd></div>
+          <div data-video-only="true"><dt>原生缓存目标</dt><dd data-status-field="target">未提供</dd></div>
+          <div data-live-only="true"><dt>是否暂停</dt><dd data-status-field="paused">未提供</dd></div>
+          <div data-live-only="true"><dt>最近一秒有新画面</dt><dd data-status-field="recentFrame">未提供</dd></div>
           <div data-live-only="true"><dt>估算延迟</dt><dd data-status-field="delay">未提供</dd></div>
+          <div data-live-only="true"><dt>原生分辨率</dt><dd data-status-field="resolution">未提供</dd></div>
           <div data-live-only="true"><dt>画质</dt><dd data-status-field="quality">未提供</dd></div>
-          <div data-live-only="true"><dt>速度</dt><dd data-status-field="speed">未提供</dd></div>
-          <div data-live-only="true"><dt>下载倍率</dt><dd data-status-field="multiplier">未提供</dd></div>
-          <div data-live-only="true"><dt>阶段</dt><dd data-status-field="stage">未提供</dd></div>
+          <div data-live-only="true"><dt>用户速度</dt><dd data-status-field="speed">未提供</dd></div>
+          <div data-live-only="true"><dt>视频替换次数</dt><dd data-status-field="videoReplacements">未提供</dd></div>
+          <div data-live-only="true"><dt>source 替换次数</dt><dd data-status-field="sourceReplacements">未提供</dd></div>
+          <div><dt>最近媒体事件</dt><dd data-status-field="recentEvent">未提供</dd></div>
+          <div><dt>错误</dt><dd data-status-field="error">未提供</dd></div>
+          <div><dt>日志 session</dt><dd data-status-field="sessionId">未提供</dd></div>
+          <div><dt>日志持久化</dt><dd data-status-field="persistence">未提供</dd></div>
         </dl>
-        <p class="message" data-status-field="message">未提供</p>
-        <div class="actions" data-actions></div>
       </section>
+      <button type="button" data-open-logs>打开开发日志</button>
       <p class="status" data-status role="status">正在读取当前页面状态…</p>
     </main>
     <script src="popup.js"></script>

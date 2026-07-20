@@ -6,13 +6,13 @@
   var BRIDGE_RESPONSE_ATTRIBUTE = "data-bilibili-buffer-bridge-response-v1";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
-    "callPlayer",
-    "callCoreSync"
+    "callCoreSync",
+    "getLiveCapabilitySnapshot",
+    "disableLiveAutoCatchup"
   ]);
-  var BRIDGE_PLAYER_METHODS = Object.freeze([
+  var BRIDGE_LIVE_METHODS = Object.freeze([
     "setAutoSyncProgressCfg",
-    "setAutoDiscardFrameCfg",
-    "pause"
+    "setAutoDiscardFrameCfg"
   ]);
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function encodeMessage(message) {
@@ -38,9 +38,41 @@
     return operation;
   }
   function serializeError(error) {
+    const seen = /* @__PURE__ */ new WeakSet();
+    const serialize = (value, depth) => {
+      if (value === void 0 || value === null) {
+        return void 0;
+      }
+      if (typeof value !== "object" && typeof value !== "function") {
+        return { name: typeof value, message: String(value) };
+      }
+      if (seen.has(value)) {
+        return "[Circular]";
+      }
+      if (depth >= 8) {
+        return "[CauseDepthLimit]";
+      }
+      seen.add(value);
+      const result = {};
+      const name = typeof value.name === "string" ? value.name : void 0;
+      const code = typeof value.code === "string" ? value.code : void 0;
+      const message = typeof value.message === "string" ? value.message : String(value);
+      const stack = typeof value.stack === "string" ? value.stack : void 0;
+      if (name !== void 0) result.name = name;
+      if (code !== void 0) result.code = code;
+      result.message = message;
+      if (stack !== void 0) result.stack = stack;
+      const cause = serialize(value.cause, depth + 1);
+      if (cause !== void 0) result.cause = cause;
+      return result;
+    };
+    const serialized = serialize(error, 0) || { message: "未知错误" };
     return {
-      code: typeof error?.code === "string" ? error.code : "BRIDGE_CALL_FAILED",
-      message: error?.message || String(error)
+      name: serialized.name || "Error",
+      code: serialized.code || "BRIDGE_CALL_FAILED",
+      message: serialized.message,
+      ...serialized.stack === void 0 ? {} : { stack: serialized.stack },
+      ...serialized.cause === void 0 ? {} : { cause: serialized.cause }
     };
   }
 
@@ -126,29 +158,37 @@
     }
     return args;
   }
-  async function callPlayer(args) {
-    if (!Array.isArray(args) || args.length < 1 || args.length > 2) {
-      throw Object.assign(new Error("页面播放器操作参数数量错误"), { code: "BRIDGE_ARGUMENTS_INVALID" });
-    }
-    const [method, value] = args;
-    if (!BRIDGE_PLAYER_METHODS.includes(method)) {
-      throw Object.assign(new Error(`页面播放器操作未允许: ${method}`), { code: "BRIDGE_OPERATION_DENIED" });
-    }
-    const player = pagePlayerObject();
-    if (typeof player[method] !== "function") {
-      throw Object.assign(new Error(`当前页面播放器没有 ${method}`), { code: "BRIDGE_METHOD_UNAVAILABLE" });
-    }
-    if (method === "pause") {
-      if (args.length !== 1) {
-        throw Object.assign(new Error("pause 不接受参数"), { code: "BRIDGE_ARGUMENTS_INVALID" });
+  function livePlayerCandidates() {
+    return [
+      globalThis.__PLAYER_GLOBAL_INSTANCE__,
+      globalThis.EmbedPlayer?.instance,
+      globalThis.livePlayer,
+      globalThis.player
+    ].filter((candidate) => candidate !== void 0 && candidate !== null);
+  }
+  function liveAutoCatchupCandidate() {
+    return livePlayerCandidates().find((candidate) => BRIDGE_LIVE_METHODS.some((method) => typeof candidate?.[method] === "function"));
+  }
+  function getLiveCapabilitySnapshot() {
+    const candidate = liveAutoCatchupCandidate();
+    return {
+      live: {
+        disableAutoCatchup: candidate !== void 0
       }
-      await player.pause();
-      return true;
+    };
+  }
+  async function disableLiveAutoCatchup() {
+    const candidate = liveAutoCatchupCandidate();
+    if (candidate === void 0) {
+      throw Object.assign(new Error("页面播放器没有关闭自动追赶能力"), {
+        code: "LIVE_AUTO_CATCHUP_UNAVAILABLE"
+      });
     }
-    if (value === null || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 1 || value.enable !== false && value.enable !== true) {
-      throw Object.assign(new Error(`${method} 参数必须是 {enable:boolean}`), { code: "BRIDGE_ARGUMENTS_INVALID" });
+    for (const method of BRIDGE_LIVE_METHODS) {
+      if (typeof candidate[method] === "function") {
+        await candidate[method]({ enable: false });
+      }
     }
-    await player[method](value);
     return true;
   }
   function callCoreSync(args) {
@@ -175,10 +215,14 @@
       case "getCoreSnapshot":
         requireArguments(request.args, 0);
         return getCoreSnapshot();
-      case "callPlayer":
-        return callPlayer(request.args);
       case "callCoreSync":
         return callCoreSync(request.args);
+      case "getLiveCapabilitySnapshot":
+        requireArguments(request.args, 0);
+        return getLiveCapabilitySnapshot();
+      case "disableLiveAutoCatchup":
+        requireArguments(request.args, 0);
+        return disableLiveAutoCatchup();
       default:
         throw new Error(`未处理的桥接操作: ${request.operation}`);
     }
@@ -210,6 +254,10 @@
   document.addEventListener(BRIDGE_REQUEST_EVENT, (event) => {
     try {
       const request = decodeMessage(event.detail);
+      const requestFields = /* @__PURE__ */ new Set(["version", "id", "operation", "args", "mode"]);
+      if (Object.keys(request).some((field) => !requestFields.has(field))) {
+        throw new Error("bridge request contains fields that are not allowed");
+      }
       if (request.mode !== "sync" && request.mode !== "async") {
         throw new Error("bridge request mode is invalid");
       }
@@ -234,3 +282,4 @@
     }
   });
 })();
+//# sourceMappingURL=main-bridge.js.map

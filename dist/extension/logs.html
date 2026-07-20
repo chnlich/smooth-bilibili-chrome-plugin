@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bilibili 开发日志</title>
+    <link rel="stylesheet" href="logs.css">
+  </head>
+  <body>
+    <main>
+      <h1>Bilibili 开发日志</h1>
+      <p>日志只在本机扩展 IndexedDB 中追加保存；导出由你选择目标文件，新增事件不会进入已经开始的导出。</p>
+      <label for="session-filter">导出范围</label>
+      <select id="session-filter" data-session-filter>
+        <option value="">全部 session</option>
+        <option value="current">当前 session</option>
+      </select>
+      <p data-session-details>导出全部 session</p>
+      <button type="button" data-export>打开文件并导出 JSONL</button>
+      <p role="status" data-status>正在读取日志 session…</p>
+    </main>
+    <script src="logs.js"></script>
+  </body>
+</html>

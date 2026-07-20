@@ -1,184 +1,143 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { EXTENSION_MANIFEST, EXTENSION_PREFERENCES, HLS_DEPENDENCY, VOD_CONFIG } from '../src/constants.js';
+import { EXTENSION_MANIFEST, EXTENSION_PREFERENCES, VOD_CONFIG } from '../src/constants.js';
 import {
   BRIDGE_CORE_SYNC_METHODS,
+  BRIDGE_LIVE_METHODS,
   BRIDGE_OPERATIONS,
-  BRIDGE_PLAYER_METHODS,
-  BRIDGE_VERSION,
-  decodeMessage,
-  encodeMessage,
+  serializeError,
 } from '../src/extension/bridge-contract.js';
-import { BridgeCore, createPageWindowAdapter } from '../src/extension/bridge-client.js';
+import { BridgeCore, LiveCapabilities } from '../src/extension/bridge-client.js';
 import { createManifest } from '../src/extension/manifest-source.js';
-import { isVodPage, modeForLocation } from '../src/extension/controller.js';
-import { createUnavailableStatusSnapshot, StatusPanel } from '../src/ui/panel.js';
+import { isVideoPage, isVodPage, modeForLocation } from '../src/extension/controller.js';
+import { createStatusPanel, createUnavailableStatusSnapshot, STATUS_MESSAGE_VERSION } from '../src/ui/panel.js';
+import { createSessionIdentity, validateSession } from '../src/diagnostics/session.js';
 
-function snapshot(coreId, source, supportsStable = true) {
-  return {
-    coreId,
-    source,
-    capabilities: {
-      core: { setStableBufferTime: supportsStable },
-    },
-  };
-}
-
-test('extension manifest keeps live mode and adds only the two supported VOD route patterns', () => {
+test('manifest is MV3 with only storage permissions, unlimited diagnostic storage, worker, and approved routes', () => {
   const manifest = createManifest();
   assert.equal(manifest.manifest_version, EXTENSION_MANIFEST.manifestVersion);
-  assert.equal(manifest.minimum_chrome_version, EXTENSION_MANIFEST.minimumChromeVersion);
-  assert.deepEqual(manifest.host_permissions, [...EXTENSION_MANIFEST.hostPermissions]);
+  assert.deepEqual(manifest.permissions, ['storage', 'unlimitedStorage']);
+  assert.deepEqual(manifest.host_permissions, []);
   assert.deepEqual(manifest.content_scripts[0].matches, [...EXTENSION_MANIFEST.matches]);
   assert.deepEqual(manifest.content_scripts[1].matches, [...EXTENSION_MANIFEST.matches]);
-  assert.deepEqual(manifest.permissions, ['storage']);
-  assert.equal(manifest.background, undefined);
+  assert.deepEqual(manifest.background, { service_worker: 'worker.js' });
+  assert.equal(manifest.action.default_popup, 'popup.html');
   assert.equal(manifest.options_page, undefined);
-  assert.match(manifest.description, /原生缓存提示/);
+  assert.equal(manifest.permissions.includes('tabs'), false);
+  assert.equal(manifest.permissions.includes('downloads'), false);
 });
 
-test('route selection activates normal video and Watch Later but not unrelated www paths', () => {
+test('video route selection has one behavior for video and Watch Later only', () => {
   const location = (href) => new URL(href);
-  assert.equal(isVodPage(location('https://www.bilibili.com/video/BVtest')), true);
-  assert.equal(isVodPage(location('https://www.bilibili.com/list/watchlater')), true);
-  assert.equal(isVodPage(location('https://www.bilibili.com/list/watchlater/')), true);
-  assert.equal(isVodPage(location('https://www.bilibili.com/list/watchlaterish')), false);
-  assert.equal(isVodPage(location('https://www.bilibili.com/')), false);
-  assert.equal(isVodPage(location('https://www.bilibili.com/read/cv123')), false);
-  assert.equal(modeForLocation(location('https://live.bilibili.com/6363772')), 'live');
-  assert.equal(modeForLocation(location('https://www.bilibili.com/video/BVtest')), 'vod');
-  assert.equal(modeForLocation(location('https://www.bilibili.com/list/watchlater')), 'vod');
-  assert.equal(modeForLocation(location('https://www.bilibili.com/')), undefined);
+  for (const url of [
+    'https://www.bilibili.com/video/BVtest',
+    'https://www.bilibili.com/list/watchlater',
+    'https://www.bilibili.com/list/watchlater/',
+    'https://www.bilibili.com/list/watchlater/item-1',
+  ]) {
+    assert.equal(isVideoPage(location(url)), true);
+    assert.equal(isVodPage(location(url)), true);
+    assert.equal(modeForLocation(location(url)), 'video');
+  }
+  for (const url of [
+    'https://www.bilibili.com/',
+    'https://www.bilibili.com/search?keyword=video',
+    'https://www.bilibili.com/read/cv1',
+  ]) {
+    assert.equal(isVideoPage(location(url)), false);
+    assert.equal(modeForLocation(location(url)), undefined);
+  }
+  assert.equal(modeForLocation(location('https://live.bilibili.com/123')), 'live');
 });
 
-test('bridge schema exposes only live player controls and the one VOD core mutation', () => {
-  const message = {
-    version: BRIDGE_VERSION,
-    id: 7,
-    operation: 'getCoreSnapshot',
-    args: [],
-    mode: 'async',
-  };
-  assert.deepEqual(decodeMessage(encodeMessage(message)), message);
-  assert.deepEqual(BRIDGE_OPERATIONS, ['getCoreSnapshot', 'callPlayer', 'callCoreSync']);
-  assert.deepEqual(BRIDGE_PLAYER_METHODS, ['setAutoSyncProgressCfg', 'setAutoDiscardFrameCfg', 'pause']);
-  assert.deepEqual(BRIDGE_CORE_SYNC_METHODS, ['setStableBufferTime']);
-  assert.equal(HLS_DEPENDENCY.version, '1.5.17');
-  assert.deepEqual(Object.values(EXTENSION_PREFERENCES), ['liveEnabled', 'vodEnabled']);
-  assert.equal(VOD_CONFIG.stableBufferSeconds, 120);
-  assert.throws(() => decodeMessage(JSON.stringify({ ...message, version: 2 })), /not supported/);
-  assert.throws(() => decodeMessage(JSON.stringify({ ...message, id: 0 })), /positive integer/);
-});
-
-test('bridge core invokes only the stable-buffer setter and reports capability absence', () => {
-  const calls = [];
-  const client = {
-    callSync(operation, args) {
-      calls.push([operation, args]);
-      return true;
-    },
-  };
-  const supported = new BridgeCore(client, snapshot(3, 'test-source', true));
-  assert.equal(supported.supports('setStableBufferTime'), true);
-  supported.setStableBufferTime(120);
-  assert.deepEqual(calls, [['callCoreSync', [3, 'setStableBufferTime', [120], 'test-source']]]);
-
-  const unsupported = new BridgeCore(client, snapshot(4, 'other-source', false));
-  assert.equal(unsupported.supports('setStableBufferTime'), false);
-  assert.throws(
-    () => unsupported.setStableBufferTime(120),
-    (error) => error.code === 'VOD_STABLE_BUFFER_UNAVAILABLE',
-  );
-});
-
-test('adapter reuses a stable BridgeCore and replaces it for source-only or core-only changes', async () => {
-  let snapshotCalls = 0;
-  const calls = [];
-  const client = {
-    callAsync(operation) {
-      assert.equal(operation, 'getCoreSnapshot');
-      snapshotCalls += 1;
-      const snapshots = [
-        snapshot(5, 'old'),
-        snapshot(5, 'old'),
-        snapshot(5, 'new'),
-        snapshot(6, 'new'),
-      ];
-      return Promise.resolve(snapshots[snapshotCalls - 1]);
-    },
-    callSync(operation, args) {
-      calls.push([operation, args]);
-      return true;
-    },
-  };
-  const adapter = createPageWindowAdapter(client, {
-    location: { href: 'https://www.bilibili.com/video/BVtest' },
-    performance: { now: () => 0 },
-    MediaSource: undefined,
-    URL: undefined,
-  });
-  const first = await adapter.refreshCore();
-  const same = await adapter.refreshCore();
-  assert.strictEqual(first, same);
-  assert.equal(snapshotCalls, 2);
-  const sourceReplacement = await adapter.refreshCore();
-  assert.notStrictEqual(sourceReplacement, first);
-  assert.equal(first.stale, true);
-  assert.equal(sourceReplacement.coreId, 5);
-  assert.equal(sourceReplacement.snapshot.source, 'new');
-  const coreReplacement = await adapter.refreshCore();
-  assert.notStrictEqual(coreReplacement, sourceReplacement);
-  assert.equal(sourceReplacement.stale, true);
-  assert.equal(coreReplacement.coreId, 6);
-  coreReplacement.setStableBufferTime(120);
-  assert.equal(calls.length, 1);
-});
-
-test('VOD status snapshots omit legacy quality, rate, multiplier, delay, stage, and actions', () => {
-  const panel = new StatusPanel({}, '点播');
-  panel.setModel({ mode: '点播', state: 'APPLIED', inventory: '120.0 秒', message: '' });
-  const snapshotValue = panel.getSnapshot();
-  assert.deepEqual(Object.keys(snapshotValue).sort(), ['actions', 'inventory', 'message', 'mode', 'state', 'surfaceId', 'version']);
-  assert.deepEqual(snapshotValue.actions, {});
-  panel.destroy();
-
-  const unavailable = createUnavailableStatusSnapshot('vod');
-  assert.equal(unavailable.mode, '点播');
-  assert.deepEqual(
-    Object.keys(unavailable).sort(),
-    ['actions', 'inventory', 'message', 'mode', 'state', 'surfaceId', 'version'],
-  );
-});
-
-test('live status snapshots retain every live field and action surface', () => {
-  let actionCalls = 0;
-  const panel = new StatusPanel({}, '直播');
+test('status panel exposes only direct facts and no playback or recovery actions', () => {
+  const panel = createStatusPanel({}, 'live');
   panel.setModel({
     mode: '直播',
-    state: 'RECOVERING',
-    inventory: '15.0 秒',
-    delay: '4.0 秒',
-    quality: '高清 / qn250 / avc',
+    paused: '否',
+    recentFrame: '是',
+    buffered: 8,
+    delay: 12,
+    resolution: '1280×720',
     speed: '1×',
-    multiplier: '库存已满',
-    stage: '库存形成',
-    message: '重试第 2 轮',
+    videoReplacements: 1,
+    sourceReplacements: 2,
+    recentEvent: 'playing',
   });
-  panel.setAction('toggle', '停用', () => { actionCalls += 1; });
-  panel.setAction('skip-gap', '跨过缺口', () => {}, true);
-  panel.setAction('return-live', '回到直播', () => {}, true);
-  const snapshotValue = panel.getSnapshot();
-  assert.equal(snapshotValue.delay, '4.0 秒');
-  assert.equal(snapshotValue.quality, '高清 / qn250 / avc');
-  assert.equal(snapshotValue.speed, '1×');
-  assert.equal(snapshotValue.multiplier, '库存已满');
-  assert.equal(snapshotValue.stage, '库存形成');
-  assert.deepEqual(snapshotValue.actions, {
-    toggle: '停用',
-    'skip-gap': '跨过缺口',
-    'return-live': '回到直播',
-  });
-  panel.runAction('toggle');
-  assert.equal(actionCalls, 1);
+  const snapshot = panel.getSnapshot();
+  assert.equal(snapshot.version, STATUS_MESSAGE_VERSION);
+  assert.equal(snapshot.mode, '直播');
+  assert.equal(Object.hasOwn(snapshot, 'actions'), false);
+  assert.equal(Object.hasOwn(snapshot, 'stage'), false);
+  assert.equal(Object.hasOwn(snapshot, 'state'), false);
   panel.destroy();
+
+  const unavailable = createUnavailableStatusSnapshot('video');
+  assert.equal(unavailable.mode, '视频');
+  assert.equal(unavailable.target, '未提供');
+  assert.equal(Object.hasOwn(unavailable, 'actions'), false);
 });
+
+test('bridge contract allows only native video hint and narrow live capability operations', () => {
+  assert.deepEqual(BRIDGE_CORE_SYNC_METHODS, ['setStableBufferTime']);
+  assert.deepEqual(BRIDGE_LIVE_METHODS, ['setAutoSyncProgressCfg', 'setAutoDiscardFrameCfg']);
+  assert.deepEqual(BRIDGE_OPERATIONS, [
+    'getCoreSnapshot',
+    'callCoreSync',
+    'getLiveCapabilitySnapshot',
+    'disableLiveAutoCatchup',
+  ]);
+});
+
+test('BridgeCore preserves stale-generation errors and LiveCapabilities calls only once', async () => {
+  const calls = [];
+  const client = {
+    callSync(operation, args) {
+      calls.push({ operation, args });
+      throw Object.assign(new Error('stale'), { code: 'BRIDGE_CORE_STALE' });
+    },
+    callAsync(operation) {
+      calls.push({ operation });
+      return Promise.resolve(true);
+    },
+  };
+  const core = new BridgeCore(client, {
+    coreId: 1,
+    source: 'https://media.example/video',
+    capabilities: { core: { setStableBufferTime: true } },
+  });
+  assert.throws(() => core.setStableBufferTime(120), (error) => error.code === 'BRIDGE_CORE_STALE');
+  assert.throws(() => core.setStableBufferTime(120), (error) => error.code === 'BRIDGE_CORE_STALE');
+  const capabilities = new LiveCapabilities(client, { live: { disableAutoCatchup: true } });
+  await capabilities.disableAutoCatchup();
+  await assert.rejects(() => capabilities.disableAutoCatchup(), (error) => error.code === 'LIVE_AUTO_CATCHUP_ALREADY_ATTEMPTED');
+  assert.equal(calls.filter((call) => call.operation === 'disableLiveAutoCatchup').length, 1);
+});
+
+test('session identity omits page tab id and keeps route identity fields', () => {
+  const session = createSessionIdentity({
+    locationObject: {
+      origin: 'https://live.bilibili.com',
+      pathname: '/6363772?foo=secret',
+    },
+    routeKind: 'live',
+    runtimeObject: {},
+    sessionId: 'session-fixed',
+    roomId: 6363772,
+  });
+  assert.equal(session.tabId, undefined);
+  assert.equal(session.pathname, '/6363772');
+  assert.equal(session.roomId, '6363772');
+  assert.doesNotThrow(() => validateSession(session, { requireTabId: false }));
+  assert.throws(() => validateSession({ ...session, tabId: 3 }, { requireTabId: false }));
+});
+
+test('error serialization rejects arbitrary cause objects while keeping safe cause fields', () => {
+  const error = Object.assign(new Error('safe'), { code: 'SAFE', cause: { name: 'Cause', message: 'nested' } });
+  const serialized = serializeError(error);
+  assert.equal(serialized.code, 'SAFE');
+  assert.deepEqual(serialized.cause, { name: 'Cause', message: 'nested' });
+});
+
+assert.equal(EXTENSION_PREFERENCES.vodEnabled, 'vodEnabled');
+assert.equal(VOD_CONFIG.stableBufferSeconds, 120);

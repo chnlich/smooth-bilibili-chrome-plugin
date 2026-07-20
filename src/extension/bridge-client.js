@@ -38,6 +38,24 @@ function isSerializable(value, depth = 0) {
   return values.length <= (Array.isArray(value) ? 256 : 64) && values.every((item) => isSerializable(item, depth + 1));
 }
 
+function validateSerializedError(value, depth = 0) {
+  if (!isObject(value) || depth >= 8) {
+    fail('BRIDGE_RESPONSE_INVALID', '桥接错误对象格式无效');
+  }
+  const allowedFields = new Set(['name', 'code', 'message', 'stack', 'cause']);
+  if (Object.keys(value).some((field) => !allowedFields.has(field))) {
+    fail('BRIDGE_RESPONSE_INVALID', '桥接错误对象包含未允许字段');
+  }
+  for (const field of ['name', 'code', 'message', 'stack']) {
+    if (Object.prototype.hasOwnProperty.call(value, field) && typeof value[field] !== 'string') {
+      fail('BRIDGE_RESPONSE_INVALID', `桥接错误字段 ${field} 无效`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'cause')) {
+    if (typeof value.cause !== 'string') validateSerializedError(value.cause, depth + 1);
+  }
+}
+
 function logInvalidBridgePayload(kind, error) {
   console.warn(`[BilibiliBuffer] 忽略无效桥接${kind}`, serializeError(error));
 }
@@ -45,6 +63,13 @@ function logInvalidBridgePayload(kind, error) {
 function validateResponse(response) {
   if (!isObject(response) || typeof response.operation !== 'string' || typeof response.ok !== 'boolean') {
     fail('BRIDGE_RESPONSE_INVALID', '桥接响应格式无效');
+  }
+  const allowedFields = new Set(['version', 'id', 'operation', 'ok', 'value', 'error']);
+  if (Object.keys(response).some((field) => !allowedFields.has(field))) {
+    fail('BRIDGE_RESPONSE_INVALID', '桥接响应包含未允许字段');
+  }
+  if (!Number.isInteger(response.id) || response.id <= 0 || response.version !== BRIDGE_VERSION) {
+    fail('BRIDGE_RESPONSE_INVALID', '桥接响应身份字段无效');
   }
   assertOperation(response.operation);
   if (Object.prototype.hasOwnProperty.call(response, 'value') && !isSerializable(response.value)) {
@@ -56,6 +81,13 @@ function validateResponse(response) {
   ) {
     fail('BRIDGE_RESPONSE_INVALID', '桥接失败响应缺少错误代码或消息');
   }
+  if (response.ok && Object.prototype.hasOwnProperty.call(response, 'error')) {
+    fail('BRIDGE_RESPONSE_INVALID', '桥接成功响应不得包含错误');
+  }
+  if (!response.ok && Object.prototype.hasOwnProperty.call(response, 'value')) {
+    fail('BRIDGE_RESPONSE_INVALID', '桥接失败响应不得包含值');
+  }
+  if (Object.prototype.hasOwnProperty.call(response, 'error')) validateSerializedError(response.error);
   return response;
 }
 
@@ -72,6 +104,11 @@ function validateCoreSnapshot(snapshot) {
   if (!isObject(snapshot.capabilities) || !isObject(coreCapabilities)) {
     fail('BRIDGE_SNAPSHOT_INVALID', '桥接内核快照缺少真实能力标记');
   }
+  if (Object.keys(snapshot).some((field) => !CORE_SNAPSHOT_FIELDS.includes(field)) ||
+    Object.keys(snapshot.capabilities).some((field) => field !== 'core') ||
+    Object.keys(coreCapabilities).some((field) => field !== 'setStableBufferTime')) {
+    fail('BRIDGE_SNAPSHOT_INVALID', '桥接内核快照包含未允许字段');
+  }
   for (const field of ['setStableBufferTime']) {
     if (typeof coreCapabilities[field] !== 'boolean') {
       fail('BRIDGE_SNAPSHOT_INVALID', `桥接内核快照缺少能力标记: ${field}`);
@@ -85,8 +122,30 @@ function validateCoreSnapshot(snapshot) {
   return snapshot;
 }
 
+function validateLiveCapabilitySnapshot(snapshot) {
+  if (
+    !isObject(snapshot) ||
+    !isObject(snapshot.live) ||
+    typeof snapshot.live.disableAutoCatchup !== 'boolean'
+  ) {
+    fail('BRIDGE_LIVE_SNAPSHOT_INVALID', '桥接直播能力快照格式无效');
+  }
+  if (Object.keys(snapshot).some((field) => field !== 'live') ||
+    Object.keys(snapshot.live).some((field) => field !== 'disableAutoCatchup')) {
+    fail('BRIDGE_LIVE_SNAPSHOT_INVALID', '桥接直播能力快照包含未允许字段');
+  }
+  return snapshot;
+}
+
 function responseError(response) {
-  return new BufferScriptError(response.error?.code || 'BRIDGE_CALL_FAILED', response.error?.message || '桥接调用失败');
+  const error = new BufferScriptError(
+    response.error?.code || 'BRIDGE_CALL_FAILED',
+    response.error?.message || '桥接调用失败',
+    response.error?.cause,
+  );
+  if (typeof response.error?.name === 'string') error.name = response.error.name;
+  if (typeof response.error?.stack === 'string') error.stack = response.error.stack;
+  return error;
 }
 
 function customEventClass(documentObject) {
@@ -99,6 +158,7 @@ export class BridgeClient {
     this.runtimeObject = runtimeObject;
     this.nextId = 1;
     this.pending = new Map();
+    this.diagnostics = undefined;
     this.destroyed = false;
     this.onResponse = (event) => this.resolveResponse(event.detail);
     documentObject.addEventListener(BRIDGE_RESPONSE_EVENT, this.onResponse);
@@ -125,6 +185,14 @@ export class BridgeClient {
     );
   }
 
+  diagnostic(code, data, error) {
+    try {
+      this.diagnostics?.log(code, data, error);
+    } catch (diagnosticError) {
+      console.error('[BilibiliBuffer] bridge diagnostic failed', serializeError(diagnosticError));
+    }
+  }
+
   decodeResponse(serialized, expectedId, expectedOperation) {
     const response = validateResponse(decodeMessage(serialized));
     if (response.id !== expectedId || response.operation !== expectedOperation) {
@@ -138,30 +206,41 @@ export class BridgeClient {
 
   callSync(operation, args = []) {
     const request = this.createRequest(operation, args, 'sync');
+    this.diagnostic('bridge.request', { operation, direction: 'content-to-main' });
     if (this.documentObject.documentElement === null) {
-      fail('BRIDGE_DOCUMENT_UNAVAILABLE', '桥接调用时页面 documentElement 不可用');
+      const error = new BufferScriptError('BRIDGE_DOCUMENT_UNAVAILABLE', '桥接调用时页面 documentElement 不可用');
+      this.diagnostic('bridge.error', { operation, direction: 'content-to-main' }, error);
+      throw error;
     }
     this.documentObject.documentElement.setAttribute(BRIDGE_RESPONSE_ATTRIBUTE, '');
     this.dispatch(request);
     const serialized = this.documentObject.documentElement.getAttribute(BRIDGE_RESPONSE_ATTRIBUTE);
     this.documentObject.documentElement.removeAttribute(BRIDGE_RESPONSE_ATTRIBUTE);
     if (serialized === null || serialized.length === 0) {
-      fail('BRIDGE_RESPONSE_MISSING', `桥接同步操作没有响应: ${operation}`);
+      const error = new BufferScriptError('BRIDGE_RESPONSE_MISSING', `桥接同步操作没有响应: ${operation}`);
+      this.diagnostic('bridge.error', { operation, direction: 'main-to-content' }, error);
+      throw error;
     }
     try {
-      return this.decodeResponse(serialized, request.id, request.operation);
+      const value = this.decodeResponse(serialized, request.id, request.operation);
+      this.diagnostic('bridge.response', { operation, direction: 'main-to-content', status: 'ok' });
+      return value;
     } catch (error) {
       logInvalidBridgePayload('同步响应', error);
+      this.diagnostic('bridge.error', { operation, direction: 'main-to-content' }, error);
       throw error;
     }
   }
 
   callAsync(operation, args = []) {
     const request = this.createRequest(operation, args, 'async');
+    this.diagnostic('bridge.request', { operation, direction: 'content-to-main' });
     return new Promise((resolve, reject) => {
       const timer = this.runtimeObject.setTimeout(() => {
         this.pending.delete(request.id);
-        reject(new BufferScriptError('BRIDGE_RESPONSE_TIMEOUT', `桥接操作超时: ${operation}`));
+        const error = new BufferScriptError('BRIDGE_RESPONSE_TIMEOUT', `桥接操作超时: ${operation}`);
+        this.diagnostic('bridge.error', { operation, direction: 'main-to-content' }, error);
+        reject(error);
       }, 15000);
       this.pending.set(request.id, { resolve, reject, timer, operation });
       try {
@@ -169,7 +248,9 @@ export class BridgeClient {
       } catch (error) {
         this.runtimeObject.clearTimeout(timer);
         this.pending.delete(request.id);
-        reject(new BufferScriptError('BRIDGE_DISPATCH_FAILED', '桥接请求派发失败', error));
+        const wrapped = new BufferScriptError('BRIDGE_DISPATCH_FAILED', '桥接请求派发失败', error);
+        this.diagnostic('bridge.error', { operation, direction: 'content-to-main' }, wrapped);
+        reject(wrapped);
       }
     });
   }
@@ -193,8 +274,15 @@ export class BridgeClient {
     this.pending.delete(response.id);
     this.runtimeObject.clearTimeout(pending.timer);
     try {
-      pending.resolve(this.decodeResponse(serialized, response.id, pending.operation));
+      const value = this.decodeResponse(serialized, response.id, pending.operation);
+      this.diagnostic('bridge.response', {
+        operation: pending.operation,
+        direction: 'main-to-content',
+        status: 'ok',
+      });
+      pending.resolve(value);
     } catch (error) {
+      this.diagnostic('bridge.error', { operation: pending.operation, direction: 'main-to-content' }, error);
       pending.reject(error);
     }
   }
@@ -266,9 +354,30 @@ export class BridgeCore {
 
   setStableBufferTime(seconds) {
     if (!this.supports('setStableBufferTime')) {
-      fail('VOD_STABLE_BUFFER_UNAVAILABLE', '点播内核没有稳定缓冲设置能力');
+      fail('VOD_STABLE_BUFFER_UNAVAILABLE', '视频内核没有稳定缓存设置能力');
     }
     return this.callCoreSync('setStableBufferTime', [seconds]);
+  }
+}
+
+export class LiveCapabilities {
+  constructor(client, snapshot) {
+    validateLiveCapabilitySnapshot(snapshot);
+    this.client = client;
+    this.snapshot = snapshot;
+    this.used = false;
+  }
+
+  supportsDisableAutoCatchup() {
+    return this.snapshot.live.disableAutoCatchup === true;
+  }
+
+  async disableAutoCatchup() {
+    if (this.used) {
+      fail('LIVE_AUTO_CATCHUP_ALREADY_ATTEMPTED', '关闭自动追赶能力只能尝试一次');
+    }
+    this.used = true;
+    return this.client.callAsync('disableLiveAutoCatchup', []);
   }
 }
 
@@ -282,25 +391,18 @@ export function createPageWindowAdapter(client, windowObject = window) {
       }
       return state.core;
     },
-    setAutoSyncProgressCfg(value) {
-      return client.callAsync('callPlayer', ['setAutoSyncProgressCfg', value]);
-    },
-    setAutoDiscardFrameCfg(value) {
-      return client.callAsync('callPlayer', ['setAutoDiscardFrameCfg', value]);
-    },
-    pause() {
-      return client.callAsync('callPlayer', ['pause']);
-    },
   };
   const pageWindow = {
     location: windowObject.location,
     performance: windowObject.performance,
-    MediaSource: windowObject.MediaSource,
-    URL: windowObject.URL,
     player,
   };
   return {
     pageWindow,
+    async refreshLiveCapabilities() {
+      const snapshot = await client.callAsync('getLiveCapabilitySnapshot', []);
+      return new LiveCapabilities(client, snapshot);
+    },
     async refreshCore() {
       if (refreshPromise === undefined) {
         refreshPromise = client

@@ -16,10 +16,3 @@ export function toBufferScriptError(error, code, message) {
   }
   return new BufferScriptError(code, message, error);
 }
-
-export function requireValue(value, code, message) {
-  if (value === undefined || value === null) {
-    fail(code, message);
-  }
-  return value;
-}

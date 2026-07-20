@@ -1,7 +1,7 @@
 import {
   assertOperation,
   BRIDGE_CORE_SYNC_METHODS,
-  BRIDGE_PLAYER_METHODS,
+  BRIDGE_LIVE_METHODS,
   BRIDGE_REQUEST_EVENT,
   BRIDGE_RESPONSE_ATTRIBUTE,
   BRIDGE_RESPONSE_EVENT,
@@ -103,35 +103,41 @@ function requireArguments(args, count) {
   return args;
 }
 
-async function callPlayer(args) {
-  if (!Array.isArray(args) || args.length < 1 || args.length > 2) {
-    throw Object.assign(new Error('页面播放器操作参数数量错误'), { code: 'BRIDGE_ARGUMENTS_INVALID' });
+function livePlayerCandidates() {
+  return [
+    globalThis.__PLAYER_GLOBAL_INSTANCE__,
+    globalThis.EmbedPlayer?.instance,
+    globalThis.livePlayer,
+    globalThis.player,
+  ].filter((candidate) => candidate !== undefined && candidate !== null);
+}
+
+function liveAutoCatchupCandidate() {
+  return livePlayerCandidates().find((candidate) =>
+    BRIDGE_LIVE_METHODS.some((method) => typeof candidate?.[method] === 'function'));
+}
+
+function getLiveCapabilitySnapshot() {
+  const candidate = liveAutoCatchupCandidate();
+  return {
+    live: {
+      disableAutoCatchup: candidate !== undefined,
+    },
+  };
+}
+
+async function disableLiveAutoCatchup() {
+  const candidate = liveAutoCatchupCandidate();
+  if (candidate === undefined) {
+    throw Object.assign(new Error('页面播放器没有关闭自动追赶能力'), {
+      code: 'LIVE_AUTO_CATCHUP_UNAVAILABLE',
+    });
   }
-  const [method, value] = args;
-  if (!BRIDGE_PLAYER_METHODS.includes(method)) {
-    throw Object.assign(new Error(`页面播放器操作未允许: ${method}`), { code: 'BRIDGE_OPERATION_DENIED' });
-  }
-  const player = pagePlayerObject();
-  if (typeof player[method] !== 'function') {
-    throw Object.assign(new Error(`当前页面播放器没有 ${method}`), { code: 'BRIDGE_METHOD_UNAVAILABLE' });
-  }
-  if (method === 'pause') {
-    if (args.length !== 1) {
-      throw Object.assign(new Error('pause 不接受参数'), { code: 'BRIDGE_ARGUMENTS_INVALID' });
+  for (const method of BRIDGE_LIVE_METHODS) {
+    if (typeof candidate[method] === 'function') {
+      await candidate[method]({ enable: false });
     }
-    await player.pause();
-    return true;
   }
-  if (
-    value === null ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.keys(value).length !== 1 ||
-    value.enable !== false && value.enable !== true
-  ) {
-    throw Object.assign(new Error(`${method} 参数必须是 {enable:boolean}`), { code: 'BRIDGE_ARGUMENTS_INVALID' });
-  }
-  await player[method](value);
   return true;
 }
 
@@ -160,10 +166,14 @@ function invoke(request) {
     case 'getCoreSnapshot':
       requireArguments(request.args, 0);
       return getCoreSnapshot();
-    case 'callPlayer':
-      return callPlayer(request.args);
     case 'callCoreSync':
       return callCoreSync(request.args);
+    case 'getLiveCapabilitySnapshot':
+      requireArguments(request.args, 0);
+      return getLiveCapabilitySnapshot();
+    case 'disableLiveAutoCatchup':
+      requireArguments(request.args, 0);
+      return disableLiveAutoCatchup();
     default:
       throw new Error(`未处理的桥接操作: ${request.operation}`);
   }
@@ -200,6 +210,10 @@ function respond(request, operation) {
 document.addEventListener(BRIDGE_REQUEST_EVENT, (event) => {
   try {
     const request = decodeMessage(event.detail);
+    const requestFields = new Set(['version', 'id', 'operation', 'args', 'mode']);
+    if (Object.keys(request).some((field) => !requestFields.has(field))) {
+      throw new Error('bridge request contains fields that are not allowed');
+    }
     if (request.mode !== 'sync' && request.mode !== 'async') {
       throw new Error('bridge request mode is invalid');
     }
