@@ -185,22 +185,42 @@ export function normalizeEventForStorage(event) {
   return result;
 }
 
-function sanitizeSerializedError(error, seen = new WeakSet(), depth = 0) {
+function sanitizeSerializedError(error) {
   if (typeof error === 'string') return scrubErrorText(error);
-  if (error === null || typeof error !== 'object' || Array.isArray(error)) {
-    return UNKNOWN_VALUE;
+  if (error === null || typeof error !== 'object' || Array.isArray(error)) return UNKNOWN_VALUE;
+  const seen = new WeakSet();
+  let source = error;
+  let result = {};
+  const root = result;
+  for (;;) {
+    if (seen.has(source)) {
+      result = '[Circular]';
+      break;
+    }
+    seen.add(source);
+    for (const field of ['name', 'code', 'message', 'stack']) {
+      if (typeof source[field] === 'string') result[field] = scrubErrorText(source[field]);
+    }
+    if (!Object.prototype.hasOwnProperty.call(source, 'cause')) break;
+    const cause = source.cause;
+    if (typeof cause === 'string') {
+      result.cause = scrubErrorText(cause);
+      break;
+    }
+    if (cause === null || typeof cause !== 'object' || Array.isArray(cause)) {
+      result.cause = UNKNOWN_VALUE;
+      break;
+    }
+    if (seen.has(cause)) {
+      result.cause = '[Circular]';
+      break;
+    }
+    const next = {};
+    result.cause = next;
+    result = next;
+    source = cause;
   }
-  if (seen.has(error)) return '[Circular]';
-  if (depth >= 8) return '[CauseDepthLimit]';
-  seen.add(error);
-  const result = {};
-  for (const field of ['name', 'code', 'message', 'stack']) {
-    if (typeof error[field] === 'string') result[field] = scrubErrorText(error[field]);
-  }
-  if (Object.prototype.hasOwnProperty.call(error, 'cause')) {
-    result.cause = sanitizeSerializedError(error.cause, seen, depth + 1);
-  }
-  return result;
+  return root;
 }
 
 export function resourceTimingFields(entry) {

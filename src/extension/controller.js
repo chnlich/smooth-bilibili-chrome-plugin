@@ -253,10 +253,20 @@ export class ExtensionCoordinator {
     panel.setModel({
       mode: mode === 'live' ? '直播' : '视频',
       ...(mode === 'live'
-        ? { paused: '未提供', recentFrame: '未提供', buffered: '未提供', delay: '未提供' }
-        : { state: 'WAITING', buffered: '未提供', target: '120 秒', error: '等待原生 video、媒体 source 和播放器内核' }),
-      sessionId: this.diagnostics?.getStatus?.().sessionId,
-      persistence: this.diagnostics?.getStatus?.().persistence,
+        ? {
+          paused: '未提供',
+          recentFrame: '未提供',
+          buffered: '未提供',
+          delay: '未提供',
+          sessionId: this.diagnostics?.getStatus?.().sessionId,
+          persistence: this.diagnostics?.getStatus?.().persistence,
+        }
+        : {
+          state: 'WAITING',
+          buffered: '未提供',
+          target: '120 秒',
+          error: '等待原生 video、媒体 source 和播放器内核',
+        }),
     });
     this.diagnostics?.log('preference.changed', { name: preferenceKeyForMode(mode), enabled: true });
     const routeStillCurrent = () =>

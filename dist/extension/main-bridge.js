@@ -39,34 +39,44 @@
   }
   function serializeError(error) {
     const seen = /* @__PURE__ */ new WeakSet();
-    const serialize = (value, depth) => {
-      if (value === void 0 || value === null) {
-        return void 0;
+    let value = error;
+    let serialized;
+    if (value === void 0 || value === null) {
+      serialized = { message: "未知错误" };
+    } else if (typeof value !== "object" && typeof value !== "function") {
+      serialized = { name: typeof value, message: String(value) };
+    } else {
+      serialized = {};
+      let current = serialized;
+      for (; ; ) {
+        if (seen.has(value)) {
+          current.cause = "[Circular]";
+          break;
+        }
+        seen.add(value);
+        const name = typeof value.name === "string" ? value.name : void 0;
+        const code = typeof value.code === "string" ? value.code : void 0;
+        const message = typeof value.message === "string" ? value.message : String(value);
+        const stack = typeof value.stack === "string" ? value.stack : void 0;
+        if (name !== void 0) current.name = name;
+        if (code !== void 0) current.code = code;
+        current.message = message;
+        if (stack !== void 0) current.stack = stack;
+        const cause = value.cause;
+        if (cause === void 0 || cause === null) break;
+        if (typeof cause !== "object" && typeof cause !== "function") {
+          current.cause = { name: typeof cause, message: String(cause) };
+          break;
+        }
+        if (seen.has(cause)) {
+          current.cause = "[Circular]";
+          break;
+        }
+        current.cause = {};
+        current = current.cause;
+        value = cause;
       }
-      if (typeof value !== "object" && typeof value !== "function") {
-        return { name: typeof value, message: String(value) };
-      }
-      if (seen.has(value)) {
-        return "[Circular]";
-      }
-      if (depth >= 8) {
-        return "[CauseDepthLimit]";
-      }
-      seen.add(value);
-      const result = {};
-      const name = typeof value.name === "string" ? value.name : void 0;
-      const code = typeof value.code === "string" ? value.code : void 0;
-      const message = typeof value.message === "string" ? value.message : String(value);
-      const stack = typeof value.stack === "string" ? value.stack : void 0;
-      if (name !== void 0) result.name = name;
-      if (code !== void 0) result.code = code;
-      result.message = message;
-      if (stack !== void 0) result.stack = stack;
-      const cause = serialize(value.cause, depth + 1);
-      if (cause !== void 0) result.cause = cause;
-      return result;
-    };
-    const serialized = serialize(error, 0) || { message: "未知错误" };
+    }
     return {
       name: serialized.name || "Error",
       code: serialized.code || "BRIDGE_CALL_FAILED",

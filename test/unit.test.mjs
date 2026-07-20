@@ -6,9 +6,17 @@ import { LiveObserver } from '../src/live/observer.js';
 import { ExtensionCoordinator } from '../src/extension/controller.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
 import { VodBufferController } from '../src/vod/controller.js';
-import { DiagnosticsClient } from '../src/diagnostics/client.js';
+import { DiagnosticsClient, createRouteIdentity } from '../src/diagnostics/client.js';
+import { MediaEventRecorder, readMediaFacts } from '../src/diagnostics/media.js';
 import { MEDIA_EVENT_NAMES, EVENT_CODES } from '../src/diagnostics/catalog.js';
-import { browserMetric, sanitizeEventData, scrubUrl } from '../src/diagnostics/privacy.js';
+import {
+  browserMetric,
+  normalizeEventForStorage,
+  sanitizeEventData,
+  scrubUrl,
+} from '../src/diagnostics/privacy.js';
+import { BridgeClient } from '../src/extension/bridge-client.js';
+import { encodeMessage } from '../src/extension/bridge-contract.js';
 
 function ranges(values) {
   return {
@@ -116,6 +124,18 @@ function eventDocument(video) {
         remove() {},
       };
     },
+  };
+}
+
+function timelineControl(attributes = {}) {
+  return {
+    tagName: 'input',
+    type: 'range',
+    parentElement: null,
+    getAttribute(name) {
+      return Object.hasOwn(attributes, name) ? attributes[name] : null;
+    },
+    ...attributes,
   };
 }
 
@@ -588,7 +608,11 @@ test('a trusted user seek cancels live protection and suppresses pre-first-frame
   observer.start();
   video.emit('loadeddata');
   video.emit('waiting');
-  documentObject.emit('pointerdown', { isTrusted: true });
+  documentObject.emit('pointerdown', {
+    type: 'pointerdown',
+    isTrusted: true,
+    target: timelineControl({ id: 'seek', 'data-seek': '' }),
+  });
   video.currentTime = 70;
   video.emit('seeking');
   video.emit('waiting');
@@ -662,17 +686,17 @@ test('live visual cover appears only for an active-stall media gap', () => {
   video.currentSrc = 'https://media.example/live-cover-new';
   video.src = video.currentSrc;
   observer.sample();
-  assert.equal(coverCalls, 0);
+  assert.equal(coverCalls, 1);
 
   video.currentSrc = '';
   video.src = '';
   observer.sample();
-  assert.equal(coverCalls, 1);
-  video.emit('emptied');
   assert.equal(coverCalls, 2);
+  video.emit('emptied');
+  assert.equal(coverCalls, 3);
 
   observer.bindVideo(mediaVideo('https://media.example/live-cover-replacement'));
-  assert.equal(coverCalls, 3);
+  assert.equal(coverCalls, 4);
   observer.destroy();
 });
 
@@ -698,7 +722,7 @@ test('live replacement rebases an unavailable protected time and skips cleared s
   video.currentTime = 115;
   observer.sample();
   assert.deepEqual(video.assignments, [115, 100]);
-  assert.equal(observer.activeStall.protectedTime, 100);
+  assert.equal(observer.activeStall.protectedDelay, 20);
   assert.equal(
     diagnostics.events.find((event) => event.code === 'live.delay.corrected').data.currentTime,
     115,
@@ -717,6 +741,200 @@ test('live replacement rebases an unavailable protected time and skips cleared s
   observer.sample();
   assert.deepEqual(video.assignments, []);
   observer.destroy();
+});
+
+test('live protection is continuous in readable delay and never follows an old absolute time', () => {
+  const video = mediaVideo('https://media.example/live-delay-continuity');
+  video.currentTime = 90;
+  const documentObject = eventDocument(video);
+  const observer = new LiveObserver({
+    documentObject,
+    windowObject: {},
+    runtimeObject: runtimeWithIntervals(),
+    initialVideo: video,
+    panel: { setModel() {} },
+    diagnostics: diagnosticsRecorder(),
+    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
+  });
+  observer.start();
+  video.emit('loadeddata');
+  video.emit('waiting');
+  assert.equal(observer.activeStall.protectedDelay, 30);
+
+  video.seekable = ranges([[0, 125]]);
+  video.currentTime = 90;
+  observer.onDecodedFrame(video);
+  assert.equal(observer.activeStall.protectedDelay, 35);
+
+  video.assignments.length = 0;
+  video.currentTime = 100;
+  video.emit('seeking');
+  assert.deepEqual(video.assignments, [100, 90]);
+
+  video.assignments.length = 0;
+  video.currentTime = 90;
+  observer.onDecodedFrame(video);
+  video.seekable = ranges([[100, 200]]);
+  video.currentTime = 165;
+  observer.onDecodedFrame(video);
+  video.assignments.length = 0;
+  video.emit('seeking');
+  assert.deepEqual(video.assignments, []);
+
+  video.seekable = ranges([[100, 210]]);
+  video.currentTime = 175;
+  video.assignments.length = 0;
+  video.emit('seeking');
+  assert.deepEqual(video.assignments, []);
+  observer.destroy();
+});
+
+test('repeated automatic forward seeks keep correcting delay loss without eroding the target', () => {
+  const video = mediaVideo('https://media.example/live-repeat-correction');
+  const observer = new LiveObserver({
+    documentObject: eventDocument(video),
+    windowObject: {},
+    runtimeObject: runtimeWithIntervals(),
+    initialVideo: video,
+    panel: { setModel() {} },
+    diagnostics: diagnosticsRecorder(),
+    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
+  });
+  observer.start();
+  video.emit('loadeddata');
+  video.seekable = ranges([[0, 125]]);
+  video.currentTime = 90;
+  video.emit('waiting');
+  observer.onDecodedFrame(video);
+  video.assignments.length = 0;
+
+  video.currentTime = 105;
+  video.emit('seeking');
+  video.currentTime = 106;
+  video.emit('seeking');
+  assert.deepEqual(video.assignments, [105, 90, 106, 90]);
+  assert.equal(observer.activeStall.protectedDelay, 35);
+  observer.destroy();
+});
+
+test('only timeline intent and seek keys authorize user control; video, quality, volume, and unrelated keys do not', () => {
+  const video = mediaVideo('https://media.example/live-user-intent');
+  const documentObject = eventDocument(video);
+  const observer = new LiveObserver({
+    documentObject,
+    windowObject: {},
+    runtimeObject: runtimeWithIntervals(),
+    initialVideo: video,
+    panel: { setModel() {} },
+    diagnostics: diagnosticsRecorder(),
+    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
+  });
+  observer.start();
+  video.emit('loadeddata');
+  video.seekable = ranges([[0, 125]]);
+  video.currentTime = 90;
+  video.emit('waiting');
+  observer.onDecodedFrame(video);
+
+  const assertAutomaticCorrection = (event) => {
+    video.assignments.length = 0;
+    video.currentTime = 105;
+    documentObject.emit(event.type, event);
+    video.emit('seeking');
+    assert.deepEqual(video.assignments, [105, 90]);
+  };
+  assertAutomaticCorrection({
+    type: 'pointerdown',
+    isTrusted: true,
+    target: video,
+  });
+  assertAutomaticCorrection({
+    type: 'pointerdown',
+    isTrusted: true,
+    target: timelineControl({ id: 'volume', 'aria-label': 'volume' }),
+  });
+  assertAutomaticCorrection({
+    type: 'pointerdown',
+    isTrusted: true,
+    target: timelineControl({ id: 'quality', 'aria-label': 'quality' }),
+  });
+  assertAutomaticCorrection({
+    type: 'keydown',
+    isTrusted: true,
+    key: 'ArrowRight',
+    target: { tagName: 'button', parentElement: null },
+  });
+
+  video.assignments.length = 0;
+  video.currentTime = 90;
+  const timeline = timelineControl({ id: 'timeline', 'data-seek': '' });
+  documentObject.emit('pointerdown', { type: 'pointerdown', isTrusted: true, target: timeline });
+  video.currentTime = 105;
+  video.emit('seeking');
+  assert.deepEqual(video.assignments, [90, 105]);
+  assert.equal(observer.activeStall, undefined);
+  observer.destroy();
+});
+
+test('tainted pixel reads preserve a successfully drawn memory frame without persisting pixels', () => {
+  const video = mediaVideo('https://media.example/live-tainted');
+  const appended = [];
+  video.parentElement = { append(canvas) { appended.push(canvas); } };
+  const frameContext = {
+    drawImage() {},
+    getImageData() { throw Object.assign(new Error('canvas is origin tainted'), { name: 'SecurityError' }); },
+  };
+  const documentObject = {
+    ...eventDocument(video),
+    createElement(name) {
+      if (name === 'canvas') {
+        return {
+          width: 0,
+          height: 0,
+          style: {},
+          setAttribute() {},
+          getContext() { return frameContext; },
+          remove() {},
+        };
+      }
+      throw new Error(`unexpected element ${name}`);
+    },
+  };
+  const observer = new LiveObserver({
+    documentObject,
+    windowObject: {},
+    runtimeObject: runtimeWithIntervals(),
+    initialVideo: video,
+    panel: { setModel() {} },
+    diagnostics: diagnosticsRecorder(),
+    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
+  });
+  observer.start();
+  observer.onDecodedFrame(video);
+  assert.notEqual(observer.frameCanvas, undefined);
+  video.emit('waiting');
+  observer.showOverlay();
+  assert.equal(observer.overlayCanvas, appended[0]);
+  assert.equal(observer.overlayCanvas.style.pointerEvents, 'none');
+  observer.destroy();
+});
+
+test('every catalog media event records its own eventType while samples remain sample', () => {
+  const video = mediaVideo('https://media.example/media-events');
+  const events = [];
+  const recorder = new MediaEventRecorder({
+    video,
+    runtimeObject: { setInterval(callback) { return callback; }, clearInterval() {} },
+    logger: { log(code, data) { events.push({ code, data }); } },
+  });
+  recorder.start();
+  for (const name of MEDIA_EVENT_NAMES) video.emit(name);
+  recorder.destroy();
+  assert.equal(events.find((event) => event.code === 'media.sample').data.eventType, 'sample');
+  for (const name of MEDIA_EVENT_NAMES) {
+    assert.equal(events.find((event) => event.code === `media.${name}`).data.eventType, name);
+  }
+  assert.equal(readMediaFacts(video, 'volumechange').eventType, 'volumechange');
 });
 
 test('diagnostic catalog covers all required media events and preserves browser-reported zero', () => {
@@ -747,7 +965,93 @@ test('diagnostic catalog covers all required media events and preserves browser-
   });
 });
 
-test('bridge error serialization keeps stack and a bounded circular cause chain', () => {
+test('watch-later route identity preserves the real item and omits an absent item', () => {
+  const item = createRouteIdentity({
+    hostname: 'www.bilibili.com',
+    pathname: '/list/watchlater/item-actual',
+    search: '?p=part-1',
+  });
+  assert.deepEqual(item, {
+    routeKind: 'video',
+    watchLaterItem: 'item-actual',
+    part: 'part-1',
+  });
+  assert.deepEqual(createRouteIdentity({
+    hostname: 'www.bilibili.com',
+    pathname: '/list/watchlater',
+    search: '',
+  }), { routeKind: 'video', watchLaterItem: undefined, part: undefined });
+});
+
+test('bridge and privacy error contracts preserve deep causes, scrub URLs, and mark cycles', () => {
+  let deepest = Object.assign(new Error('deep https://secret.example/path?token=redact'), { code: 'DEEP' });
+  for (let index = 0; index < 24; index += 1) {
+    deepest = Object.assign(new Error(`cause-${index} https://secret.example/${index}?token=redact`), {
+      code: `CAUSE_${index}`,
+      cause: deepest,
+    });
+  }
+  const error = Object.assign(new Error('outer https://secret.example/root?token=redact'), {
+    code: 'OUTER',
+    cause: deepest,
+  });
+  const serialized = serializeError(error);
+  let serializedDepth = 0;
+  let serializedCause = serialized.cause;
+  while (typeof serializedCause === 'object') {
+    serializedDepth += 1;
+    serializedCause = serializedCause.cause;
+  }
+  assert.equal(serializedDepth, 25);
+  assert.doesNotMatch(JSON.stringify(serialized), /CauseDepthLimit/);
+
+  const privacyEvent = normalizeEventForStorage({
+    sessionId: 'session-deep-error',
+    sequence: 1,
+    wallTime: '2026-07-20T00:00:00.000Z',
+    elapsedMs: 0,
+    code: 'extension.observer_error',
+    error: serialized,
+  });
+  assert.doesNotMatch(JSON.stringify(privacyEvent), /token=redact|CauseDepthLimit/);
+  assert.match(privacyEvent.error.cause.cause.message, /https:\/\/secret\.example\/\d+$/);
+
+  const circular = new Error('circular');
+  circular.cause = circular;
+  const circularEvent = normalizeEventForStorage({
+    sessionId: 'session-circular-error',
+    sequence: 1,
+    wallTime: '2026-07-20T00:00:00.000Z',
+    elapsedMs: 0,
+    code: 'extension.observer_error',
+    error: serializeError(circular),
+  });
+  assert.equal(circularEvent.error.cause, '[Circular]');
+
+  const bridgeDocument = {
+    defaultView: {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const bridgeClient = new BridgeClient(bridgeDocument, {
+    setTimeout() { return 1; },
+    clearTimeout() {},
+  });
+  const bridgeResponse = encodeMessage({
+    version: 1,
+    id: 1,
+    operation: 'getCoreSnapshot',
+    ok: false,
+    error: serialized,
+  });
+  assert.throws(
+    () => bridgeClient.decodeResponse(bridgeResponse, 1, 'getCoreSnapshot'),
+    (bridgeError) => bridgeError.cause?.cause?.cause?.cause?.cause !== undefined,
+  );
+  bridgeClient.destroy();
+});
+
+test('bridge error serialization keeps stack and a circular cause chain', () => {
   const cause = new Error('cause');
   const error = new Error('outer', { cause });
   cause.cause = error;

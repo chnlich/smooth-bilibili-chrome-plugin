@@ -9,8 +9,6 @@ const VIDEO_FIELDS = Object.freeze([
   'buffered',
   'target',
   'error',
-  'sessionId',
-  'persistence',
 ]);
 const LIVE_FIELDS = Object.freeze([
   'mode',

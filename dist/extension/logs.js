@@ -27,35 +27,6 @@
     }
     return response;
   }
-  function appendSessionOption(session) {
-    const option = document.createElement("option");
-    option.value = session.sessionId;
-    option.textContent = `${session.routeKind} · ${session.sessionId} · ${session.pathname}`;
-    option.dataset.routeKind = session.routeKind;
-    sessionSelect.append(option);
-  }
-  async function loadSessions() {
-    let afterSessionId;
-    for (; ; ) {
-      const response = await send({
-        type: "logs:sessions-page",
-        limit: PAGE_SIZE,
-        ...afterSessionId === void 0 ? {} : { afterSessionId }
-      });
-      for (const session of response.sessions) appendSessionOption(session);
-      if (!response.hasMore) break;
-      const nextAfterSessionId = response.nextAfterSessionId ?? response.sessions.at(-1)?.sessionId;
-      if (typeof nextAfterSessionId !== "string" || nextAfterSessionId.length === 0 || nextAfterSessionId === afterSessionId) {
-        throw new Error("日志 session 分页没有向前推进");
-      }
-      afterSessionId = nextAfterSessionId;
-    }
-    if (currentSessionId !== void 0) {
-      const option = [...sessionSelect.options].find((candidate) => candidate.value === currentSessionId);
-      if (option !== void 0) option.textContent = `当前 · ${option.textContent}`;
-    }
-    renderDetails();
-  }
   function selectedSessionId() {
     if (sessionSelect.value === "current") {
       if (currentSessionId === void 0) throw new Error("当前活动页面没有可用日志 session");
@@ -154,9 +125,11 @@
       exportButton.disabled = false;
     }
   });
-  void loadSessions().catch((error) => {
-    statusElement.textContent = `读取日志 session 失败: ${display(error?.message || error)}`;
-    console.error("[BilibiliBuffer] 日志页启动失败", error);
-  });
+  if (currentSessionId === void 0) {
+    sessionSelect.querySelector('option[value="current"]').disabled = true;
+  } else {
+    sessionSelect.value = "current";
+  }
+  renderDetails();
 })();
 //# sourceMappingURL=logs.js.map

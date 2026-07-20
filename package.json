@@ -6,7 +6,7 @@
   "description": "Bilibili native video buffering and live delay continuity Manifest V3 extension",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test:unit": "node --test test/unit.test.mjs test/extension-unit.test.mjs",
+    "test:unit": "node --test test/unit.test.mjs test/extension-unit.test.mjs test/idb-unit.test.mjs",
     "test:contract": "node test/build-contract.mjs",
     "test:e2e": "node scripts/browser-e2e.mjs",
     "smoke:external": "node scripts/smoke-external.mjs",

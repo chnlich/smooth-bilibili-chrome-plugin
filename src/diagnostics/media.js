@@ -14,7 +14,7 @@ function readNumber(value) {
   return Number.isFinite(value) ? value : UNKNOWN_VALUE;
 }
 
-export function readMediaFacts(video) {
+export function readMediaFacts(video, eventType = 'sample') {
   if (video === undefined || video === null) return UNKNOWN_VALUE;
   const bufferedRanges = readRanges(video.buffered);
   const seekableRanges = readRanges(video.seekable);
@@ -24,7 +24,7 @@ export function readMediaFacts(video) {
     estimatedDelay = Number.isFinite(end) ? Math.max(0, end - video.currentTime) : UNKNOWN_VALUE;
   }
   return {
-    eventType: 'sample',
+    eventType,
     bufferedRanges,
     seekableRanges,
     currentTime: readNumber(video.currentTime),
@@ -93,7 +93,7 @@ export class MediaEventRecorder {
   logMediaEvent(name, error) {
     let facts;
     try {
-      facts = readMediaFacts(this.video);
+      facts = readMediaFacts(this.video, name);
     } catch (error) {
       this.writeLog('extension.observer_error', { reason: 'media-facts' }, error);
       facts = {

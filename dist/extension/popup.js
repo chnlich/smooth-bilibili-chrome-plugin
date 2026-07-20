@@ -33,7 +33,7 @@
   // src/extension/popup.js
   var MESSAGE_VERSION = 2;
   var PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
-  var VIDEO_FIELDS = Object.freeze(["mode", "state", "buffered", "target", "error", "sessionId", "persistence"]);
+  var VIDEO_FIELDS = Object.freeze(["mode", "state", "buffered", "target", "error"]);
   var LIVE_FIELDS = Object.freeze([
     "mode",
     "paused",

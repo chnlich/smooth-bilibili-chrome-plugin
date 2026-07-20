@@ -44,34 +44,44 @@ export function assertOperation(operation) {
 
 export function serializeError(error) {
   const seen = new WeakSet();
-  const serialize = (value, depth) => {
-    if (value === undefined || value === null) {
-      return undefined;
+  let value = error;
+  let serialized;
+  if (value === undefined || value === null) {
+    serialized = { message: '未知错误' };
+  } else if (typeof value !== 'object' && typeof value !== 'function') {
+    serialized = { name: typeof value, message: String(value) };
+  } else {
+    serialized = {};
+    let current = serialized;
+    for (;;) {
+      if (seen.has(value)) {
+        current.cause = '[Circular]';
+        break;
+      }
+      seen.add(value);
+      const name = typeof value.name === 'string' ? value.name : undefined;
+      const code = typeof value.code === 'string' ? value.code : undefined;
+      const message = typeof value.message === 'string' ? value.message : String(value);
+      const stack = typeof value.stack === 'string' ? value.stack : undefined;
+      if (name !== undefined) current.name = name;
+      if (code !== undefined) current.code = code;
+      current.message = message;
+      if (stack !== undefined) current.stack = stack;
+      const cause = value.cause;
+      if (cause === undefined || cause === null) break;
+      if (typeof cause !== 'object' && typeof cause !== 'function') {
+        current.cause = { name: typeof cause, message: String(cause) };
+        break;
+      }
+      if (seen.has(cause)) {
+        current.cause = '[Circular]';
+        break;
+      }
+      current.cause = {};
+      current = current.cause;
+      value = cause;
     }
-    if (typeof value !== 'object' && typeof value !== 'function') {
-      return { name: typeof value, message: String(value) };
-    }
-    if (seen.has(value)) {
-      return '[Circular]';
-    }
-    if (depth >= 8) {
-      return '[CauseDepthLimit]';
-    }
-    seen.add(value);
-    const result = {};
-    const name = typeof value.name === 'string' ? value.name : undefined;
-    const code = typeof value.code === 'string' ? value.code : undefined;
-    const message = typeof value.message === 'string' ? value.message : String(value);
-    const stack = typeof value.stack === 'string' ? value.stack : undefined;
-    if (name !== undefined) result.name = name;
-    if (code !== undefined) result.code = code;
-    result.message = message;
-    if (stack !== undefined) result.stack = stack;
-    const cause = serialize(value.cause, depth + 1);
-    if (cause !== undefined) result.cause = cause;
-    return result;
-  };
-  const serialized = serialize(error, 0) || { message: '未知错误' };
+  }
   return {
     name: serialized.name || 'Error',
     code: serialized.code || 'BRIDGE_CALL_FAILED',

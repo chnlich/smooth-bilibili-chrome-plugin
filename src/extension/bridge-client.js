@@ -38,21 +38,25 @@ function isSerializable(value, depth = 0) {
   return values.length <= (Array.isArray(value) ? 256 : 64) && values.every((item) => isSerializable(item, depth + 1));
 }
 
-function validateSerializedError(value, depth = 0) {
-  if (!isObject(value) || depth >= 8) {
-    fail('BRIDGE_RESPONSE_INVALID', '桥接错误对象格式无效');
-  }
-  const allowedFields = new Set(['name', 'code', 'message', 'stack', 'cause']);
-  if (Object.keys(value).some((field) => !allowedFields.has(field))) {
-    fail('BRIDGE_RESPONSE_INVALID', '桥接错误对象包含未允许字段');
-  }
-  for (const field of ['name', 'code', 'message', 'stack']) {
-    if (Object.prototype.hasOwnProperty.call(value, field) && typeof value[field] !== 'string') {
-      fail('BRIDGE_RESPONSE_INVALID', `桥接错误字段 ${field} 无效`);
+function validateSerializedError(value) {
+  const seen = new WeakSet();
+  let current = value;
+  for (;;) {
+    if (!isObject(current) || seen.has(current)) {
+      fail('BRIDGE_RESPONSE_INVALID', '桥接错误对象格式无效');
     }
-  }
-  if (Object.prototype.hasOwnProperty.call(value, 'cause')) {
-    if (typeof value.cause !== 'string') validateSerializedError(value.cause, depth + 1);
+    seen.add(current);
+    const allowedFields = new Set(['name', 'code', 'message', 'stack', 'cause']);
+    if (Object.keys(current).some((field) => !allowedFields.has(field))) {
+      fail('BRIDGE_RESPONSE_INVALID', '桥接错误对象包含未允许字段');
+    }
+    for (const field of ['name', 'code', 'message', 'stack']) {
+      if (Object.prototype.hasOwnProperty.call(current, field) && typeof current[field] !== 'string') {
+        fail('BRIDGE_RESPONSE_INVALID', `桥接错误字段 ${field} 无效`);
+      }
+    }
+    if (!Object.prototype.hasOwnProperty.call(current, 'cause') || typeof current.cause === 'string') return;
+    current = current.cause;
   }
 }
 

@@ -265,8 +265,6 @@ export class VodBufferController {
       buffered: inventory,
       target: `${this.config.stableBufferSeconds} 秒`,
       error: this.message,
-      sessionId: this.diagnostics?.getStatus?.().sessionId,
-      persistence: this.diagnostics?.getStatus?.().persistence,
     });
   }
 

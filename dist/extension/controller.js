@@ -344,22 +344,42 @@
     }
     return result;
   }
-  function sanitizeSerializedError(error, seen = /* @__PURE__ */ new WeakSet(), depth = 0) {
+  function sanitizeSerializedError(error) {
     if (typeof error === "string") return scrubErrorText(error);
-    if (error === null || typeof error !== "object" || Array.isArray(error)) {
-      return UNKNOWN_VALUE;
+    if (error === null || typeof error !== "object" || Array.isArray(error)) return UNKNOWN_VALUE;
+    const seen = /* @__PURE__ */ new WeakSet();
+    let source = error;
+    let result = {};
+    const root = result;
+    for (; ; ) {
+      if (seen.has(source)) {
+        result = "[Circular]";
+        break;
+      }
+      seen.add(source);
+      for (const field of ["name", "code", "message", "stack"]) {
+        if (typeof source[field] === "string") result[field] = scrubErrorText(source[field]);
+      }
+      if (!Object.prototype.hasOwnProperty.call(source, "cause")) break;
+      const cause = source.cause;
+      if (typeof cause === "string") {
+        result.cause = scrubErrorText(cause);
+        break;
+      }
+      if (cause === null || typeof cause !== "object" || Array.isArray(cause)) {
+        result.cause = UNKNOWN_VALUE;
+        break;
+      }
+      if (seen.has(cause)) {
+        result.cause = "[Circular]";
+        break;
+      }
+      const next = {};
+      result.cause = next;
+      result = next;
+      source = cause;
     }
-    if (seen.has(error)) return "[Circular]";
-    if (depth >= 8) return "[CauseDepthLimit]";
-    seen.add(error);
-    const result = {};
-    for (const field of ["name", "code", "message", "stack"]) {
-      if (typeof error[field] === "string") result[field] = scrubErrorText(error[field]);
-    }
-    if (Object.prototype.hasOwnProperty.call(error, "cause")) {
-      result.cause = sanitizeSerializedError(error.cause, seen, depth + 1);
-    }
-    return result;
+    return root;
   }
   function resourceTimingFields(entry) {
     if (entry === null || typeof entry !== "object") {
@@ -375,7 +395,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-8592acd44366dc824375c091" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-3e157e08141e57a474385997" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -477,34 +497,44 @@
   }
   function serializeError(error) {
     const seen = /* @__PURE__ */ new WeakSet();
-    const serialize = (value, depth) => {
-      if (value === void 0 || value === null) {
-        return void 0;
+    let value = error;
+    let serialized;
+    if (value === void 0 || value === null) {
+      serialized = { message: "未知错误" };
+    } else if (typeof value !== "object" && typeof value !== "function") {
+      serialized = { name: typeof value, message: String(value) };
+    } else {
+      serialized = {};
+      let current = serialized;
+      for (; ; ) {
+        if (seen.has(value)) {
+          current.cause = "[Circular]";
+          break;
+        }
+        seen.add(value);
+        const name = typeof value.name === "string" ? value.name : void 0;
+        const code = typeof value.code === "string" ? value.code : void 0;
+        const message = typeof value.message === "string" ? value.message : String(value);
+        const stack = typeof value.stack === "string" ? value.stack : void 0;
+        if (name !== void 0) current.name = name;
+        if (code !== void 0) current.code = code;
+        current.message = message;
+        if (stack !== void 0) current.stack = stack;
+        const cause = value.cause;
+        if (cause === void 0 || cause === null) break;
+        if (typeof cause !== "object" && typeof cause !== "function") {
+          current.cause = { name: typeof cause, message: String(cause) };
+          break;
+        }
+        if (seen.has(cause)) {
+          current.cause = "[Circular]";
+          break;
+        }
+        current.cause = {};
+        current = current.cause;
+        value = cause;
       }
-      if (typeof value !== "object" && typeof value !== "function") {
-        return { name: typeof value, message: String(value) };
-      }
-      if (seen.has(value)) {
-        return "[Circular]";
-      }
-      if (depth >= 8) {
-        return "[CauseDepthLimit]";
-      }
-      seen.add(value);
-      const result = {};
-      const name = typeof value.name === "string" ? value.name : void 0;
-      const code = typeof value.code === "string" ? value.code : void 0;
-      const message = typeof value.message === "string" ? value.message : String(value);
-      const stack = typeof value.stack === "string" ? value.stack : void 0;
-      if (name !== void 0) result.name = name;
-      if (code !== void 0) result.code = code;
-      result.message = message;
-      if (stack !== void 0) result.stack = stack;
-      const cause = serialize(value.cause, depth + 1);
-      if (cause !== void 0) result.cause = cause;
-      return result;
-    };
-    const serialized = serialize(error, 0) || { message: "未知错误" };
+    }
     return {
       name: serialized.name || "Error",
       code: serialized.code || "BRIDGE_CALL_FAILED",
@@ -556,7 +586,7 @@
       return { routeKind: "video", bvid: pathname.split("/")[2] || void 0, part };
     }
     if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/list/watchlater")) {
-      return { routeKind: "video", watchLaterItem: pathname.split("/")[2] || void 0, part };
+      return { routeKind: "video", watchLaterItem: pathname.split("/")[3] || void 0, part };
     }
     return { routeKind: "other", part };
   }
@@ -813,7 +843,7 @@
   function readNumber(value) {
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }
-  function readMediaFacts(video) {
+  function readMediaFacts(video, eventType = "sample") {
     if (video === void 0 || video === null) return UNKNOWN_VALUE;
     const bufferedRanges = readRanges(video.buffered);
     const seekableRanges = readRanges(video.seekable);
@@ -823,7 +853,7 @@
       estimatedDelay = Number.isFinite(end) ? Math.max(0, end - video.currentTime) : UNKNOWN_VALUE;
     }
     return {
-      eventType: "sample",
+      eventType,
       bufferedRanges,
       seekableRanges,
       currentTime: readNumber(video.currentTime),
@@ -891,7 +921,7 @@
     logMediaEvent(name, error) {
       let facts;
       try {
-        facts = readMediaFacts(this.video);
+        facts = readMediaFacts(this.video, name);
       } catch (error2) {
         this.writeLog("extension.observer_error", { reason: "media-facts" }, error2);
         facts = {
@@ -1128,6 +1158,49 @@
     }
     throw new Error("无法为直播目标位置选择 seekable 端点");
   }
+  function seekablePositionForDelay(ranges, targetDelay) {
+    if (!Array.isArray(ranges) || ranges.length === 0 || !Number.isFinite(targetDelay)) return void 0;
+    const seekableEnd = ranges[ranges.length - 1].end;
+    const targetTime = seekableEnd - targetDelay;
+    return closestSeekablePosition(ranges, targetTime, true);
+  }
+  var SEEK_KEYS = /* @__PURE__ */ new Set(["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"]);
+  var CONTROL_EXCLUSIONS = /volume|音量|quality|画质|speed|倍速|rate|播放速度|chat|comment|弹幕/i;
+  var TIMELINE_MARKERS = /seek|timeline|progress|time|position|进度|时间轴|时间/i;
+  function eventPath(event) {
+    if (typeof event?.composedPath === "function") return event.composedPath();
+    const path = [];
+    let current = event?.target;
+    while (current !== void 0 && current !== null) {
+      path.push(current);
+      current = current.parentElement;
+    }
+    return path;
+  }
+  function elementText(element) {
+    const attributes = ["id", "class", "aria-label", "title", "name", "data-seek", "data-timeline", "data-progress"];
+    return attributes.map((attribute) => element?.getAttribute?.(attribute) || element?.[attribute] || "").join(" ");
+  }
+  function isTimelineControl(element) {
+    if (element === void 0 || element === null || typeof element !== "object") return false;
+    const text = elementText(element);
+    const explicit = ["data-seek", "data-timeline", "data-progress"].some((attribute) => typeof element.getAttribute === "function" && element.getAttribute(attribute) !== null);
+    if (CONTROL_EXCLUSIONS.test(text) && !explicit) return false;
+    if (explicit) return true;
+    const tagName = String(element.tagName || "").toLowerCase();
+    const inputType = String(element.type || element.getAttribute?.("type") || "").toLowerCase();
+    const role = String(element.getAttribute?.("role") || element.role || "").toLowerCase();
+    if (tagName === "input" && inputType === "range") return TIMELINE_MARKERS.test(text);
+    if (role === "slider") return TIMELINE_MARKERS.test(text);
+    return TIMELINE_MARKERS.test(text) && !CONTROL_EXCLUSIONS.test(text);
+  }
+  function isUserSeekIntent(event, video, documentObject) {
+    const path = eventPath(event);
+    const timeline = path.some((element) => isTimelineControl(element));
+    if (event?.type === "pointerdown") return timeline;
+    if (event?.type !== "keydown" || !SEEK_KEYS.has(event.key)) return false;
+    return timeline || path.includes(video) || documentObject.activeElement === video;
+  }
   function selectVideo(documentObject) {
     const videos = [...documentObject.querySelectorAll("video")].filter((video) => video.isConnected !== false);
     return videos.sort((left, right) => {
@@ -1294,7 +1367,7 @@
       this.sourceKey = nextSource;
       this.sourceInstance += 1;
       if (previousSource !== "") this.sourceReplacements += 1;
-      if (this.activeStall !== void 0 && nextSource === "") this.showOverlay();
+      if (this.activeStall !== void 0) this.showOverlay();
       if (this.activeStall !== void 0) {
         this.activeStall = { ...this.activeStall, sourceInstance: this.sourceInstance };
       }
@@ -1332,24 +1405,32 @@
       this.captureFrame(video);
       this.hideOverlay();
       if (wasAwaiting) this.awaitingUserSeekFrame = false;
+      const observedDelay = delayOrUnknown(video, this.diagnostics, "decoded-seekable-read", this.context());
+      if (this.activeStall !== void 0 && Number.isFinite(observedDelay)) {
+        this.activeStall.lastObservedDelay = observedDelay;
+        if (this.activeStall.recoveredAt === void 0) {
+          this.activeStall.protectedDelay = Math.max(this.activeStall.protectedDelay, observedDelay);
+        } else if (observedDelay > this.activeStall.protectedDelay) {
+          this.activeStall.protectedDelay = observedDelay;
+        }
+      }
       if (this.activeStall !== void 0 && this.activeStall.recoveredAt === void 0) {
         this.activeStall.recoveredAt = this.lastDecodedAtMilliseconds;
         this.diagnostics?.log("live.stall.recovered", {
           delayBeforeStall: this.activeStall.delayBeforeStall,
           stallDuration: Math.max(0, this.lastDecodedAtMilliseconds - this.activeStall.startedAt) / 1e3,
-          protectedDelay: delayOrUnknown(video, this.diagnostics, "recovered-seekable-read", this.context())
+          protectedDelay: this.activeStall.protectedDelay
         }, void 0, this.context());
-      }
-      if (this.activeStall !== void 0 && Number.isFinite(video.currentTime)) {
-        const protectedTime = this.activeStall.protectedTime;
-        if (!Number.isFinite(protectedTime) || video.currentTime <= protectedTime + this.config.correctionToleranceSeconds) {
-          this.activeStall.protectedTime = video.currentTime;
-        }
       }
       this.updateStatus();
     }
     noteUserInput(event) {
       if (this.destroyed || event?.isTrusted !== true) return;
+      if (!isUserSeekIntent(event, this.video, this.documentObject)) {
+        this.userSeekAuthorization = void 0;
+        return;
+      }
+      if (this.video === void 0) return;
       this.userSeekAuthorization = {
         video: this.video,
         initialTime: Number.isFinite(this.video?.currentTime) ? this.video.currentTime : void 0,
@@ -1378,9 +1459,10 @@
       }
       if (this.userSeekAuthorization !== void 0) return;
       if (this.activeStall === void 0 || this.activeStall.video !== video || this.activeStall.videoInstance !== this.videoInstance || this.activeStall.sourceInstance !== this.sourceInstance || this.awaitingUserSeekFrame || video.paused !== false) return;
-      const protectedTime = this.activeStall.protectedTime;
+      const protectedDelay = this.activeStall.protectedDelay;
       const requestedTime = video.currentTime;
-      if (!Number.isFinite(protectedTime) || !Number.isFinite(requestedTime) || requestedTime <= protectedTime + this.config.correctionToleranceSeconds) return;
+      const requestedDelay = delayOrUnknown(video, this.diagnostics, "seeking-delay-read", this.context());
+      if (!Number.isFinite(protectedDelay) || !Number.isFinite(requestedTime) || !Number.isFinite(requestedDelay) || requestedDelay >= protectedDelay) return;
       let ranges;
       try {
         ranges = readSeekable(video);
@@ -1388,8 +1470,8 @@
         this.diagnostics?.log("extension.observer_error", { reason: "seekable-read" }, error, this.context());
         return;
       }
-      const target = closestSeekablePosition(ranges, protectedTime, false);
-      if (!Number.isFinite(target) || target >= requestedTime - this.config.correctionToleranceSeconds) return;
+      const target = seekablePositionForDelay(ranges, protectedDelay);
+      if (!Number.isFinite(target) || target >= requestedTime) return;
       this.correcting = true;
       try {
         video.currentTime = target;
@@ -1397,7 +1479,7 @@
           reason: "automatic_forward_seek",
           targetTime: target,
           currentTime: requestedTime,
-          protectedDelay: delayOrUnknown(video, this.diagnostics, "correction-seekable-read", this.context())
+          protectedDelay
         }, void 0, this.context());
       } catch (error) {
         this.diagnostics?.log("live.delay_protection.failed", {
@@ -1426,7 +1508,8 @@
         sourceInstance: this.sourceInstance,
         startedAt,
         delayBeforeStall,
-        protectedTime: currentTime
+        protectedDelay: delayBeforeStall,
+        lastObservedDelay: delayBeforeStall
       };
       this.replacementNeedsCorrection = false;
       this.diagnostics?.log("live.stall.detected", {
@@ -1504,11 +1587,17 @@
         this.diagnostics?.log("extension.observer_error", { reason: "replacement-seekable-read" }, error, this.context());
         return;
       }
-      const target = closestSeekablePosition(ranges, this.activeStall.protectedTime, true);
+      const target = seekablePositionForDelay(ranges, this.activeStall.protectedDelay);
       if (!Number.isFinite(target) || !Number.isFinite(this.video.currentTime)) return;
       const currentTime = this.video.currentTime;
-      if (Math.abs(currentTime - target) <= this.config.correctionToleranceSeconds) {
-        this.activeStall.protectedTime = target;
+      const currentDelay = delayOrUnknown(
+        this.video,
+        this.diagnostics,
+        "replacement-seekable-read-current",
+        this.context()
+      );
+      if (Number.isFinite(currentDelay) && currentDelay >= this.activeStall.protectedDelay) {
+        this.activeStall.protectedDelay = currentDelay;
         this.replacementNeedsCorrection = false;
         return;
       }
@@ -1516,18 +1605,18 @@
       try {
         this.video.currentTime = target;
         if (!Number.isFinite(this.video.currentTime) || Math.abs(this.video.currentTime - target) > this.config.correctionToleranceSeconds) return;
-        this.activeStall.protectedTime = target;
+        this.activeStall.protectedDelay = delayOrUnknown(
+          this.video,
+          this.diagnostics,
+          "replacement-seekable-read-after-correction",
+          this.context()
+        );
         this.replacementNeedsCorrection = false;
         this.diagnostics?.log("live.delay.corrected", {
           reason: "source_replaced",
           targetTime: target,
           currentTime,
-          protectedDelay: delayOrUnknown(
-            this.video,
-            this.diagnostics,
-            "replacement-seekable-read-after-correction",
-            this.context()
-          )
+          protectedDelay: this.activeStall.protectedDelay
         }, void 0, this.context());
       } catch (error) {
         this.diagnostics?.log("live.delay_protection.failed", { reason: "source_replaced", status: "failed" }, error, this.context());
@@ -1537,23 +1626,28 @@
     }
     captureFrame(video) {
       if (video.videoWidth <= 0 || video.videoHeight <= 0 || typeof this.documentObject.createElement !== "function") return;
+      let canvas;
       try {
-        const canvas = this.frameCanvas || this.documentObject.createElement("canvas");
+        canvas = this.documentObject.createElement("canvas");
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         const context = canvas.getContext("2d");
         if (context === null) return;
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
         if (typeof context.getImageData === "function") {
-          const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-          let nonBlack = false;
-          for (let index = 0; index < pixels.length; index += 4) {
-            if (pixels[index] + pixels[index + 1] + pixels[index + 2] > 12 && pixels[index + 3] > 0) {
-              nonBlack = true;
-              break;
+          try {
+            const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+            let nonBlack = false;
+            for (let index = 0; index < pixels.length; index += 4) {
+              if (pixels[index] + pixels[index + 1] + pixels[index + 2] > 12 && pixels[index + 3] > 0) {
+                nonBlack = true;
+                break;
+              }
             }
+            if (!nonBlack) return;
+          } catch (error) {
+            if (error?.name !== "SecurityError") throw error;
           }
-          if (!nonBlack) return;
         }
         this.frameCanvas = canvas;
       } catch (error) {
@@ -1600,15 +1694,20 @@
       this.checkForNoFrameStall();
       this.applyReplacementCorrection();
       if (this.activeStall !== void 0 && this.video !== void 0) {
+        const estimatedDelay = delayOrUnknown(
+          this.video,
+          this.diagnostics,
+          "sample-seekable-read",
+          this.context()
+        );
+        if (Number.isFinite(estimatedDelay)) {
+          this.activeStall.lastObservedDelay = estimatedDelay;
+          if (estimatedDelay > this.activeStall.protectedDelay) this.activeStall.protectedDelay = estimatedDelay;
+        }
         this.diagnostics?.log("live.delay.observed", {
-          estimatedDelay: delayOrUnknown(
-            this.video,
-            this.diagnostics,
-            "sample-seekable-read",
-            this.context()
-          ),
+          estimatedDelay,
           currentTime: this.video.currentTime,
-          protectedDelay: this.activeStall.delayBeforeStall
+          protectedDelay: this.activeStall.protectedDelay
         }, void 0, this.context());
       }
       this.updateStatus();
@@ -1997,9 +2096,7 @@
         state: this.hintState,
         buffered: inventory,
         target: `${this.config.stableBufferSeconds} 秒`,
-        error: this.message,
-        sessionId: this.diagnostics?.getStatus?.().sessionId,
-        persistence: this.diagnostics?.getStatus?.().persistence
+        error: this.message
       });
     }
     refreshStatus() {
@@ -2033,9 +2130,7 @@
     "state",
     "buffered",
     "target",
-    "error",
-    "sessionId",
-    "persistence"
+    "error"
   ]);
   var LIVE_FIELDS = Object.freeze([
     "mode",
@@ -2169,21 +2264,25 @@
     const values = Array.isArray(value) ? value : Object.values(value);
     return values.length <= (Array.isArray(value) ? 256 : 64) && values.every((item) => isSerializable(item, depth + 1));
   }
-  function validateSerializedError(value, depth = 0) {
-    if (!isObject(value) || depth >= 8) {
-      fail("BRIDGE_RESPONSE_INVALID", "桥接错误对象格式无效");
-    }
-    const allowedFields = /* @__PURE__ */ new Set(["name", "code", "message", "stack", "cause"]);
-    if (Object.keys(value).some((field) => !allowedFields.has(field))) {
-      fail("BRIDGE_RESPONSE_INVALID", "桥接错误对象包含未允许字段");
-    }
-    for (const field of ["name", "code", "message", "stack"]) {
-      if (Object.prototype.hasOwnProperty.call(value, field) && typeof value[field] !== "string") {
-        fail("BRIDGE_RESPONSE_INVALID", `桥接错误字段 ${field} 无效`);
+  function validateSerializedError(value) {
+    const seen = /* @__PURE__ */ new WeakSet();
+    let current = value;
+    for (; ; ) {
+      if (!isObject(current) || seen.has(current)) {
+        fail("BRIDGE_RESPONSE_INVALID", "桥接错误对象格式无效");
       }
-    }
-    if (Object.prototype.hasOwnProperty.call(value, "cause")) {
-      if (typeof value.cause !== "string") validateSerializedError(value.cause, depth + 1);
+      seen.add(current);
+      const allowedFields = /* @__PURE__ */ new Set(["name", "code", "message", "stack", "cause"]);
+      if (Object.keys(current).some((field) => !allowedFields.has(field))) {
+        fail("BRIDGE_RESPONSE_INVALID", "桥接错误对象包含未允许字段");
+      }
+      for (const field of ["name", "code", "message", "stack"]) {
+        if (Object.prototype.hasOwnProperty.call(current, field) && typeof current[field] !== "string") {
+          fail("BRIDGE_RESPONSE_INVALID", `桥接错误字段 ${field} 无效`);
+        }
+      }
+      if (!Object.prototype.hasOwnProperty.call(current, "cause") || typeof current.cause === "string") return;
+      current = current.cause;
     }
   }
   function logInvalidBridgePayload(kind, error) {
@@ -2726,9 +2825,19 @@
       panel.setFreshnessCheck(() => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && this.active?.panel === panel && this.routeKey === href && this.windowObject.location.href === href && modeForLocation(this.windowObject.location) === mode);
       panel.setModel({
         mode: mode === "live" ? "直播" : "视频",
-        ...mode === "live" ? { paused: "未提供", recentFrame: "未提供", buffered: "未提供", delay: "未提供" } : { state: "WAITING", buffered: "未提供", target: "120 秒", error: "等待原生 video、媒体 source 和播放器内核" },
-        sessionId: this.diagnostics?.getStatus?.().sessionId,
-        persistence: this.diagnostics?.getStatus?.().persistence
+        ...mode === "live" ? {
+          paused: "未提供",
+          recentFrame: "未提供",
+          buffered: "未提供",
+          delay: "未提供",
+          sessionId: this.diagnostics?.getStatus?.().sessionId,
+          persistence: this.diagnostics?.getStatus?.().persistence
+        } : {
+          state: "WAITING",
+          buffered: "未提供",
+          target: "120 秒",
+          error: "等待原生 video、媒体 source 和播放器内核"
+        }
       });
       this.diagnostics?.log("preference.changed", { name: preferenceKeyForMode(mode), enabled: true });
       const routeStillCurrent = () => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location) && this.active?.panel === panel;

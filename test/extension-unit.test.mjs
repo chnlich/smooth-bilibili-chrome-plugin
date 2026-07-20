@@ -80,6 +80,34 @@ test('status panel exposes only direct facts and no playback or recovery actions
   assert.equal(Object.hasOwn(unavailable, 'actions'), false);
 });
 
+test('video status surface exposes exactly the approved snapshot fields', () => {
+  const panel = createStatusPanel({}, 'video');
+  panel.setModel({
+    mode: '视频',
+    state: 'APPLIED',
+    buffered: '8.0 秒',
+    target: '120 秒',
+    error: '未提供',
+    recentEvent: 'playing',
+    sessionId: 'unapproved-session',
+    persistence: 'PERSISTED',
+  });
+  const snapshot = panel.getSnapshot();
+  assert.deepEqual(Object.keys(snapshot), [
+    'version',
+    'surfaceId',
+    'mode',
+    'state',
+    'buffered',
+    'target',
+    'error',
+  ]);
+  assert.equal(Object.hasOwn(snapshot, 'recentEvent'), false);
+  assert.equal(Object.hasOwn(snapshot, 'sessionId'), false);
+  assert.equal(Object.hasOwn(snapshot, 'persistence'), false);
+  panel.destroy();
+});
+
 test('tab-scoped popup status requests do not require a popup sender tab', async () => {
   let listener;
   const panel = createStatusPanel({}, 'video');
