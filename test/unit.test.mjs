@@ -545,6 +545,41 @@ test('live source replacement corrects only active protection and preserves the 
   normalObserver.destroy();
 });
 
+test('live visual cover appears only for an active-stall media gap', () => {
+  const video = mediaVideo('https://media.example/live-cover-old');
+  const observer = new LiveObserver({
+    documentObject: eventDocument(video),
+    windowObject: {},
+    runtimeObject: runtimeWithIntervals(),
+    initialVideo: video,
+    panel: { setModel() {} },
+    diagnostics: diagnosticsRecorder(),
+    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
+  });
+  observer.start();
+  video.emit('loadeddata');
+  video.emit('waiting');
+  assert.notEqual(observer.activeStall, undefined);
+
+  let coverCalls = 0;
+  observer.showOverlay = () => { coverCalls += 1; };
+  video.currentSrc = 'https://media.example/live-cover-new';
+  video.src = video.currentSrc;
+  observer.sample();
+  assert.equal(coverCalls, 0);
+
+  video.currentSrc = '';
+  video.src = '';
+  observer.sample();
+  assert.equal(coverCalls, 1);
+  video.emit('emptied');
+  assert.equal(coverCalls, 2);
+
+  observer.bindVideo(mediaVideo('https://media.example/live-cover-replacement'));
+  assert.equal(coverCalls, 3);
+  observer.destroy();
+});
+
 test('live replacement rebases an unavailable protected time and skips cleared sources', () => {
   const video = mediaVideo('https://media.example/live-rebase-old');
   const diagnostics = diagnosticsRecorder();

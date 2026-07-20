@@ -245,7 +245,7 @@ export class LiveObserver {
     this.sourceKey = nextSource;
     this.sourceInstance += 1;
     if (previousSource !== '') this.sourceReplacements += 1;
-    if (this.activeStall !== undefined) this.showOverlay();
+    if (this.activeStall !== undefined && nextSource === '') this.showOverlay();
     if (this.activeStall !== undefined) {
       this.activeStall = { ...this.activeStall, sourceInstance: this.sourceInstance };
     }

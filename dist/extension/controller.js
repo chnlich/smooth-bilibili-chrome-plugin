@@ -370,7 +370,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-ed0c90035715069764a3b1f6" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-888cd5d967e07b796404e055" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1170,7 +1170,7 @@
       this.sourceKey = nextSource;
       this.sourceInstance += 1;
       if (previousSource !== "") this.sourceReplacements += 1;
-      if (this.activeStall !== void 0) this.showOverlay();
+      if (this.activeStall !== void 0 && nextSource === "") this.showOverlay();
       if (this.activeStall !== void 0) {
         this.activeStall = { ...this.activeStall, sourceInstance: this.sourceInstance };
       }
