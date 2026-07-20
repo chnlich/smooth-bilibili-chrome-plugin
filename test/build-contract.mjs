@@ -44,6 +44,24 @@ async function readJavaScriptFiles(directory, prefix = '') {
   return files;
 }
 
+async function readTextFiles(directory, suffixes, prefix = '') {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const entryPath = path.join(directory, entry.name);
+    const relativePath = path.join(prefix, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await readTextFiles(entryPath, suffixes, relativePath));
+    } else if (suffixes.some((suffix) => entry.name.endsWith(suffix))) {
+      files.push({
+        relativePath: relativePath.replaceAll(path.sep, '/'),
+        content: await fs.readFile(entryPath, 'utf8'),
+      });
+    }
+  }
+  return files;
+}
+
 async function snapshotExtensionOutput(directory, prefix = '') {
   const entries = await fs.readdir(directory, { withFileTypes: true });
   const files = [];
@@ -92,6 +110,8 @@ assert.equal(secondBuild.buildId, firstBuild.buildId);
 const manifest = JSON.parse(await fs.readFile(path.join(extensionDirectory, 'manifest.json'), 'utf8'));
 const source = await readTree(path.join(root, 'src'));
 const sourceFiles = await readJavaScriptFiles(path.join(root, 'src'));
+const sourceVisibleAssets = await readTextFiles(path.join(root, 'src'), ['.html', '.css', '.json']);
+const extensionVisibleFiles = await readTextFiles(extensionDirectory, ['.js', '.html', '.css', '.json']);
 const controller = await fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8');
 const bridge = await fs.readFile(path.join(extensionDirectory, 'main-bridge.js'), 'utf8');
 const popup = await fs.readFile(path.join(extensionDirectory, 'popup.js'), 'utf8');
@@ -101,6 +121,8 @@ const vodSource = await fs.readFile(path.join(root, 'src/vod/controller.js'), 'u
 const liveSource = await fs.readFile(path.join(root, 'src/live/observer.js'), 'utf8');
 const passiveMediaSource = await fs.readFile(path.join(root, 'src/diagnostics/passive-media-observer.js'), 'utf8');
 const manifestSource = createManifest();
+const goal = await fs.readFile(path.join(root, 'GOAL.md'), 'utf8');
+const readme = await fs.readFile(path.join(root, 'README.md'), 'utf8');
 
 assert.deepEqual(manifest, manifestSource);
 assert.equal(packageMetadata.version, manifest.version);
@@ -204,9 +226,25 @@ assert.equal(EVENT_CODES.includes('live.delay_protection.applied'), true);
 for (const mediaEvent of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${mediaEvent}`));
 assert.match(controller, /unlimitedStorage|diagnostic/);
 assert.match(logs, /showSaveFilePicker|createWritable|recordType/);
-assert.doesNotMatch(`${source}\n${controller}\n${logs}`, /点播/);
-assert.match(await fs.readFile(path.join(root, 'README.md'), 'utf8'), /GOAL\.md/);
-assert.doesNotMatch(await fs.readFile(path.join(root, 'README.md'), 'utf8'), /点播/);
-assert.match(await fs.readFile(path.join(root, 'GOAL.md'), 'utf8'), /视频和直播同等重要/);
+const userVisibleDocuments = [
+  { path: 'GOAL.md', content: goal },
+  { path: 'README.md', content: readme },
+  ...sourceFiles.map(({ relativePath, content }) => ({ path: `src/${relativePath}`, content })),
+  ...sourceVisibleAssets.map(({ relativePath, content }) => ({ path: `src/${relativePath}`, content })),
+  ...extensionVisibleFiles
+    .filter(({ relativePath }) => !relativePath.endsWith('.map'))
+    .map(({ relativePath, content }) => ({ path: `dist/extension/${relativePath}`, content })),
+];
+for (const document of userVisibleDocuments) {
+  assert.doesNotMatch(document.content, /点播|稍后再看/, `${document.path} 含有已拒绝的产品术语`);
+}
+assert.match(readme, /GOAL\.md/);
+assert.match(readme, /\/list\/watchlater\*/);
+assert.match(source, /\/list\/watchlater/);
+assert.match(goal, /视频[\s\S]*120 秒/);
+assert.match(goal, /直播[\s\S]*卡顿[\s\S]*延迟/);
+assert.match(goal, /用户[\s\S]*控制/);
+assert.match(goal, /完整结构化日志/);
+assert.match(goal, /--mute-audio/);
 
 console.log('extension build contract passed');

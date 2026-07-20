@@ -136,7 +136,7 @@ const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-e2e-p
 let context;
 try {
   context = await chromium.launchPersistentContext(profileDirectory, {
-    headless: true,
+    headless: false,
     args: [
       '--mute-audio',
       `--disable-extensions-except=${extensionDirectory}`,
@@ -188,10 +188,7 @@ try {
   assert.deepEqual(await livePage.evaluate(() => window.__e2eAudit.ownership()), []);
   await livePage.close();
 
-  console.log('browser e2e passed: video route, Watch Later route, unrelated route, native live ownership, muted guard');
-} catch (error) {
-  if (!String(error?.message || error).includes('libnspr4.so')) throw error;
-  console.log(`browser e2e BLOCKED: Chromium runtime is unavailable in this host (${error.message})`);
+  console.log('browser e2e passed: 5 deterministic scenes (video routes and generation, unrelated route, native live ownership, user seek, muted guard)');
 } finally {
   await context?.close();
   await fs.rm(profileDirectory, { recursive: true, force: true });

@@ -188,7 +188,7 @@ async function readMediaEvents(page) {
 }
 
 function blockedInterruption(kind, reason, before, details = {}) {
-  return { kind, status: 'BLOCKED', reason, before, ...details };
+  return { kind, status: 'BLOCKED', reason, browserStarted: true, pageStarted: true, before, ...details };
 }
 
 async function runLiveMediaInterruption(page) {
@@ -303,7 +303,15 @@ async function runLiveMediaInterruption(page) {
       details,
     );
   }
-  return { kind: 'live-media-stall', status: 'PASS', reason: '已仅中断媒体请求并观察到原生恢复', before, ...details };
+  return {
+    kind: 'live-media-stall',
+    status: 'PASS',
+    reason: '已仅中断媒体请求并观察到原生恢复',
+    browserStarted: true,
+    pageStarted: true,
+    before,
+    ...details,
+  };
 }
 
 async function runLiveOfflineInterruption(context, page) {
@@ -389,7 +397,15 @@ async function runLiveOfflineInterruption(context, page) {
       details,
     );
   }
-  return { kind: 'live-offline', status: 'PASS', reason: '已完整离线并观察到原生恢复', before, ...details };
+  return {
+    kind: 'live-offline',
+    status: 'PASS',
+    reason: '已完整离线并观察到原生恢复',
+    browserStarted: true,
+    pageStarted: true,
+    before,
+    ...details,
+  };
 }
 
 async function runPage(context, kind, url, { keepPage = false } = {}) {
@@ -414,18 +430,38 @@ async function runPage(context, kind, url, { keepPage = false } = {}) {
     const silent = await page.evaluate(() => window.__externalAudioAudit?.() || []);
     if (!media.present) {
       return {
-        result: { kind, status: 'BLOCKED', reason: '匿名公共页面没有可读取的 video', media, bridgeRequests, silent },
+        result: {
+          kind,
+          status: 'BLOCKED',
+          reason: '匿名公共页面没有可读取的 video',
+          browserStarted: true,
+          pageStarted: true,
+          media,
+          bridgeRequests,
+          silent,
+        },
       };
     }
     const forbiddenOperations = bridgeRequests.filter((request) => !bridgeAuditOperations.has(request.operation));
     if (forbiddenOperations.length > 0 || silent.some(({ muted, volume }) => muted !== true || volume !== 0)) {
       return {
-        result: { kind, status: 'FAIL', reason: '静音或桥接所有权审计失败', media, bridgeRequests, silent },
+        result: {
+          kind,
+          status: 'FAIL',
+          reason: '静音或桥接所有权审计失败',
+          browserStarted: true,
+          pageStarted: true,
+          media,
+          bridgeRequests,
+          silent,
+        },
       };
     }
     const result = {
       kind,
       status: 'PASS',
+      browserStarted: true,
+      pageStarted: true,
       reason: kind === 'video'
         ? '读取到原生 video；实际 120 秒提示结果以页面内核和日志为准'
         : '读取到原生 video；未观察到扩展播放所有权操作',
@@ -439,7 +475,15 @@ async function runPage(context, kind, url, { keepPage = false } = {}) {
     }
     return { result };
   } catch (error) {
-    return { result: { kind, status: 'BLOCKED', reason: reportError(error) } };
+    return {
+      result: {
+        kind,
+        status: 'BLOCKED',
+        reason: reportError(error),
+        browserStarted: true,
+        pageStarted: true,
+      },
+    };
   } finally {
     if (!retained) await page.close();
   }
@@ -449,18 +493,24 @@ const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-exter
 let context;
 const report = {
   generatedAt: new Date().toISOString(),
-  browser: { headless: true, muteAudio: true, freshProfile: true },
+  browser: {
+    headless: false,
+    muteAudio: true,
+    freshProfile: true,
+    browserStarted: false,
+  },
   results: [],
 };
 try {
   context = await chromium.launchPersistentContext(profileDirectory, {
-    headless: true,
+    headless: false,
     args: [
       '--mute-audio',
       `--disable-extensions-except=${extensionDirectory}`,
       `--load-extension=${extensionDirectory}`,
     ],
   });
+  report.browser.browserStarted = true;
   await context.addInitScript({ content: `(${mutedInit.toString()})()` });
   const video = await runPage(context, 'video', 'https://www.bilibili.com/video/BV1ohQVBFEsh');
   report.results.push(video.result);
@@ -471,11 +521,15 @@ try {
       kind: 'live-media-stall',
       status: 'BLOCKED',
       reason: '直播页面未通过可读原生 video 与所有权审计，未执行媒体专属中断',
+      browserStarted: true,
+      pageStarted: true,
     });
     report.results.push({
       kind: 'live-offline',
       status: 'BLOCKED',
       reason: '直播页面未通过可读原生 video 与所有权审计，未执行完整离线中断',
+      browserStarted: true,
+      pageStarted: true,
     });
   } else {
     try {
@@ -485,13 +539,6 @@ try {
       await live.page.close();
     }
   }
-} catch (error) {
-  if (!String(error?.message || error).includes('libnspr4.so')) throw error;
-  report.results.push({
-    kind: 'browser-environment',
-    status: 'BLOCKED',
-    reason: `Chromium runtime is unavailable in this host: ${reportError(error)}`,
-  });
 } finally {
   await context?.close();
   await fs.rm(profileDirectory, { recursive: true, force: true });
