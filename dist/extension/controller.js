@@ -370,7 +370,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-ba6255002478afcee8790d08" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-ed0c90035715069764a3b1f6" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -625,6 +625,7 @@
         part: this.session.part,
         watchLaterItem: this.session.watchLaterItem
       });
+      void this.flush();
       this.scheduleNoVideoNotice();
       return this.session;
     }

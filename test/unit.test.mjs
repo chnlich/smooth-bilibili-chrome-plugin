@@ -671,6 +671,47 @@ test('diagnostics initializes before controls, creates fresh sessions, and flush
   assert.ok(timers.some((timer) => timer.milliseconds === 30000));
 });
 
+test('diagnostics immediately sends a new session identity before scheduled flushes', () => {
+  const sent = [];
+  const timers = [];
+  const locationObject = {
+    origin: 'https://www.bilibili.com',
+    hostname: 'www.bilibili.com',
+    pathname: '/video/BVinitial',
+  };
+  class SilentPerformanceObserver {
+    observe() {}
+
+    disconnect() {}
+  }
+  const client = new DiagnosticsClient({
+    documentObject: { defaultView: { addEventListener() {} } },
+    windowObject: {
+      location: locationObject,
+      PerformanceObserver: SilentPerformanceObserver,
+      setTimeout(callback, milliseconds) {
+        const timer = { callback, milliseconds };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout(timer) { timer.cleared = true; },
+    },
+    runtimeObject: {
+      sendMessage(message, callback) {
+        sent.push(message);
+        callback({ ok: true, status: 'PERSISTED', eventCount: message.events.length });
+      },
+    },
+    locationObject,
+    loggerObject: { log() {}, warn() {}, error() {} },
+  });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].events.map((event) => event.code), ['route.session_started']);
+  assert.equal(sent[0].session.pathname, '/video/BVinitial');
+  assert.ok(timers.some((timer) => timer.milliseconds === 0));
+  client.destroy();
+});
+
 test('diagnostics pagehide drains queued batches after an in-flight commit', async () => {
   const sent = [];
   const acknowledgements = [];
@@ -707,7 +748,6 @@ test('diagnostics pagehide drains queued batches after an in-flight commit', asy
     loggerObject: { log() {}, warn() {}, error() {} },
   });
   client.log('video.attached', { source: 'https://cdn.example/video' });
-  void client.flush();
   client.log('route.changed', { reason: 'spa_media_change' });
   onPagehide();
   assert.equal(sent.length, 1);
@@ -717,8 +757,9 @@ test('diagnostics pagehide drains queued batches after an in-flight commit', asy
   acknowledgements.shift()();
   await tick();
   assert.equal(client.destroyed, true);
-  assert.ok(sent[0].events.some((event) => event.code === 'video.attached'));
-  assert.deepEqual(sent[1].events.map((event) => event.code), ['route.changed']);
+  assert.ok(sent[0].events.some((event) => event.code === 'route.session_started'));
+  assert.ok(sent[1].events.some((event) => event.code === 'video.attached'));
+  assert.ok(sent[1].events.some((event) => event.code === 'route.changed'));
 });
 
 test('resource timing observer snapshots prototype fields before privacy filtering', async () => {

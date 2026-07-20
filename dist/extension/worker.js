@@ -537,10 +537,19 @@
     }
     return new URL(sender.url);
   }
-  function assertSenderMatchesSession(session, sender) {
+  function assertSenderMatchesSession(session, sender, { requirePathname = true } = {}) {
     const pageUrl = senderUrl(sender);
-    if (pageUrl.origin !== session.origin || pageUrl.pathname !== session.pathname) {
+    if (pageUrl.origin !== session.origin || requirePathname && pageUrl.pathname !== session.pathname) {
       throw storageError("SESSION_ROUTE_CONFLICT", "sender URL 与 session origin/pathname 不一致");
+    }
+  }
+  function assertAppendSessionPolicy(existingSession, session, sender) {
+    assertSenderMatchesSession(session, sender, { requirePathname: false });
+    if (existingSession !== void 0 && stableStringify(existingSession) !== stableStringify(session)) {
+      throw storageError("SESSION_CONFLICT", "相同 sessionId 的 session 身份不一致");
+    }
+    if (existingSession === void 0) {
+      assertSenderMatchesSession(session, sender, { requirePathname: true });
     }
   }
   function validateBatchMessage(message) {
@@ -566,7 +575,6 @@
       throw storageError("TAB_ID_FORBIDDEN", "content page 不得自报 tabId");
     }
     const session = sessionWithTabId(pageSession, sender?.tab?.id);
-    assertSenderMatchesSession(session, sender);
     const normalizedEvents = message.events.map((event) => {
       const normalized = normalizeEventForStorage(withoutEventId(event));
       if (normalized.sessionId !== session.sessionId) {
@@ -605,9 +613,7 @@
       sessionRequest.onsuccess = () => {
         try {
           const existingSession = sessionRequest.result;
-          if (existingSession !== void 0 && stableStringify(existingSession) !== stableStringify(session)) {
-            throw storageError("SESSION_CONFLICT", "相同 sessionId 的 session 身份不一致");
-          }
+          assertAppendSessionPolicy(existingSession, session, sender);
           if (existingSession === void 0) {
             sessions.add(session);
           }

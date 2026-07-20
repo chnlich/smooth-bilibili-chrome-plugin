@@ -13,6 +13,7 @@ import { installPopupMessageHandler, isVideoPage, isVodPage, modeForLocation } f
 import { createStatusPanel, createUnavailableStatusSnapshot, STATUS_MESSAGE_VERSION } from '../src/ui/panel.js';
 import { createSessionIdentity, validateSession } from '../src/diagnostics/session.js';
 import { logSessionFragment, sessionIdFromHash } from '../src/diagnostics/log-session.js';
+import { assertAppendSessionPolicy } from '../src/diagnostics/worker.js';
 
 test('manifest is MV3 with only storage permissions, unlimited diagnostic storage, worker, and approved routes', () => {
   const manifest = createManifest();
@@ -151,6 +152,37 @@ test('session identity omits page tab id and keeps route identity fields', () =>
   assert.equal(session.roomId, '6363772');
   assert.doesNotThrow(() => validateSession(session, { requireTabId: false }));
   assert.throws(() => validateSession({ ...session, tabId: 3 }, { requireTabId: false }));
+});
+
+test('diagnostic sender policy allows only stored same-origin SPA session transitions', () => {
+  const session = {
+    schemaVersion: 1,
+    sessionId: 'session-sender-policy',
+    startedAt: '2026-07-20T00:00:00.000Z',
+    extensionVersion: '1.0.0',
+    buildId: 'src-test',
+    tabId: 7,
+    routeKind: 'video',
+    origin: 'https://www.bilibili.com',
+    pathname: '/video/BVold',
+    bvid: 'BVold',
+  };
+  const oldRouteSender = { tab: { id: 7 }, url: 'https://www.bilibili.com/video/BVold?from=test' };
+  const newRouteSender = { tab: { id: 7 }, url: 'https://www.bilibili.com/video/BVnew?from=test' };
+  assert.doesNotThrow(() => assertAppendSessionPolicy(undefined, session, oldRouteSender));
+  assert.throws(
+    () => assertAppendSessionPolicy(undefined, session, newRouteSender),
+    (error) => error.code === 'SESSION_ROUTE_CONFLICT',
+  );
+  assert.doesNotThrow(() => assertAppendSessionPolicy({ ...session }, session, newRouteSender));
+  assert.throws(
+    () => assertAppendSessionPolicy({ ...session }, session, { tab: { id: 7 }, url: 'https://live.bilibili.com/1' }),
+    (error) => error.code === 'SESSION_ROUTE_CONFLICT',
+  );
+  assert.throws(
+    () => assertAppendSessionPolicy({ ...session }, { ...session, tabId: 8 }, newRouteSender),
+    (error) => error.code === 'SESSION_CONFLICT',
+  );
 });
 
 test('log session fragments carry only a precise encoded session filter', () => {

@@ -123,6 +123,7 @@ export class DiagnosticsClient {
       part: this.session.part,
       watchLaterItem: this.session.watchLaterItem,
     });
+    void this.flush();
     this.scheduleNoVideoNotice();
     return this.session;
   }
