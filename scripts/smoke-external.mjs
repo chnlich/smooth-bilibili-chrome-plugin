@@ -10,6 +10,7 @@ const reportDirectory = path.join(root, 'reports');
 const reportPath = path.join(reportDirectory, 'external-smoke-report.json');
 const interruptionMilliseconds = 4000;
 const recoveryMilliseconds = 5000;
+const delayToleranceSeconds = 1;
 
 const mutedInit = () => {
   const observed = new Set();
@@ -52,13 +53,21 @@ function mediaFacts() {
     if (!['http:', 'https:'].includes(currentSource.protocol)) return '未提供';
     return currentSource.pathname;
   };
+  const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : '未提供';
+  const seekable = read(video.seekable);
+  const estimatedDelay = () => {
+    if (typeof currentTime !== 'number' || !Array.isArray(seekable) || seekable.length === 0) return '未提供';
+    const seekableEnd = seekable[seekable.length - 1].end;
+    return Number.isFinite(seekableEnd) ? seekableEnd - currentTime : '未提供';
+  };
   return {
     present: true,
-    currentTime: Number.isFinite(video.currentTime) ? video.currentTime : '未提供',
+    currentTime,
     paused: video.paused,
     readyState: video.readyState,
     buffered: read(video.buffered),
-    seekable: read(video.seekable),
+    seekable,
+    estimatedDelay: estimatedDelay(),
     resolution: [video.videoWidth, video.videoHeight],
     playbackRate: video.playbackRate,
     currentSrc: currentSourcePathname(),
@@ -115,6 +124,50 @@ function observedStall(before, during, events) {
 function observedRecovery(during, after, events) {
   return playbackAdvanced(during, after)
     || events.some(({ type }) => type === 'loadeddata' || type === 'canplay' || type === 'playing');
+}
+
+function hasEstimatedDelay(media) {
+  return media !== null
+    && typeof media === 'object'
+    && typeof media.estimatedDelay === 'number'
+    && Number.isFinite(media.estimatedDelay)
+    && media.estimatedDelay >= 0;
+}
+
+function delayPreservation(before, during, after) {
+  const beforeDelay = before?.estimatedDelay ?? '未提供';
+  const duringDelay = during?.estimatedDelay ?? '未提供';
+  const afterDelay = after?.estimatedDelay ?? '未提供';
+  const protectedDelays = [before, during].filter(hasEstimatedDelay).map(({ estimatedDelay }) => estimatedDelay);
+  if (protectedDelays.length === 0) {
+    return {
+      verifiable: false,
+      reason: '中断前和中断期间均没有可读 seekable 延迟',
+      beforeDelay,
+      duringDelay,
+      afterDelay,
+    };
+  }
+  if (!hasEstimatedDelay(after)) {
+    return {
+      verifiable: false,
+      reason: '恢复后没有可读 seekable 延迟',
+      beforeDelay,
+      duringDelay,
+      afterDelay,
+    };
+  }
+  const protectedBaseline = Math.max(...protectedDelays);
+  const minimumAfterDelay = Math.max(0, protectedBaseline - delayToleranceSeconds);
+  return {
+    verifiable: true,
+    preserved: after.estimatedDelay >= minimumAfterDelay,
+    protectedBaseline,
+    minimumAfterDelay,
+    beforeDelay,
+    duringDelay,
+    afterDelay,
+  };
 }
 
 async function readMediaEvents(page) {
@@ -195,7 +248,8 @@ async function runLiveMediaInterruption(page) {
     );
   }
 
-  const details = { during, after, interruptedMediaRequests, duringEvents, recoveryEvents };
+  const delayCheck = delayPreservation(before, during, after);
+  const details = { during, after, interruptedMediaRequests, duringEvents, recoveryEvents, delayCheck };
   if (interruptedMediaRequests === 0) {
     return blockedInterruption(
       'live-media-stall',
@@ -216,6 +270,22 @@ async function runLiveMediaInterruption(page) {
     return blockedInterruption(
       'live-media-stall',
       '已解除媒体中断，但未观察到原生 video 的恢复证据',
+      before,
+      details,
+    );
+  }
+  if (!delayCheck.verifiable) {
+    return blockedInterruption(
+      'live-media-stall',
+      `已观察到恢复，但无法验证延迟保留：${delayCheck.reason}`,
+      before,
+      details,
+    );
+  }
+  if (!delayCheck.preserved) {
+    return blockedInterruption(
+      'live-media-stall',
+      '已观察到恢复，但恢复后估算延迟低于受保护基准（含 1 秒测试容差）',
       before,
       details,
     );
@@ -272,7 +342,8 @@ async function runLiveOfflineInterruption(context, page) {
     );
   }
 
-  const details = { during, after, duringEvents, recoveryEvents };
+  const delayCheck = delayPreservation(before, during, after);
+  const details = { during, after, duringEvents, recoveryEvents, delayCheck };
   if (!observedStall(before, during, duringEvents)) {
     return blockedInterruption(
       'live-offline',
@@ -285,6 +356,22 @@ async function runLiveOfflineInterruption(context, page) {
     return blockedInterruption(
       'live-offline',
       '已恢复在线，但未观察到原生 video 的恢复证据',
+      before,
+      details,
+    );
+  }
+  if (!delayCheck.verifiable) {
+    return blockedInterruption(
+      'live-offline',
+      `已观察到恢复，但无法验证延迟保留：${delayCheck.reason}`,
+      before,
+      details,
+    );
+  }
+  if (!delayCheck.preserved) {
+    return blockedInterruption(
+      'live-offline',
+      '已观察到恢复，但恢复后估算延迟低于受保护基准（含 1 秒测试容差）',
       before,
       details,
     );
