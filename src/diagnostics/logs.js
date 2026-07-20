@@ -41,8 +41,16 @@ async function loadSessions() {
       ...(afterSessionId === undefined ? {} : { afterSessionId }),
     });
     for (const session of response.sessions) appendSessionOption(session);
-    if (!response.hasMore || response.sessions.length === 0) break;
-    afterSessionId = response.sessions.at(-1).sessionId;
+    if (!response.hasMore) break;
+    const nextAfterSessionId = response.nextAfterSessionId ?? response.sessions.at(-1)?.sessionId;
+    if (
+      typeof nextAfterSessionId !== 'string'
+      || nextAfterSessionId.length === 0
+      || nextAfterSessionId === afterSessionId
+    ) {
+      throw new Error('日志 session 分页没有向前推进');
+    }
+    afterSessionId = nextAfterSessionId;
   }
   if (currentSessionId !== undefined) {
     const option = [...sessionSelect.options].find((candidate) => candidate.value === currentSessionId);
@@ -68,18 +76,27 @@ async function writeLine(writer, value) {
   await writer.write(`${JSON.stringify(value)}\n`);
 }
 
-async function writeSessions(writer, sessionId) {
+async function writeSessions(writer, sessionId, maxEventId) {
   let afterSessionId;
   for (;;) {
     const response = await send({
       type: 'logs:sessions-page',
       limit: PAGE_SIZE,
       ...(afterSessionId === undefined ? {} : { afterSessionId }),
+      maxEventId,
       ...(sessionId === undefined ? {} : { sessionId }),
     });
     for (const session of response.sessions) await writeLine(writer, { recordType: 'session', ...session });
-    if (sessionId !== undefined || !response.hasMore || response.sessions.length === 0) break;
-    afterSessionId = response.sessions.at(-1).sessionId;
+    if (sessionId !== undefined || !response.hasMore) break;
+    const nextAfterSessionId = response.nextAfterSessionId;
+    if (
+      typeof nextAfterSessionId !== 'string'
+      || nextAfterSessionId.length === 0
+      || nextAfterSessionId === afterSessionId
+    ) {
+      throw new Error('日志 session 分页没有向前推进');
+    }
+    afterSessionId = nextAfterSessionId;
   }
 }
 
@@ -108,17 +125,17 @@ async function exportLogs() {
     throw new Error('当前 Chrome 不支持 File System Access，无法安全导出日志');
   }
   const sessionId = selectedSessionId();
-  const snapshot = await send({
-    type: 'logs:max-event-id',
-    ...(sessionId === undefined ? {} : { sessionId }),
-  });
   const handle = await window.showSaveFilePicker({
     suggestedName: `bilibili-development-logs-${Date.now()}.jsonl`,
     types: [{ description: 'JSON Lines', accept: { 'application/jsonl': ['.jsonl'] } }],
   });
   const writer = await handle.createWritable();
   try {
-    await writeSessions(writer, sessionId);
+    const snapshot = await send({
+      type: 'logs:max-event-id',
+      ...(sessionId === undefined ? {} : { sessionId }),
+    });
+    await writeSessions(writer, sessionId, snapshot.maxEventId);
     await writeEvents(writer, sessionId, snapshot.maxEventId);
     await writer.close();
     statusElement.textContent = `导出完成，截止 eventId ${snapshot.maxEventId}。新事件仍继续保存。`;

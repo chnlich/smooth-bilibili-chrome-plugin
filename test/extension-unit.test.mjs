@@ -13,7 +13,7 @@ import { installPopupMessageHandler, isVideoPage, isVodPage, modeForLocation } f
 import { createStatusPanel, createUnavailableStatusSnapshot, STATUS_MESSAGE_VERSION } from '../src/ui/panel.js';
 import { createSessionIdentity, validateSession } from '../src/diagnostics/session.js';
 import { logSessionFragment, sessionIdFromHash } from '../src/diagnostics/log-session.js';
-import { assertAppendSessionPolicy } from '../src/diagnostics/worker.js';
+import { assertAppendSessionPolicy, isSessionWithinEventCutoff, readLogs } from '../src/diagnostics/worker.js';
 
 test('manifest is MV3 with only storage permissions, unlimited diagnostic storage, worker, and approved routes', () => {
   const manifest = createManifest();
@@ -182,6 +182,17 @@ test('diagnostic sender policy allows only stored same-origin SPA session transi
   assert.throws(
     () => assertAppendSessionPolicy({ ...session }, { ...session, tabId: 8 }, newRouteSender),
     (error) => error.code === 'SESSION_CONFLICT',
+  );
+});
+
+test('session export cutoff admits only a session first event present in the snapshot', async () => {
+  assert.equal(isSessionWithinEventCutoff({ eventId: 41, sequence: 1 }, 41), true);
+  assert.equal(isSessionWithinEventCutoff({ eventId: 42, sequence: 1 }, 41), false);
+  assert.equal(isSessionWithinEventCutoff({ eventId: 41, sequence: 2 }, 41), false);
+  assert.equal(isSessionWithinEventCutoff(undefined, 41), false);
+  await assert.rejects(
+    readLogs({ type: 'logs:sessions-page', version: 1, limit: 1, maxEventId: -1 }),
+    (error) => error.code === 'MAX_EVENT_ID_INVALID',
   );
 });
 

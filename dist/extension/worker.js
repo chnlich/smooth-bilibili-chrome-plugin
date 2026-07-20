@@ -688,7 +688,7 @@
     }
     const allowed = {
       "logs:max-event-id": ["type", "version", "sessionId"],
-      "logs:sessions-page": ["type", "version", "limit", "afterSessionId", "sessionId"],
+      "logs:sessions-page": ["type", "version", "limit", "afterSessionId", "maxEventId", "sessionId"],
       "logs:events-page": ["type", "version", "limit", "afterEventId", "maxEventId", "sessionId"]
     }[message.type];
     if (Object.keys(message).some((field) => !allowed.includes(field))) {
@@ -704,6 +704,12 @@
   function positiveLimit(value) {
     if (!Number.isInteger(value) || value <= 0 || value > 250) {
       throw storageError("READ_LIMIT_INVALID", "日志分页 limit 必须是 1 到 250");
+    }
+    return value;
+  }
+  function validMaxEventId(value) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw storageError("MAX_EVENT_ID_INVALID", "maxEventId 无效");
     }
     return value;
   }
@@ -732,47 +738,78 @@
   }
   async function readSessionsPage(message, indexedDbObject) {
     const limit = positiveLimit(message.limit);
+    const maxEventId = message.maxEventId === void 0 ? void 0 : validMaxEventId(message.maxEventId);
     const after = message.afterSessionId === void 0 ? void 0 : String(message.afterSessionId);
     const database = await openLogDatabase(indexedDbObject);
     return new Promise((resolve, reject) => {
-      const transaction = database.transaction(SESSION_STORE, "readonly");
+      const transaction = database.transaction(
+        maxEventId === void 0 ? SESSION_STORE : [SESSION_STORE, EVENT_STORE],
+        "readonly"
+      );
       const store = transaction.objectStore(SESSION_STORE);
+      const eventIndex = maxEventId === void 0 ? void 0 : transaction.objectStore(EVENT_STORE).index(EVENT_INDEX);
       const request = message.sessionId !== void 0 ? store.get(message.sessionId) : store.openCursor(after === void 0 ? null : IDBKeyRange.lowerBound(after, true));
       const sessions = [];
+      let lastScannedSessionId = after;
+      let scanned = 0;
+      const includeIfWithinSnapshot = (session, done) => {
+        if (eventIndex === void 0) {
+          sessions.push(session);
+          done();
+          return;
+        }
+        const firstEventRequest = eventIndex.get([session.sessionId, 1]);
+        firstEventRequest.onerror = () => {
+          reject(firstEventRequest.error || new Error("读取 session 首条 event 失败"));
+        };
+        firstEventRequest.onsuccess = () => {
+          if (isSessionWithinEventCutoff(firstEventRequest.result, maxEventId)) sessions.push(session);
+          done();
+        };
+      };
       request.onerror = () => reject(request.error || new Error("读取 session 分页失败"));
       request.onsuccess = () => {
         if (message.sessionId !== void 0) {
-          if (request.result !== void 0) sessions.push(request.result);
-          resolve({ sessions, hasMore: false });
+          if (request.result === void 0) {
+            resolve({ sessions, hasMore: false });
+            return;
+          }
+          includeIfWithinSnapshot(request.result, () => resolve({ sessions, hasMore: false }));
           return;
         }
         const cursor = request.result;
-        if (cursor === null || sessions.length >= limit) {
-          resolve({ sessions, hasMore: cursor !== null });
+        if (cursor === null) {
+          resolve({ sessions, hasMore: false, nextAfterSessionId: lastScannedSessionId });
           return;
         }
-        sessions.push(cursor.value);
-        cursor.continue();
+        if (scanned >= limit) {
+          resolve({ sessions, hasMore: true, nextAfterSessionId: lastScannedSessionId });
+          return;
+        }
+        scanned += 1;
+        lastScannedSessionId = String(cursor.key);
+        includeIfWithinSnapshot(cursor.value, () => cursor.continue());
       };
       transaction.oncomplete = () => database.close();
       transaction.onerror = () => reject(transaction.error || new Error("读取 session 分页事务失败"));
     });
   }
+  function isSessionWithinEventCutoff(firstEvent, maxEventId) {
+    return firstEvent?.sequence === 1 && Number.isInteger(firstEvent.eventId) && firstEvent.eventId > 0 && firstEvent.eventId <= maxEventId;
+  }
   async function readEventsPage(message, indexedDbObject) {
     const limit = positiveLimit(message.limit);
-    if (!Number.isInteger(message.maxEventId) || message.maxEventId < 0) {
-      throw storageError("MAX_EVENT_ID_INVALID", "maxEventId 无效");
-    }
+    const maxEventId = validMaxEventId(message.maxEventId);
     if (!Number.isInteger(message.afterEventId) || message.afterEventId < 0) {
       throw storageError("AFTER_EVENT_ID_INVALID", "afterEventId 无效");
     }
-    if (message.maxEventId <= message.afterEventId) {
+    if (maxEventId <= message.afterEventId) {
       return { events: [], hasMore: false, nextAfterEventId: message.afterEventId };
     }
     const database = await openLogDatabase(indexedDbObject);
     return new Promise((resolve, reject) => {
       const transaction = database.transaction(EVENT_STORE, "readonly");
-      const range = IDBKeyRange.bound(message.afterEventId + 1, message.maxEventId);
+      const range = IDBKeyRange.bound(message.afterEventId + 1, maxEventId);
       const request = transaction.objectStore(EVENT_STORE).openCursor(range);
       const events = [];
       let lastScannedEventId = message.afterEventId;
