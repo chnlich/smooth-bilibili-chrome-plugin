@@ -1,4 +1,5 @@
 import { EXTENSION_PREFERENCES } from '../constants.js';
+import { logSessionFragment } from '../diagnostics/log-session.js';
 
 const MESSAGE_VERSION = 2;
 const PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
@@ -24,6 +25,7 @@ const statusElement = document.querySelector('[data-status]');
 const inputs = new Map(
   PREFERENCES.map((name) => [name, document.querySelector(`input[data-preference="${name}"]`)]),
 );
+let latestStatusSnapshot;
 
 function displayValue(value) {
   return value === undefined || value === null || value === '' ? '未提供' : String(value);
@@ -55,6 +57,7 @@ async function pollStatus() {
   try {
     const tab = await activeTab();
     if (tab === undefined) {
+      latestStatusSnapshot = undefined;
       renderSnapshot(undefined);
       statusElement.textContent = '当前活动页面未提供扩展状态。';
       return;
@@ -64,9 +67,11 @@ async function pollStatus() {
       type: 'status:get',
     });
     if (response?.ok === false) throw new Error(response.error?.message || '当前页面拒绝状态请求');
+    latestStatusSnapshot = response;
     renderSnapshot(response);
     statusElement.textContent = '状态每 500ms 刷新。';
   } catch (error) {
+    latestStatusSnapshot = undefined;
     renderSnapshot(undefined);
     statusElement.textContent = `读取当前页面状态失败: ${displayValue(error?.message || error)}`;
   }
@@ -85,7 +90,10 @@ for (const name of PREFERENCES) {
 }
 
 document.querySelector('[data-open-logs]').addEventListener('click', () => {
-  chrome.tabs.create({ url: chrome.runtime.getURL('logs.html') });
+  const fragment = logSessionFragment(latestStatusSnapshot?.sessionId);
+  void chrome.tabs.create({ url: chrome.runtime.getURL(`logs.html${fragment}`) }).catch((error) => {
+    console.error('[BilibiliBuffer] 打开开发日志失败', error);
+  });
 });
 
 void loadPreferences().catch((error) => {

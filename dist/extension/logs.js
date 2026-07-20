@@ -1,4 +1,12 @@
 (() => {
+  // src/diagnostics/log-session.js
+  var UNKNOWN_SESSION_ID = "未提供";
+  function sessionIdFromHash(hash) {
+    if (typeof hash !== "string" || !hash.startsWith("#")) return void 0;
+    const sessionId = new URLSearchParams(hash.slice(1)).get("sessionId");
+    return typeof sessionId === "string" && sessionId.length > 0 && sessionId !== UNKNOWN_SESSION_ID ? sessionId : void 0;
+  }
+
   // src/diagnostics/logs.js
   var MESSAGE_VERSION = 1;
   var PAGE_SIZE = 250;
@@ -6,7 +14,7 @@
   var exportButton = document.querySelector("[data-export]");
   var statusElement = document.querySelector("[data-status]");
   var sessionDetails = document.querySelector("[data-session-details]");
-  var currentSessionId;
+  var currentSessionId = sessionIdFromHash(window.location.hash);
   function display(value) {
     return value === void 0 || value === null || value === "" ? "未提供" : String(value);
   }
@@ -18,17 +26,6 @@
       });
     }
     return response;
-  }
-  async function readCurrentSessionId() {
-    try {
-      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      if (tabs.length !== 1 || !Number.isInteger(tabs[0].id)) return void 0;
-      const response = await chrome.tabs.sendMessage(tabs[0].id, { version: 2, type: "status:get" });
-      return typeof response?.sessionId === "string" && response.sessionId !== "未提供" ? response.sessionId : void 0;
-    } catch (error) {
-      console.warn("[BilibiliBuffer] 当前 session 不可读取", error);
-      return void 0;
-    }
   }
   function appendSessionOption(session) {
     const option = document.createElement("option");
@@ -49,7 +46,6 @@
       if (!response.hasMore || response.sessions.length === 0) break;
       afterSessionId = response.sessions.at(-1).sessionId;
     }
-    currentSessionId = await readCurrentSessionId();
     if (currentSessionId !== void 0) {
       const option = [...sessionSelect.options].find((candidate) => candidate.value === currentSessionId);
       if (option !== void 0) option.textContent = `当前 · ${option.textContent}`;

@@ -1,5 +1,5 @@
 import { DIAGNOSTIC_MESSAGE_VERSION } from './catalog.js';
-import { sanitizeEventData, normalizeEventForStorage } from './privacy.js';
+import { normalizeEventForStorage, resourceTimingFields } from './privacy.js';
 import { createSessionIdentity } from './session.js';
 import { serializeError } from '../extension/bridge-contract.js';
 
@@ -82,6 +82,7 @@ export class DiagnosticsClient {
     this.flushScheduled = false;
     this.flushPromise = undefined;
     this.destroyed = false;
+    this.tearingDown = false;
     this.persistence = '未提供';
     this.pendingPersistResult = undefined;
     this.noVideoTimer = undefined;
@@ -89,8 +90,10 @@ export class DiagnosticsClient {
     this.startSession(routeIdentity(locationObject));
     this.installResourceObserver();
     this.documentObject?.defaultView?.addEventListener?.('pagehide', () => {
-      void this.flush();
-      this.destroy();
+      this.beginTeardown();
+      void this.flushForTeardown().catch((error) => {
+        this.logger.error?.('[BilibiliBuffer] diagnostic teardown flush failed', serializeError(error));
+      }).finally(() => this.destroy());
     }, { once: true });
   }
 
@@ -151,7 +154,7 @@ export class DiagnosticsClient {
       this.resourceObserver = new Observer((list) => {
         for (const entry of list.getEntries()) {
           try {
-            this.log('resource.observed', entry);
+            this.log('resource.observed', resourceTimingFields(entry));
           } catch (error) {
             this.log('extension.observer_error', { reason: 'resource' }, error);
           }
@@ -164,7 +167,7 @@ export class DiagnosticsClient {
   }
 
   log(code, data = {}, error, context = {}) {
-    if (this.destroyed) return;
+    if (this.destroyed || this.tearingDown) return;
     try {
       if (this.pendingPersistResult !== undefined && !code.startsWith('log.persist.')) {
         const result = this.pendingPersistResult;
@@ -192,8 +195,7 @@ export class DiagnosticsClient {
       code,
       ...contextFields(context),
     };
-    const sanitizedData = sanitizeEventData(code, data);
-    if (Object.keys(sanitizedData).length > 0) event.data = sanitizedData;
+    event.data = data;
     if (error !== undefined) event.error = serializeError(error);
     const normalized = normalizeEventForStorage(event);
     this.sequence = normalized.sequence;
@@ -206,7 +208,7 @@ export class DiagnosticsClient {
   }
 
   scheduleFlush() {
-    if (this.flushScheduled || this.destroyed) return;
+    if (this.flushScheduled || this.destroyed || this.tearingDown) return;
     this.flushScheduled = true;
     this.windowObject.setTimeout(() => {
       this.flushScheduled = false;
@@ -217,6 +219,14 @@ export class DiagnosticsClient {
   async flush() {
     this.enqueuePendingBatch();
     return this.flushOutbox();
+  }
+
+  async flushForTeardown() {
+    this.enqueuePendingBatch();
+    for (;;) {
+      const result = await (this.flushPromise || this.flushOutbox());
+      if (result === undefined || result.status === 'DEGRADED' || this.outbox.length === 0) return;
+    }
   }
 
   enqueuePendingBatch() {
@@ -265,7 +275,7 @@ export class DiagnosticsClient {
       return { status: 'DEGRADED', error: serializeError(error) };
     }).finally(() => {
       this.flushPromise = undefined;
-      if (!this.destroyed && this.outbox.length > 0 && this.outbox[0].failed !== true) {
+      if (!this.destroyed && !this.tearingDown && this.outbox.length > 0 && this.outbox[0].failed !== true) {
         void this.flushOutbox();
       }
     });
@@ -279,11 +289,17 @@ export class DiagnosticsClient {
     };
   }
 
-  destroy() {
-    if (this.destroyed) return;
-    this.destroyed = true;
+  beginTeardown() {
+    if (this.tearingDown) return;
+    this.tearingDown = true;
     if (this.noVideoTimer !== undefined) this.windowObject.clearTimeout(this.noVideoTimer);
     this.resourceObserver?.disconnect?.();
+  }
+
+  destroy() {
+    if (this.destroyed) return;
+    this.beginTeardown();
+    this.destroyed = true;
   }
 }
 

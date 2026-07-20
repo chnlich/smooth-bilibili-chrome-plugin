@@ -120,6 +120,9 @@ export class VodBufferController {
       if (core === undefined || core === null) {
         fail('VOD_CORE_UNAVAILABLE', '播放器内核刷新没有返回当前内核');
       }
+      if (selectedVideo !== this.video || selectedVideo !== this.getVideo()) {
+        return;
+      }
       const currentSource = currentVideoSource(this.video);
       if (currentSource === '' || currentSource !== core.snapshot.source) {
         this.hintState = 'WAITING';

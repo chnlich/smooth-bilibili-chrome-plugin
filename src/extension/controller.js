@@ -91,14 +91,10 @@ function assertPopupMessage(message) {
   return message;
 }
 
-async function handlePopupMessage(message, sender) {
+async function handlePopupMessage(message) {
   assertPopupMessage(message);
-  if (sender?.tab?.id === undefined) {
-    throw Object.assign(new Error('popup 消息缺少 sender.tab.id'), { code: 'POPUP_TAB_MISSING' });
-  }
   const surface = getCurrentStatusSurface();
   if (surface === undefined) return createUnavailableStatusSnapshot(modeForLocation(window.location));
-  surface.bindTab(sender.tab.id);
   return surface.getSnapshot();
 }
 
@@ -106,8 +102,8 @@ export function installPopupMessageHandler(runtimeObject = chrome.runtime) {
   if (runtimeObject?.onMessage === undefined || typeof runtimeObject.onMessage.addListener !== 'function') {
     throw new Error('Chrome runtime message API 不可用');
   }
-  runtimeObject.onMessage.addListener((message, sender, sendResponse) => {
-    void handlePopupMessage(message, sender)
+  runtimeObject.onMessage.addListener((message, _sender, sendResponse) => {
+    void handlePopupMessage(message)
       .then((response) => sendResponse(response))
       .catch((error) => sendResponse({
         version: STATUS_MESSAGE_VERSION,

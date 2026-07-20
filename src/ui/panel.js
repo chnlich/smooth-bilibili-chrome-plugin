@@ -62,7 +62,6 @@ export class StatusPanel {
     this.mode = mode;
     this.model = Object.fromEntries(fieldsForMode(mode).map((field) => [field, '未提供']));
     this.destroyed = false;
-    this.boundTabId = undefined;
     this.freshnessCheck = () => true;
     this.snapshotRefresh = () => {};
     currentSurface = this;
@@ -93,12 +92,6 @@ export class StatusPanel {
 
   assertFresh() {
     if (this.freshnessCheck() !== true) fail('UI_SURFACE_STALE', '状态 surface 已不属于当前页面');
-  }
-
-  bindTab(tabId) {
-    if (!Number.isInteger(tabId) || tabId <= 0) fail('UI_TAB_INVALID', '状态 surface 的 tab id 无效');
-    if (this.boundTabId !== undefined && this.boundTabId !== tabId) fail('UI_TAB_MISMATCH', '状态 surface 不属于请求 tab');
-    this.boundTabId = tabId;
   }
 
   getSnapshot() {

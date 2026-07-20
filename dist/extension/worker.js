@@ -208,6 +208,7 @@
 
   // src/diagnostics/privacy.js
   var UNKNOWN_VALUE = "未提供";
+  var RESOURCE_FIELDS = Object.freeze([...allowedDataFields("resource.observed")]);
   function finiteOrUnknown(value) {
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }

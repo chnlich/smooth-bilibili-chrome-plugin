@@ -2,6 +2,8 @@ import { allowedDataFields, assertEventCode } from './catalog.js';
 
 export const UNKNOWN_VALUE = '未提供';
 
+const RESOURCE_FIELDS = Object.freeze([...allowedDataFields('resource.observed')]);
+
 function finiteOrUnknown(value) {
   return Number.isFinite(value) ? value : UNKNOWN_VALUE;
 }
@@ -200,19 +202,15 @@ function sanitizeSerializedError(error, seen = new WeakSet(), depth = 0) {
   return result;
 }
 
-export function sanitizeResourceTiming(entry) {
+export function resourceTimingFields(entry) {
   if (entry === null || typeof entry !== 'object') {
     throw new Error('PerformanceResourceTiming 条目无效');
   }
-  return sanitizeEventData('resource.observed', {
-    name: entry.name,
-    initiatorType: entry.initiatorType,
-    startTime: entry.startTime,
-    duration: entry.duration,
-    responseStart: entry.responseStart,
-    responseEnd: entry.responseEnd,
-    transferSize: entry.transferSize,
-    encodedBodySize: entry.encodedBodySize,
-    decodedBodySize: entry.decodedBodySize,
-  });
+  const fields = {};
+  for (const field of RESOURCE_FIELDS) fields[field] = entry[field];
+  return fields;
+}
+
+export function sanitizeResourceTiming(entry) {
+  return sanitizeEventData('resource.observed', resourceTimingFields(entry));
 }

@@ -23,6 +23,13 @@
     statusRefreshMilliseconds: 500
   });
 
+  // src/diagnostics/log-session.js
+  var UNKNOWN_SESSION_ID = "未提供";
+  function logSessionFragment(sessionId) {
+    if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId === UNKNOWN_SESSION_ID) return "";
+    return `#sessionId=${encodeURIComponent(sessionId)}`;
+  }
+
   // src/extension/popup.js
   var MESSAGE_VERSION = 2;
   var PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
@@ -47,6 +54,7 @@
   var inputs = new Map(
     PREFERENCES.map((name) => [name, document.querySelector(`input[data-preference="${name}"]`)])
   );
+  var latestStatusSnapshot;
   function displayValue(value) {
     return value === void 0 || value === null || value === "" ? "未提供" : String(value);
   }
@@ -73,6 +81,7 @@
     try {
       const tab = await activeTab();
       if (tab === void 0) {
+        latestStatusSnapshot = void 0;
         renderSnapshot(void 0);
         statusElement.textContent = "当前活动页面未提供扩展状态。";
         return;
@@ -82,9 +91,11 @@
         type: "status:get"
       });
       if (response?.ok === false) throw new Error(response.error?.message || "当前页面拒绝状态请求");
+      latestStatusSnapshot = response;
       renderSnapshot(response);
       statusElement.textContent = "状态每 500ms 刷新。";
     } catch (error) {
+      latestStatusSnapshot = void 0;
       renderSnapshot(void 0);
       statusElement.textContent = `读取当前页面状态失败: ${displayValue(error?.message || error)}`;
     }
@@ -100,7 +111,10 @@
     });
   }
   document.querySelector("[data-open-logs]").addEventListener("click", () => {
-    chrome.tabs.create({ url: chrome.runtime.getURL("logs.html") });
+    const fragment = logSessionFragment(latestStatusSnapshot?.sessionId);
+    void chrome.tabs.create({ url: chrome.runtime.getURL(`logs.html${fragment}`) }).catch((error) => {
+      console.error("[BilibiliBuffer] 打开开发日志失败", error);
+    });
   });
   void loadPreferences().catch((error) => {
     console.error("[BilibiliBuffer] Popup 读取设置失败", error);

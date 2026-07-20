@@ -9,9 +9,10 @@ import {
 } from '../src/extension/bridge-contract.js';
 import { BridgeCore, LiveCapabilities } from '../src/extension/bridge-client.js';
 import { createManifest } from '../src/extension/manifest-source.js';
-import { isVideoPage, isVodPage, modeForLocation } from '../src/extension/controller.js';
+import { installPopupMessageHandler, isVideoPage, isVodPage, modeForLocation } from '../src/extension/controller.js';
 import { createStatusPanel, createUnavailableStatusSnapshot, STATUS_MESSAGE_VERSION } from '../src/ui/panel.js';
 import { createSessionIdentity, validateSession } from '../src/diagnostics/session.js';
+import { logSessionFragment, sessionIdFromHash } from '../src/diagnostics/log-session.js';
 
 test('manifest is MV3 with only storage permissions, unlimited diagnostic storage, worker, and approved routes', () => {
   const manifest = createManifest();
@@ -78,6 +79,26 @@ test('status panel exposes only direct facts and no playback or recovery actions
   assert.equal(Object.hasOwn(unavailable, 'actions'), false);
 });
 
+test('tab-scoped popup status requests do not require a popup sender tab', async () => {
+  let listener;
+  const panel = createStatusPanel({}, 'video');
+  panel.setModel({ state: 'APPLIED', buffered: '12.0 秒', target: '120 秒' });
+  installPopupMessageHandler({
+    onMessage: {
+      addListener(callback) {
+        listener = callback;
+      },
+    },
+  });
+  const response = await new Promise((resolve) => {
+    const result = listener({ version: STATUS_MESSAGE_VERSION, type: 'status:get' }, {}, resolve);
+    assert.equal(result, true);
+  });
+  assert.equal(response.mode, '视频');
+  assert.equal(response.state, '已应用');
+  panel.destroy();
+});
+
 test('bridge contract allows only native video hint and narrow live capability operations', () => {
   assert.deepEqual(BRIDGE_CORE_SYNC_METHODS, ['setStableBufferTime']);
   assert.deepEqual(BRIDGE_LIVE_METHODS, ['setAutoSyncProgressCfg', 'setAutoDiscardFrameCfg']);
@@ -130,6 +151,18 @@ test('session identity omits page tab id and keeps route identity fields', () =>
   assert.equal(session.roomId, '6363772');
   assert.doesNotThrow(() => validateSession(session, { requireTabId: false }));
   assert.throws(() => validateSession({ ...session, tabId: 3 }, { requireTabId: false }));
+});
+
+test('log session fragments carry only a precise encoded session filter', () => {
+  const sessionId = 'session /?&=测试';
+  const fragment = logSessionFragment(sessionId);
+  assert.equal(fragment, '#sessionId=session%20%2F%3F%26%3D%E6%B5%8B%E8%AF%95');
+  assert.equal(sessionIdFromHash(fragment), sessionId);
+  assert.equal(logSessionFragment(undefined), '');
+  assert.equal(logSessionFragment(''), '');
+  assert.equal(logSessionFragment('未提供'), '');
+  assert.equal(sessionIdFromHash('#other=value'), undefined);
+  assert.equal(sessionIdFromHash('#sessionId='), undefined);
 });
 
 test('error serialization rejects arbitrary cause objects while keeping safe cause fields', () => {

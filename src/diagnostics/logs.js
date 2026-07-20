@@ -1,3 +1,5 @@
+import { sessionIdFromHash } from './log-session.js';
+
 const MESSAGE_VERSION = 1;
 const PAGE_SIZE = 250;
 
@@ -6,7 +8,7 @@ const exportButton = document.querySelector('[data-export]');
 const statusElement = document.querySelector('[data-status]');
 const sessionDetails = document.querySelector('[data-session-details]');
 
-let currentSessionId;
+const currentSessionId = sessionIdFromHash(window.location.hash);
 
 function display(value) {
   return value === undefined || value === null || value === '' ? '未提供' : String(value);
@@ -20,20 +22,6 @@ async function send(message) {
     });
   }
   return response;
-}
-
-async function readCurrentSessionId() {
-  try {
-    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    if (tabs.length !== 1 || !Number.isInteger(tabs[0].id)) return undefined;
-    const response = await chrome.tabs.sendMessage(tabs[0].id, { version: 2, type: 'status:get' });
-    return typeof response?.sessionId === 'string' && response.sessionId !== '未提供'
-      ? response.sessionId
-      : undefined;
-  } catch (error) {
-    console.warn('[BilibiliBuffer] 当前 session 不可读取', error);
-    return undefined;
-  }
 }
 
 function appendSessionOption(session) {
@@ -56,7 +44,6 @@ async function loadSessions() {
     if (!response.hasMore || response.sessions.length === 0) break;
     afterSessionId = response.sessions.at(-1).sessionId;
   }
-  currentSessionId = await readCurrentSessionId();
   if (currentSessionId !== undefined) {
     const option = [...sessionSelect.options].find((candidate) => candidate.value === currentSessionId);
     if (option !== undefined) option.textContent = `当前 · ${option.textContent}`;

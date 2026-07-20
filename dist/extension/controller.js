@@ -183,6 +183,7 @@
 
   // src/diagnostics/privacy.js
   var UNKNOWN_VALUE = "未提供";
+  var RESOURCE_FIELDS = Object.freeze([...allowedDataFields("resource.observed")]);
   function finiteOrUnknown(value) {
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }
@@ -359,9 +360,17 @@
     }
     return result;
   }
+  function resourceTimingFields(entry) {
+    if (entry === null || typeof entry !== "object") {
+      throw new Error("PerformanceResourceTiming 条目无效");
+    }
+    const fields = {};
+    for (const field of RESOURCE_FIELDS) fields[field] = entry[field];
+    return fields;
+  }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-076f0d0aee341c723ae50bdd" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-ba6255002478afcee8790d08" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -576,6 +585,7 @@
       this.flushScheduled = false;
       this.flushPromise = void 0;
       this.destroyed = false;
+      this.tearingDown = false;
       this.persistence = "未提供";
       this.pendingPersistResult = void 0;
       this.noVideoTimer = void 0;
@@ -583,8 +593,10 @@
       this.startSession(routeIdentity(locationObject));
       this.installResourceObserver();
       this.documentObject?.defaultView?.addEventListener?.("pagehide", () => {
-        void this.flush();
-        this.destroy();
+        this.beginTeardown();
+        void this.flushForTeardown().catch((error) => {
+          this.logger.error?.("[BilibiliBuffer] diagnostic teardown flush failed", serializeError(error));
+        }).finally(() => this.destroy());
       }, { once: true });
     }
     startSession(route) {
@@ -641,7 +653,7 @@
         this.resourceObserver = new Observer((list) => {
           for (const entry of list.getEntries()) {
             try {
-              this.log("resource.observed", entry);
+              this.log("resource.observed", resourceTimingFields(entry));
             } catch (error) {
               this.log("extension.observer_error", { reason: "resource" }, error);
             }
@@ -653,7 +665,7 @@
       }
     }
     log(code, data = {}, error, context = {}) {
-      if (this.destroyed) return;
+      if (this.destroyed || this.tearingDown) return;
       try {
         if (this.pendingPersistResult !== void 0 && !code.startsWith("log.persist.")) {
           const result = this.pendingPersistResult;
@@ -680,8 +692,7 @@
         code,
         ...contextFields(context)
       };
-      const sanitizedData = sanitizeEventData(code, data);
-      if (Object.keys(sanitizedData).length > 0) event.data = sanitizedData;
+      event.data = data;
       if (error !== void 0) event.error = serializeError(error);
       const normalized = normalizeEventForStorage(event);
       this.sequence = normalized.sequence;
@@ -693,7 +704,7 @@
       }
     }
     scheduleFlush() {
-      if (this.flushScheduled || this.destroyed) return;
+      if (this.flushScheduled || this.destroyed || this.tearingDown) return;
       this.flushScheduled = true;
       this.windowObject.setTimeout(() => {
         this.flushScheduled = false;
@@ -703,6 +714,13 @@
     async flush() {
       this.enqueuePendingBatch();
       return this.flushOutbox();
+    }
+    async flushForTeardown() {
+      this.enqueuePendingBatch();
+      for (; ; ) {
+        const result = await (this.flushPromise || this.flushOutbox());
+        if (result === void 0 || result.status === "DEGRADED" || this.outbox.length === 0) return;
+      }
     }
     enqueuePendingBatch() {
       if (this.pending.length === 0 || this.session === void 0) return;
@@ -749,7 +767,7 @@
         return { status: "DEGRADED", error: serializeError(error) };
       }).finally(() => {
         this.flushPromise = void 0;
-        if (!this.destroyed && this.outbox.length > 0 && this.outbox[0].failed !== true) {
+        if (!this.destroyed && !this.tearingDown && this.outbox.length > 0 && this.outbox[0].failed !== true) {
           void this.flushOutbox();
         }
       });
@@ -761,11 +779,16 @@
         persistence: this.persistence
       };
     }
-    destroy() {
-      if (this.destroyed) return;
-      this.destroyed = true;
+    beginTeardown() {
+      if (this.tearingDown) return;
+      this.tearingDown = true;
       if (this.noVideoTimer !== void 0) this.windowObject.clearTimeout(this.noVideoTimer);
       this.resourceObserver?.disconnect?.();
+    }
+    destroy() {
+      if (this.destroyed) return;
+      this.beginTeardown();
+      this.destroyed = true;
     }
   };
   function createRouteIdentity(locationObject) {
@@ -1291,6 +1314,7 @@
     }
     checkForNoFrameStall() {
       if (this.video === void 0 || this.video.paused !== false || !this.hasDecodedFrame || this.lastDecodedAtMilliseconds === void 0) return;
+      if (typeof this.video.requestVideoFrameCallback !== "function") return;
       const elapsed = nowMilliseconds(this.runtimeObject) - this.lastDecodedAtMilliseconds;
       if (elapsed >= this.config.noDecodedFrameStallMilliseconds) this.maybeArmStall("no_decoded_frame");
     }
@@ -1347,7 +1371,7 @@
       });
     }
     applyReplacementCorrection() {
-      if (!this.replacementNeedsCorrection || this.activeStall === void 0 || this.video === void 0 || this.video.paused !== false || this.userSeekAuthorization !== void 0) return;
+      if (!this.replacementNeedsCorrection || this.activeStall === void 0 || this.video === void 0 || this.sourceKey === "" || this.video.paused !== false || this.userSeekAuthorization !== void 0) return;
       let ranges;
       try {
         ranges = readSeekable(this.video);
@@ -1357,15 +1381,22 @@
       }
       const target = closestSeekablePosition(ranges, this.activeStall.protectedTime, true);
       if (!Number.isFinite(target) || !Number.isFinite(this.video.currentTime)) return;
-      this.replacementNeedsCorrection = false;
-      if (Math.abs(this.video.currentTime - target) <= this.config.correctionToleranceSeconds) return;
+      const currentTime = this.video.currentTime;
+      if (Math.abs(currentTime - target) <= this.config.correctionToleranceSeconds) {
+        this.activeStall.protectedTime = target;
+        this.replacementNeedsCorrection = false;
+        return;
+      }
       this.correcting = true;
       try {
         this.video.currentTime = target;
+        if (!Number.isFinite(this.video.currentTime) || Math.abs(this.video.currentTime - target) > this.config.correctionToleranceSeconds) return;
+        this.activeStall.protectedTime = target;
+        this.replacementNeedsCorrection = false;
         this.diagnostics?.log("live.delay.corrected", {
           reason: "source_replaced",
           targetTime: target,
-          currentTime: this.video.currentTime,
+          currentTime,
           protectedDelay: delayOrUnknown(
             this.video,
             this.diagnostics,
@@ -1702,6 +1733,9 @@
         if (core === void 0 || core === null) {
           fail("VOD_CORE_UNAVAILABLE", "播放器内核刷新没有返回当前内核");
         }
+        if (selectedVideo !== this.video || selectedVideo !== this.getVideo()) {
+          return;
+        }
         const currentSource2 = currentVideoSource(this.video);
         if (currentSource2 === "" || currentSource2 !== core.snapshot.source) {
           this.hintState = "WAITING";
@@ -1922,7 +1956,6 @@
       this.mode = mode;
       this.model = Object.fromEntries(fieldsForMode(mode).map((field) => [field, "未提供"]));
       this.destroyed = false;
-      this.boundTabId = void 0;
       this.freshnessCheck = () => true;
       this.snapshotRefresh = () => {
       };
@@ -1949,11 +1982,6 @@
     }
     assertFresh() {
       if (this.freshnessCheck() !== true) fail("UI_SURFACE_STALE", "状态 surface 已不属于当前页面");
-    }
-    bindTab(tabId) {
-      if (!Number.isInteger(tabId) || tabId <= 0) fail("UI_TAB_INVALID", "状态 surface 的 tab id 无效");
-      if (this.boundTabId !== void 0 && this.boundTabId !== tabId) fail("UI_TAB_MISMATCH", "状态 surface 不属于请求 tab");
-      this.boundTabId = tabId;
     }
     getSnapshot() {
       if (this.destroyed) fail("UI_SURFACE_DESTROYED", "状态 surface 已销毁");
@@ -2428,22 +2456,18 @@
     }
     return message;
   }
-  async function handlePopupMessage(message, sender) {
+  async function handlePopupMessage(message) {
     assertPopupMessage(message);
-    if (sender?.tab?.id === void 0) {
-      throw Object.assign(new Error("popup 消息缺少 sender.tab.id"), { code: "POPUP_TAB_MISSING" });
-    }
     const surface = getCurrentStatusSurface();
     if (surface === void 0) return createUnavailableStatusSnapshot(modeForLocation(window.location));
-    surface.bindTab(sender.tab.id);
     return surface.getSnapshot();
   }
   function installPopupMessageHandler(runtimeObject = chrome.runtime) {
     if (runtimeObject?.onMessage === void 0 || typeof runtimeObject.onMessage.addListener !== "function") {
       throw new Error("Chrome runtime message API 不可用");
     }
-    runtimeObject.onMessage.addListener((message, sender, sendResponse) => {
-      void handlePopupMessage(message, sender).then((response) => sendResponse(response)).catch((error) => sendResponse({
+    runtimeObject.onMessage.addListener((message, _sender, sendResponse) => {
+      void handlePopupMessage(message).then((response) => sendResponse(response)).catch((error) => sendResponse({
         version: STATUS_MESSAGE_VERSION,
         ok: false,
         error: popupError(error)

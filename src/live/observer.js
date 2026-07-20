@@ -82,42 +82,6 @@ function selectVideo(documentObject) {
   })[0];
 }
 
-export function waitForVideo(documentObject, timeoutMilliseconds, signal) {
-  const existing = selectVideo(documentObject);
-  if (existing !== undefined) return Promise.resolve(existing);
-  return new Promise((resolve, reject) => {
-    let timer;
-    const observer = new MutationObserver(() => {
-      const video = selectVideo(documentObject);
-      if (video === undefined) return;
-      observer.disconnect();
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', abort);
-      resolve(video);
-    });
-    const abort = () => {
-      observer.disconnect();
-      clearTimeout(timer);
-      reject(Object.assign(new Error('等待 video 被取消'), { code: 'VIDEO_WAIT_ABORTED' }));
-    };
-    observer.observe(documentObject, { childList: true, subtree: true });
-    timer = setTimeout(() => {
-      observer.disconnect();
-      signal?.removeEventListener('abort', abort);
-      reject(Object.assign(new Error(`等待 video 超时: ${timeoutMilliseconds}ms`), { code: 'VIDEO_WAIT_TIMEOUT' }));
-    }, timeoutMilliseconds);
-    signal?.addEventListener('abort', abort, { once: true });
-  });
-}
-
-export function roomIdFromLocation(locationObject) {
-  const value = locationObject.pathname.split('/').filter(Boolean)[0];
-  if (value === undefined || value.length === 0) {
-    throw Object.assign(new Error('无法从直播路径读取房间号'), { code: 'LIVE_ROOM_ID_MISSING' });
-  }
-  return value;
-}
-
 export class LiveObserver {
   constructor({
     documentObject = document,
@@ -441,6 +405,7 @@ export class LiveObserver {
   checkForNoFrameStall() {
     if (this.video === undefined || this.video.paused !== false || !this.hasDecodedFrame ||
       this.lastDecodedAtMilliseconds === undefined) return;
+    if (typeof this.video.requestVideoFrameCallback !== 'function') return;
     const elapsed = nowMilliseconds(this.runtimeObject) - this.lastDecodedAtMilliseconds;
     if (elapsed >= this.config.noDecodedFrameStallMilliseconds) this.maybeArmStall('no_decoded_frame');
   }
@@ -504,7 +469,7 @@ export class LiveObserver {
 
   applyReplacementCorrection() {
     if (!this.replacementNeedsCorrection || this.activeStall === undefined || this.video === undefined ||
-      this.video.paused !== false || this.userSeekAuthorization !== undefined) return;
+      this.sourceKey === '' || this.video.paused !== false || this.userSeekAuthorization !== undefined) return;
     let ranges;
     try {
       ranges = readSeekable(this.video);
@@ -514,15 +479,23 @@ export class LiveObserver {
     }
     const target = closestSeekablePosition(ranges, this.activeStall.protectedTime, true);
     if (!Number.isFinite(target) || !Number.isFinite(this.video.currentTime)) return;
-    this.replacementNeedsCorrection = false;
-    if (Math.abs(this.video.currentTime - target) <= this.config.correctionToleranceSeconds) return;
+    const currentTime = this.video.currentTime;
+    if (Math.abs(currentTime - target) <= this.config.correctionToleranceSeconds) {
+      this.activeStall.protectedTime = target;
+      this.replacementNeedsCorrection = false;
+      return;
+    }
     this.correcting = true;
     try {
       this.video.currentTime = target;
+      if (!Number.isFinite(this.video.currentTime) ||
+        Math.abs(this.video.currentTime - target) > this.config.correctionToleranceSeconds) return;
+      this.activeStall.protectedTime = target;
+      this.replacementNeedsCorrection = false;
       this.diagnostics?.log('live.delay.corrected', {
         reason: 'source_replaced',
         targetTime: target,
-        currentTime: this.video.currentTime,
+        currentTime,
         protectedDelay: delayOrUnknown(
           this.video,
           this.diagnostics,
