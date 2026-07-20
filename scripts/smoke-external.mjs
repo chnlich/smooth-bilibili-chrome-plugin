@@ -11,6 +11,12 @@ const reportPath = path.join(reportDirectory, 'external-smoke-report.json');
 const interruptionMilliseconds = 4000;
 const recoveryMilliseconds = 5000;
 const delayToleranceSeconds = 1;
+const bridgeAuditOperations = new Set([
+  'getCoreSnapshot',
+  'callCoreSync',
+  'getLiveCapabilitySnapshot',
+  'disableLiveAutoCatchup',
+]);
 
 const mutedInit = () => {
   const observed = new Set();
@@ -100,6 +106,13 @@ function reportError(error) {
     const parsed = new URL(value);
     return `${parsed.origin}${parsed.pathname}`;
   });
+}
+
+function bridgeAuditRecord(request) {
+  const operation = bridgeAuditOperations.has(request?.operation) ? request.operation : 'invalid';
+  const mode = request?.mode === 'sync' || request?.mode === 'async' ? request.mode : 'invalid';
+  if (!Number.isSafeInteger(request?.id) || request.id <= 0) return { operation, mode };
+  return { operation, mode, id: request.id };
 }
 
 function hasReadablePlayingVideo(media) {
@@ -383,7 +396,7 @@ async function runPage(context, kind, url, { keepPage = false } = {}) {
   const page = await context.newPage();
   let retained = false;
   const bridgeRequests = [];
-  await page.exposeFunction('__recordExternalBridge', (request) => bridgeRequests.push(request));
+  await page.exposeFunction('__recordExternalBridge', (request) => bridgeRequests.push(bridgeAuditRecord(request)));
   await page.addInitScript(() => {
     document.addEventListener('bilibili-buffer:bridge-request-v1', (event) => {
       try {
@@ -404,8 +417,7 @@ async function runPage(context, kind, url, { keepPage = false } = {}) {
         result: { kind, status: 'BLOCKED', reason: '匿名公共页面没有可读取的 video', media, bridgeRequests, silent },
       };
     }
-    const forbiddenOperations = bridgeRequests.filter((request) =>
-      !['getCoreSnapshot', 'callCoreSync', 'getLiveCapabilitySnapshot', 'disableLiveAutoCatchup'].includes(request.operation));
+    const forbiddenOperations = bridgeRequests.filter((request) => !bridgeAuditOperations.has(request.operation));
     if (forbiddenOperations.length > 0 || silent.some(({ muted, volume }) => muted !== true || volume !== 0)) {
       return {
         result: { kind, status: 'FAIL', reason: '静音或桥接所有权审计失败', media, bridgeRequests, silent },
