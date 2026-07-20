@@ -255,7 +255,7 @@ export class BridgeCore {
   callCoreSync(method, args = []) {
     this.assertActive();
     try {
-      return this.client.callSync('callCoreSync', [this.coreId, method, args]);
+      return this.client.callSync('callCoreSync', [this.coreId, method, args, this.snapshot.source]);
     } catch (error) {
       if (error?.code === 'BRIDGE_CORE_STALE') {
         this.markStale();

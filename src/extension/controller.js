@@ -18,7 +18,8 @@ export function isLivePage(locationObject) {
 export function isVodPage(locationObject) {
   return locationObject.hostname === 'www.bilibili.com' && (
     locationObject.pathname.startsWith('/video/') ||
-    locationObject.pathname.startsWith('/list/watchlater')
+    locationObject.pathname === '/list/watchlater' ||
+    locationObject.pathname.startsWith('/list/watchlater/')
   );
 }
 
@@ -96,7 +97,7 @@ async function handlePopupMessage(message, sender) {
   const surface = getCurrentStatusSurface();
   if (request.type === 'status:get') {
     if (surface === undefined) {
-      return createUnavailableStatusSnapshot();
+      return createUnavailableStatusSnapshot(modeForLocation(window.location));
     }
     if (senderTabId !== undefined) {
       surface.bindTab(senderTabId);

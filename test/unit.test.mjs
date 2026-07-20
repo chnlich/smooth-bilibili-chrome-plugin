@@ -324,6 +324,7 @@ function createVodBufferFixture({ supports = true, setter = () => {}, source = '
     },
   };
   const core = {
+    snapshot: { source },
     supports(method) {
       assert.equal(method, 'setStableBufferTime');
       return supports;
@@ -2041,6 +2042,7 @@ test('VOD makes one native buffer-hint attempt per stable core/media generation'
 
   const replacementCalls = [];
   const replacementCore = {
+    snapshot: { source: 'vod-source-1' },
     supports: () => true,
     setStableBufferTime(value) {
       replacementCalls.push(value);
@@ -2052,11 +2054,133 @@ test('VOD makes one native buffer-hint attempt per stable core/media generation'
   assert.deepEqual(replacementCalls, [VOD_CONFIG.stableBufferSeconds]);
   assert.deepEqual(calls, [VOD_CONFIG.stableBufferSeconds]);
 
+  const sourceReplacementCalls = [];
+  const sourceReplacementCore = {
+    snapshot: { source: 'vod-source-3' },
+    supports: () => true,
+    setStableBufferTime(value) {
+      sourceReplacementCalls.push(value);
+    },
+  };
+  fixture.replaceCore(sourceReplacementCore);
   fixture.video.currentSrc = 'vod-source-3';
   fixture.video.src = 'vod-source-3';
   await fixture.controller.reconcile();
-  assert.deepEqual(replacementCalls, [VOD_CONFIG.stableBufferSeconds, VOD_CONFIG.stableBufferSeconds]);
+  await fixture.controller.reconcile();
+  assert.deepEqual(sourceReplacementCalls, [VOD_CONFIG.stableBufferSeconds]);
   fixture.controller.destroy();
+});
+
+test('VOD waits for a coherent core snapshot and restores a stable generation result after a bridge wait', async () => {
+  const calls = [];
+  const models = [];
+  const video = {
+    currentSrc: 'vod-source-1',
+    src: 'vod-source-1',
+    currentTime: 10,
+    buffered: { length: 1, start: () => 0, end: () => 80 },
+  };
+  let resolveRefresh;
+  const firstCore = {
+    snapshot: { source: 'vod-source-1' },
+    supports: () => true,
+    setStableBufferTime(value) {
+      calls.push(['first', value]);
+    },
+  };
+  const secondCore = {
+    snapshot: { source: 'vod-source-2' },
+    supports: () => true,
+    setStableBufferTime(value) {
+      calls.push(['second', value]);
+    },
+  };
+  let refreshCore = () => new Promise((resolve) => {
+    resolveRefresh = resolve;
+  });
+  const controller = new VodBufferController({
+    video,
+    panel: { setModel(model) { models.push(model); } },
+    runtimeObject: { setInterval: () => 1, clearInterval() {} },
+    refreshCore: () => refreshCore(),
+    logger: { warn() {}, error() {} },
+  });
+  controller.started = true;
+  const staleRefresh = controller.reconcile();
+  video.currentSrc = 'vod-source-2';
+  video.src = 'vod-source-2';
+  resolveRefresh(firstCore);
+  await staleRefresh;
+  assert.deepEqual(calls, []);
+  assert.equal(models.at(-1).state, 'WAITING');
+
+  refreshCore = async () => secondCore;
+  await controller.reconcile();
+  assert.deepEqual(calls, [['second', VOD_CONFIG.stableBufferSeconds]]);
+  assert.equal(models.at(-1).state, 'APPLIED');
+
+  video.currentSrc = '';
+  video.src = '';
+  await controller.reconcile();
+  assert.equal(models.at(-1).state, 'WAITING');
+
+  video.currentSrc = 'vod-source-2';
+  video.src = 'vod-source-2';
+  await controller.reconcile();
+  assert.deepEqual(calls, [['second', VOD_CONFIG.stableBufferSeconds]]);
+  assert.equal(models.at(-1).state, 'APPLIED');
+
+  refreshCore = async () => {
+    throw new BufferScriptError('PLAYER_UNAVAILABLE', 'temporary player refresh outage');
+  };
+  await controller.reconcile();
+  assert.equal(models.at(-1).state, 'WAITING');
+
+  refreshCore = async () => secondCore;
+  await controller.reconcile();
+  assert.deepEqual(calls, [['second', VOD_CONFIG.stableBufferSeconds]]);
+  assert.equal(models.at(-1).state, 'APPLIED');
+
+  refreshCore = async () => {
+    throw new Error('temporary bridge response failure');
+  };
+  await controller.reconcile();
+  assert.equal(models.at(-1).state, 'WAITING');
+  assert.match(models.at(-1).message, /VOD_RECONCILE_FAILED/);
+
+  refreshCore = async () => secondCore;
+  await controller.reconcile();
+  assert.deepEqual(calls, [['second', VOD_CONFIG.stableBufferSeconds]]);
+  assert.equal(models.at(-1).state, 'APPLIED');
+
+  const staleCore = {
+    snapshot: { source: 'vod-source-3' },
+    supports: () => true,
+    setStableBufferTime() {
+      throw new BufferScriptError('BRIDGE_CORE_STALE', 'source changed during setter dispatch');
+    },
+  };
+  const replacementAfterStale = {
+    snapshot: { source: 'vod-source-3' },
+    supports: () => true,
+    setStableBufferTime(value) {
+      calls.push(['after-stale', value]);
+    },
+  };
+  video.currentSrc = 'vod-source-3';
+  video.src = 'vod-source-3';
+  refreshCore = async () => staleCore;
+  await controller.reconcile();
+  assert.equal(models.at(-1).state, 'WAITING');
+
+  refreshCore = async () => replacementAfterStale;
+  await controller.reconcile();
+  assert.deepEqual(calls, [
+    ['second', VOD_CONFIG.stableBufferSeconds],
+    ['after-stale', VOD_CONFIG.stableBufferSeconds],
+  ]);
+  assert.equal(models.at(-1).state, 'APPLIED');
+  controller.destroy();
 });
 
 test('VOD reports unsupported and failed hints without changing native playback', async () => {

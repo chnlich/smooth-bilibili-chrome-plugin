@@ -185,11 +185,13 @@ export function getCurrentStatusSurface() {
   return currentSurface;
 }
 
-export function createUnavailableStatusSnapshot() {
+export function createUnavailableStatusSnapshot(routeMode) {
+  const fields = routeMode === 'vod' ? VOD_DISPLAY_FIELDS : DISPLAY_FIELDS;
   return {
     version: STATUS_MESSAGE_VERSION,
     surfaceId: 'surface-unavailable',
-    ...Object.fromEntries(DISPLAY_FIELDS.map((field) => [field, '未提供'])),
+    ...Object.fromEntries(fields.map((field) => [field, '未提供'])),
+    mode: routeMode === 'vod' ? '点播' : '未提供',
     actions: {},
   };
 }

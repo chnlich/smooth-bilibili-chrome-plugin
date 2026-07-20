@@ -12,7 +12,7 @@ import {
 import { BridgeCore, createPageWindowAdapter } from '../src/extension/bridge-client.js';
 import { createManifest } from '../src/extension/manifest-source.js';
 import { isVodPage, modeForLocation } from '../src/extension/controller.js';
-import { StatusPanel } from '../src/ui/panel.js';
+import { createUnavailableStatusSnapshot, StatusPanel } from '../src/ui/panel.js';
 
 function snapshot(coreId, source, supportsStable = true) {
   return {
@@ -42,6 +42,7 @@ test('route selection activates normal video and Watch Later but not unrelated w
   assert.equal(isVodPage(location('https://www.bilibili.com/video/BVtest')), true);
   assert.equal(isVodPage(location('https://www.bilibili.com/list/watchlater')), true);
   assert.equal(isVodPage(location('https://www.bilibili.com/list/watchlater/')), true);
+  assert.equal(isVodPage(location('https://www.bilibili.com/list/watchlaterish')), false);
   assert.equal(isVodPage(location('https://www.bilibili.com/')), false);
   assert.equal(isVodPage(location('https://www.bilibili.com/read/cv123')), false);
   assert.equal(modeForLocation(location('https://live.bilibili.com/6363772')), 'live');
@@ -80,7 +81,7 @@ test('bridge core invokes only the stable-buffer setter and reports capability a
   const supported = new BridgeCore(client, snapshot(3, 'test-source', true));
   assert.equal(supported.supports('setStableBufferTime'), true);
   supported.setStableBufferTime(120);
-  assert.deepEqual(calls, [['callCoreSync', [3, 'setStableBufferTime', [120]]]]);
+  assert.deepEqual(calls, [['callCoreSync', [3, 'setStableBufferTime', [120], 'test-source']]]);
 
   const unsupported = new BridgeCore(client, snapshot(4, 'other-source', false));
   assert.equal(unsupported.supports('setStableBufferTime'), false);
@@ -90,14 +91,20 @@ test('bridge core invokes only the stable-buffer setter and reports capability a
   );
 });
 
-test('adapter reuses a stable BridgeCore and replaces it when core identity or source changes', async () => {
+test('adapter reuses a stable BridgeCore and replaces it for source-only or core-only changes', async () => {
   let snapshotCalls = 0;
   const calls = [];
   const client = {
     callAsync(operation) {
       assert.equal(operation, 'getCoreSnapshot');
       snapshotCalls += 1;
-      return Promise.resolve(snapshot(snapshotCalls <= 2 ? 5 : 6, snapshotCalls <= 2 ? 'old' : 'new'));
+      const snapshots = [
+        snapshot(5, 'old'),
+        snapshot(5, 'old'),
+        snapshot(5, 'new'),
+        snapshot(6, 'new'),
+      ];
+      return Promise.resolve(snapshots[snapshotCalls - 1]);
     },
     callSync(operation, args) {
       calls.push([operation, args]);
@@ -114,11 +121,16 @@ test('adapter reuses a stable BridgeCore and replaces it when core identity or s
   const same = await adapter.refreshCore();
   assert.strictEqual(first, same);
   assert.equal(snapshotCalls, 2);
-  const replacement = await adapter.refreshCore();
-  assert.notStrictEqual(replacement, first);
+  const sourceReplacement = await adapter.refreshCore();
+  assert.notStrictEqual(sourceReplacement, first);
   assert.equal(first.stale, true);
-  assert.equal(replacement.coreId, 6);
-  replacement.setStableBufferTime(120);
+  assert.equal(sourceReplacement.coreId, 5);
+  assert.equal(sourceReplacement.snapshot.source, 'new');
+  const coreReplacement = await adapter.refreshCore();
+  assert.notStrictEqual(coreReplacement, sourceReplacement);
+  assert.equal(sourceReplacement.stale, true);
+  assert.equal(coreReplacement.coreId, 6);
+  coreReplacement.setStableBufferTime(120);
   assert.equal(calls.length, 1);
 });
 
@@ -129,6 +141,13 @@ test('VOD status snapshots omit legacy quality, rate, multiplier, delay, stage, 
   assert.deepEqual(Object.keys(snapshotValue).sort(), ['actions', 'inventory', 'message', 'mode', 'state', 'surfaceId', 'version']);
   assert.deepEqual(snapshotValue.actions, {});
   panel.destroy();
+
+  const unavailable = createUnavailableStatusSnapshot('vod');
+  assert.equal(unavailable.mode, '点播');
+  assert.deepEqual(
+    Object.keys(unavailable).sort(),
+    ['actions', 'inventory', 'message', 'mode', 'state', 'surfaceId', 'version'],
+  );
 });
 
 test('live status snapshots retain every live field and action surface', () => {

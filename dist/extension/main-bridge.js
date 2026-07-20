@@ -112,11 +112,11 @@
       }
     };
   }
-  function requireCurrentRecord(coreId) {
+  function requireCurrentRecord(coreId, source) {
     const current = recordFor(currentCore());
     const record = coreRecordsById.get(coreId);
-    if (record === void 0 || record !== current) {
-      throw Object.assign(new Error(`页面播放器内核 ${coreId} 已过期`), { code: "BRIDGE_CORE_STALE" });
+    if (record === void 0 || record !== current || readCurrentVideoSource() !== source) {
+      throw Object.assign(new Error(`页面播放器内核或媒体 source ${coreId} 已过期`), { code: "BRIDGE_CORE_STALE" });
     }
     return record;
   }
@@ -152,11 +152,11 @@
     return true;
   }
   function callCoreSync(args) {
-    const [coreId, method, methodArgs] = requireArguments(args, 3);
-    if (!Number.isInteger(coreId) || !BRIDGE_CORE_SYNC_METHODS.includes(method)) {
+    const [coreId, method, methodArgs, source] = requireArguments(args, 4);
+    if (!Number.isInteger(coreId) || typeof source !== "string" || !BRIDGE_CORE_SYNC_METHODS.includes(method)) {
       throw Object.assign(new Error(`内核同步操作未允许: ${method}`), { code: "BRIDGE_OPERATION_DENIED" });
     }
-    const record = requireCurrentRecord(coreId);
+    const record = requireCurrentRecord(coreId, source);
     const values = methodArgs === void 0 ? [] : methodArgs;
     if (!Array.isArray(values)) {
       throw Object.assign(new Error("内核操作参数必须是数组"), { code: "BRIDGE_ARGUMENTS_INVALID" });

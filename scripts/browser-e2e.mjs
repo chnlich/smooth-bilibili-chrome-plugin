@@ -50,6 +50,7 @@ const VIDEO_ONLY_INIT_SEGMENT = (() => {
 function audioGuard() {
   const selector = 'video, audio';
   const observedRoots = new WeakSet();
+  const observedMedia = new Set();
   const isNode = (value) => value instanceof Node;
   const mediaInRoot = (rootNode) => {
     const media = [];
@@ -60,9 +61,19 @@ function audioGuard() {
     return media;
   };
   const silence = (media) => {
+    observedMedia.add(media);
     media.muted = true;
     media.volume = 0;
   };
+  const originalPlay = HTMLMediaElement.prototype.play;
+  Object.defineProperty(HTMLMediaElement.prototype, 'play', {
+    configurable: true,
+    writable: true,
+    value(...args) {
+      silence(this);
+      return originalPlay.apply(this, args);
+    },
+  });
   const scanRoot = (rootNode) => {
     if (rootNode.nodeType !== Node.ELEMENT_NODE
         && rootNode.nodeType !== Node.DOCUMENT_NODE
@@ -159,30 +170,16 @@ function audioGuard() {
     writable: true,
     value(options) {
       const shadow = originalAttachShadow.call(this, options);
-      if (options?.mode === 'open') {
-        install(shadow);
-      }
+      install(shadow);
       return shadow;
     },
   });
   const sync = () => {
     scanRoot(document);
   };
-  const snapshotRoot = (rootNode, values) => {
-    for (const media of mediaInRoot(rootNode)) {
-      values.push({ muted: media.muted, volume: media.volume });
-    }
-    for (const element of rootNode.querySelectorAll('*')) {
-      if (element.shadowRoot !== null) {
-        snapshotRoot(element.shadowRoot, values);
-      }
-    }
-  };
   const snapshot = () => {
     sync();
-    const values = [];
-    snapshotRoot(document, values);
-    return values;
+    return [...observedMedia].map((media) => ({ muted: media.muted, volume: media.volume }));
   };
   install(document);
   window.__bilibiliAudioGuard = {
@@ -234,6 +231,7 @@ const createCore = (label) => {
 state.core = createCore('core-1');
 const video = document.createElement('video');
 video.src = state.source;
+Object.defineProperty(video, 'currentSrc', { configurable: true, get: () => state.source });
 video.muted = true;
 video.volume = 0;
 video.play = () => {
@@ -256,6 +254,15 @@ state.replaceSource = (source) => {
   state.source = source === 'user-selected-source' ? 'data:video/mp4;base64,AQ==' : source;
   video.src = state.source;
 };
+document.addEventListener('bilibili-buffer:bridge-request-v1', (event) => {
+  const request = JSON.parse(event.detail);
+  if (request.operation !== 'callCoreSync' || state.reentrantSource === undefined) {
+    return;
+  }
+  const source = state.reentrantSource;
+  state.reentrantSource = undefined;
+  state.replaceSource(source);
+}, { capture: true });
 state.userPause = () => video.pause();
 state.userPlay = () => video.play();
 state.userSeek = (value) => { state.currentTime = Number(value); };
@@ -567,6 +574,12 @@ async function assertNestedShadowAudioGuard(page) {
     host.insertAdjacentHTML('beforeend', '<audio data-audio-guard="adjacent"></audio>');
     const htmlVideo = host.querySelector('[data-audio-guard="html"]');
     const adjacentAudio = host.querySelector('[data-audio-guard="adjacent"]');
+    const detachedVideo = document.createElement('video');
+    detachedVideo.muted = false;
+    detachedVideo.volume = 0.8;
+    void Promise.resolve(HTMLMediaElement.prototype.play.call(detachedVideo)).catch((error) => {
+      console.debug('[BilibiliBuffer] detached mute-guard play rejected', error);
+    });
     const firstShadow = host.attachShadow({ mode: 'open' });
     const firstVideo = document.createElement('video');
     const nestedHost = document.createElement('div');
@@ -580,6 +593,12 @@ async function assertNestedShadowAudioGuard(page) {
     const secondAudio = document.createElement('audio');
     const secondVideo = document.createElement('video');
     secondShadow.append(secondAudio, secondVideo);
+    const closedHost = document.createElement('div');
+    document.body.append(closedHost);
+    const closedShadow = closedHost.attachShadow({ mode: 'closed' });
+    const closedVideo = document.createElement('video');
+    closedShadow.append(closedVideo);
+    const closedImmediate = { muted: closedVideo.muted, volume: closedVideo.volume };
     const fragment = document.createDocumentFragment();
     const fragmentVideo = document.createElement('video');
     fragment.append(fragmentVideo);
@@ -610,6 +629,12 @@ async function assertNestedShadowAudioGuard(page) {
       if (!secondVideo.muted || secondVideo.volume !== 0) throw new Error('second nested video was not muted synchronously');
       return Promise.resolve();
     };
+    closedVideo.play = () => {
+      if (!closedVideo.muted || closedVideo.volume !== 0) {
+        throw new Error('closed-shadow video was not muted synchronously');
+      }
+      return Promise.resolve();
+    };
     fragmentVideo.play = () => {
       if (!fragmentVideo.muted || fragmentVideo.volume !== 0) throw new Error('fragment video was not muted synchronously');
       return Promise.resolve();
@@ -627,6 +652,7 @@ async function assertNestedShadowAudioGuard(page) {
     return Promise.all([
       playWithGuard(firstVideo),
       playWithGuard(secondVideo),
+      playWithGuard(closedVideo),
       playWithGuard(fragmentVideo),
       playWithGuard(beforeVideo),
       playWithGuard(afterAudio),
@@ -637,11 +663,13 @@ async function assertNestedShadowAudioGuard(page) {
       return {
         firstImmediate,
         secondImmediate,
+        closedImmediate,
         fragmentImmediate,
         siblingImmediate,
         firstVideo: { muted: firstVideo.muted, volume: firstVideo.volume },
         secondAudio: { muted: secondAudio.muted, volume: secondAudio.volume },
         secondVideo: { muted: secondVideo.muted, volume: secondVideo.volume },
+        closedVideo: { muted: closedVideo.muted, volume: closedVideo.volume },
         fragmentVideo: { muted: fragmentVideo.muted, volume: fragmentVideo.volume },
         htmlVideo: {
           muted: htmlVideo.muted,
@@ -651,6 +679,7 @@ async function assertNestedShadowAudioGuard(page) {
           muted: adjacentAudio.muted,
           volume: adjacentAudio.volume,
         },
+        detachedVideo: { muted: detachedVideo.muted, volume: detachedVideo.volume },
         snapshot,
       };
     });
@@ -658,6 +687,7 @@ async function assertNestedShadowAudioGuard(page) {
   assert.deepEqual(result.firstImmediate, { muted: true, volume: 0 });
   assert.deepEqual(result.secondImmediate.audio, { muted: true, volume: 0 });
   assert.deepEqual(result.secondImmediate.video, { muted: true, volume: 0 });
+  assert.deepEqual(result.closedImmediate, { muted: true, volume: 0 });
   assert.deepEqual(result.fragmentImmediate, { muted: true, volume: 0 });
   assert.deepEqual(result.siblingImmediate, {
     before: { muted: true, volume: 0 },
@@ -668,9 +698,11 @@ async function assertNestedShadowAudioGuard(page) {
   assert.deepEqual(result.firstVideo, { muted: true, volume: 0 });
   assert.deepEqual(result.secondAudio, { muted: true, volume: 0 });
   assert.deepEqual(result.secondVideo, { muted: true, volume: 0 });
+  assert.deepEqual(result.closedVideo, { muted: true, volume: 0 });
   assert.deepEqual(result.fragmentVideo, { muted: true, volume: 0 });
   assert.deepEqual(result.htmlVideo, { muted: true, volume: 0 });
   assert.deepEqual(result.adjacentAudio, { muted: true, volume: 0 });
+  assert.deepEqual(result.detachedVideo, { muted: true, volume: 0 });
   assert.ok(result.snapshot.every((media) => media.muted === true && media.volume === 0));
   return result;
 }
@@ -793,12 +825,18 @@ async function runVodScenario(context, page) {
       pauseCalls: window.__fakeVodState.pauseCalls,
     })), userMediaState);
 
-    await page.evaluate(() => window.__fakeVodState.replaceSource('user-selected-source'));
+    await page.evaluate(() => {
+      const state = window.__fakeVodState;
+      state.reentrantSource = 'user-selected-source';
+      state.replaceSource('data:video/mp4;base64,Ag==');
+    });
     await page.waitForFunction(
       () => window.__fakeVodState.stable.length === 2,
       undefined,
       { timeout: 10000 },
     );
+    await wait(1200);
+    assert.equal((await page.evaluate(() => window.__fakeVodState.stable.length)), 2);
     await page.evaluate(() => window.__fakeVodState.replaceCore());
     await page.waitForFunction(
       () => window.__fakeVodState.stable.length === 3,
@@ -826,6 +864,10 @@ async function runVodScenario(context, page) {
     assert.ok(disabled.marker);
     assert.deepEqual(disabled.stable, []);
     assert.equal((await panelState(page)).state, '未提供');
+    assert.equal(
+      await popup.locator('[data-live-only="true"]').evaluateAll((rows) => rows.every((row) => row.hidden)),
+      true,
+    );
 
     await popup.bringToFront();
     await popup.locator('input[data-preference="vodEnabled"]').check();

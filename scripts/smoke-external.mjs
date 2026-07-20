@@ -19,6 +19,7 @@ const fallbackVodUrl = 'https://www.bilibili.com/video/BV1xx411c7mD';
 function audioGuard() {
   const selector = 'video, audio';
   const observedRoots = new WeakSet();
+  const observedMedia = new Set();
   const isNode = (value) => value instanceof Node;
   const mediaInRoot = (rootNode) => {
     const media = [];
@@ -29,9 +30,19 @@ function audioGuard() {
     return media;
   };
   const silence = (media) => {
+    observedMedia.add(media);
     media.muted = true;
     media.volume = 0;
   };
+  const originalPlay = HTMLMediaElement.prototype.play;
+  Object.defineProperty(HTMLMediaElement.prototype, 'play', {
+    configurable: true,
+    writable: true,
+    value(...args) {
+      silence(this);
+      return originalPlay.apply(this, args);
+    },
+  });
   const scanRoot = (rootNode) => {
     if (rootNode.nodeType !== Node.ELEMENT_NODE
         && rootNode.nodeType !== Node.DOCUMENT_NODE
@@ -128,30 +139,16 @@ function audioGuard() {
     writable: true,
     value(options) {
       const shadow = originalAttachShadow.call(this, options);
-      if (options?.mode === 'open') {
-        install(shadow);
-      }
+      install(shadow);
       return shadow;
     },
   });
   const sync = () => {
     scanRoot(document);
   };
-  const snapshotRoot = (rootNode, values) => {
-    for (const media of mediaInRoot(rootNode)) {
-      values.push({ muted: media.muted, volume: media.volume });
-    }
-    for (const element of rootNode.querySelectorAll('*')) {
-      if (element.shadowRoot !== null) {
-        snapshotRoot(element.shadowRoot, values);
-      }
-    }
-  };
   const snapshot = () => {
     sync();
-    const values = [];
-    snapshotRoot(document, values);
-    return values;
+    return [...observedMedia].map((media) => ({ muted: media.muted, volume: media.volume }));
   };
   install(document);
   window.__bilibiliAudioGuard = {
@@ -168,7 +165,11 @@ function audioGuard() {
 
 function ownershipAudit() {
   const calls = [];
-  const record = (name) => calls.push({ name, at: performance.now() });
+  const bridgeRequests = [];
+  const record = (name, value) => calls.push({ name, value, at: performance.now(), stack: new Error().stack });
+  document.addEventListener('bilibili-buffer:bridge-request-v1', (event) => {
+    bridgeRequests.push(JSON.parse(event.detail));
+  });
   for (const name of ['play', 'pause']) {
     const original = HTMLMediaElement.prototype[name];
     Object.defineProperty(HTMLMediaElement.prototype, name, {
@@ -180,13 +181,48 @@ function ownershipAudit() {
       },
     });
   }
+  for (const name of ['currentTime', 'playbackRate', 'muted', 'volume', 'src']) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, name);
+    Object.defineProperty(HTMLMediaElement.prototype, name, {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get: descriptor.get,
+      set(value) {
+        record(`set:${name}`, value);
+        return descriptor.set.call(this, value);
+      },
+    });
+  }
+  const quality = () => {
+    const video = document.querySelector('video');
+    const player = globalThis.player;
+    let playerQuality;
+    if (typeof player?.getQuality === 'function') {
+      try {
+        const value = player.getQuality();
+        playerQuality = typeof value === 'number' || typeof value === 'string'
+          ? value
+          : ['realQ', 'qn', 'quality', 'nowQ']
+            .map((field) => value?.[field])
+            .find((candidate) => typeof candidate === 'number' || typeof candidate === 'string');
+      } catch (error) {
+        playerQuality = { error: error.message || String(error) };
+      }
+    }
+    return {
+      playerQuality,
+      videoWidth: video?.videoWidth,
+      videoHeight: video?.videoHeight,
+    };
+  };
   window.__bilibiliOwnershipAudit = {
-    reset() {
-      calls.length = 0;
-    },
     read() {
       return [...calls];
     },
+    readBridgeRequests() {
+      return [...bridgeRequests];
+    },
+    quality,
   };
 }
 
@@ -340,6 +376,25 @@ function nonProductDiagnosticsAreBlocked(consoleErrors, pageErrors) {
 
 function hasViableTerminalState(mode, state) {
   return mode === '点播' ? state === 'APPLIED' : state === 'LIVE' || state === 'DELAYED';
+}
+
+function inspectVodBridgeRequests(requests) {
+  const stableHintRequests = requests.filter((request) => request.operation === 'callCoreSync');
+  const unexpectedRequests = requests.filter((request) => {
+    if (request.operation === 'getCoreSnapshot') {
+      return false;
+    }
+    const args = request.args;
+    return request.operation !== 'callCoreSync' ||
+      !Array.isArray(args) ||
+      !Number.isInteger(args[0]) ||
+      args[1] !== 'setStableBufferTime' ||
+      !Array.isArray(args[2]) ||
+      args[2].length !== 1 ||
+      args[2][0] !== 120 ||
+      typeof args[3] !== 'string';
+  });
+  return { stableHintRequests, unexpectedRequests };
 }
 
 function evaluateSnapshot(snapshot, mode) {
@@ -507,6 +562,7 @@ async function runExternalPage(context, url, mode) {
             volume: video.volume,
             paused: video.paused,
             forwardBuffer: forwardBuffer(video),
+            quality: window.__bilibiliOwnershipAudit.quality(),
           },
     };
   });
@@ -675,6 +731,10 @@ async function runExternalPage(context, url, mode) {
     await wait(15000);
     const first = await readSnapshot();
     lastSnapshot = first;
+    const startupAudit = await page.evaluate(() => ({
+      ownershipCalls: window.__bilibiliOwnershipAudit.read(),
+      bridgeRequests: window.__bilibiliOwnershipAudit.readBridgeRequests(),
+    }));
     const extensionErrors = extensionDiagnostics(consoleErrors, pageErrors);
     if (extensionErrors.consoleErrors.length > 0 || extensionErrors.pageErrors.length > 0) {
       return {
@@ -683,6 +743,7 @@ async function runExternalPage(context, url, mode) {
         reason: 'extension/product error was logged on the real page',
         first,
         beforePlay,
+        startupAudit,
         consoleErrors,
         pageErrors,
         extensionErrors,
@@ -694,6 +755,7 @@ async function runExternalPage(context, url, mode) {
         url,
         first,
         beforePlay,
+        startupAudit,
         consoleErrors,
         pageErrors,
         extensionErrors,
@@ -706,13 +768,11 @@ async function runExternalPage(context, url, mode) {
         url,
         first,
         beforePlay,
+        startupAudit,
         consoleErrors,
         pageErrors,
         extensionErrors,
       };
-    }
-    if (mode === '点播') {
-      await page.evaluate(() => window.__bilibiliOwnershipAudit.reset());
     }
     await wait(5000);
     const second = await readSnapshot();
@@ -756,18 +816,47 @@ async function runExternalPage(context, url, mode) {
         extensionErrors: secondExtensionErrors,
       };
     }
-    const ownershipCalls = mode === '点播'
-      ? await page.evaluate(() => window.__bilibiliOwnershipAudit.read())
-      : [];
-    if (mode === '点播' && ownershipCalls.length > 0) {
+    const audit = mode === '点播'
+      ? await page.evaluate(() => ({
+        ownershipCalls: window.__bilibiliOwnershipAudit.read(),
+        bridgeRequests: window.__bilibiliOwnershipAudit.readBridgeRequests(),
+      }))
+      : { ownershipCalls: [], bridgeRequests: [] };
+    const ownershipCalls = audit.ownershipCalls;
+    const extensionOwnershipCalls = ownershipCalls.filter((call) => call.stack?.includes('chrome-extension://'));
+    const bridgeAudit = inspectVodBridgeRequests(audit.bridgeRequests);
+    if (mode === '点播' && (
+      bridgeAudit.stableHintRequests.length !== 1 ||
+      bridgeAudit.unexpectedRequests.length > 0
+    )) {
       return {
         status: 'FAIL',
         url,
-        reason: `VOD playback ownership methods were called after the native hint settled: ${JSON.stringify(ownershipCalls)}`,
+        reason: `VOD bridge operations exceeded the one native hint: ${JSON.stringify(bridgeAudit)}`,
         first,
         second,
         beforePlay,
+        startupAudit,
         ownershipCalls,
+        extensionOwnershipCalls,
+        bridgeAudit,
+        consoleErrors,
+        pageErrors,
+        extensionErrors: secondExtensionErrors,
+      };
+    }
+    if (mode === '点播' && extensionOwnershipCalls.length > 0) {
+      return {
+        status: 'FAIL',
+        url,
+        reason: `VOD media ownership was observed from extension code: ${JSON.stringify(extensionOwnershipCalls)}`,
+        first,
+        second,
+        beforePlay,
+        startupAudit,
+        ownershipCalls,
+        extensionOwnershipCalls,
+        bridgeAudit,
         consoleErrors,
         pageErrors,
         extensionErrors: secondExtensionErrors,
@@ -781,7 +870,10 @@ async function runExternalPage(context, url, mode) {
         first,
         second,
         beforePlay,
+        startupAudit,
         ownershipCalls,
+        extensionOwnershipCalls,
+        bridgeAudit,
         consoleErrors,
         pageErrors,
         extensionErrors: secondExtensionErrors,
@@ -795,7 +887,27 @@ async function runExternalPage(context, url, mode) {
         first,
         second,
         beforePlay,
+        startupAudit,
         ownershipCalls,
+        extensionOwnershipCalls,
+        bridgeAudit,
+        consoleErrors,
+        pageErrors,
+        extensionErrors: secondExtensionErrors,
+      };
+    }
+    if (mode === '点播' && JSON.stringify(second.media.quality) !== JSON.stringify(first.media.quality)) {
+      return {
+        status: 'BLOCKED',
+        url,
+        reason: 'anonymous media quality changed during the bounded ownership observation',
+        first,
+        second,
+        beforePlay,
+        startupAudit,
+        ownershipCalls,
+        extensionOwnershipCalls,
+        bridgeAudit,
         consoleErrors,
         pageErrors,
         extensionErrors: secondExtensionErrors,
@@ -820,7 +932,10 @@ async function runExternalPage(context, url, mode) {
       first,
       second,
       beforePlay,
+      startupAudit,
       ownershipCalls,
+      extensionOwnershipCalls,
+      bridgeAudit,
       consoleErrors,
       pageErrors,
       extensionErrors: secondExtensionErrors,

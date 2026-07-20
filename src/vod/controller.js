@@ -48,6 +48,7 @@ export class VodBufferController {
     this.currentCore = undefined;
     this.currentSource = '';
     this.generation = 0;
+    this.generationResult = undefined;
     this.hintState = 'WAITING';
     this.message = WAITING_MESSAGE;
     this.reconcileTimer;
@@ -80,8 +81,6 @@ export class VodBufferController {
     }
     const source = currentVideoSource(this.video);
     if (source === '') {
-      this.currentCore = undefined;
-      this.currentSource = '';
       this.hintState = 'WAITING';
       this.message = WAITING_MESSAGE;
       this.updateStatus();
@@ -96,9 +95,7 @@ export class VodBufferController {
         fail('VOD_CORE_UNAVAILABLE', '播放器内核刷新没有返回当前内核');
       }
       const currentSource = currentVideoSource(this.video);
-      if (currentSource === '') {
-        this.currentCore = undefined;
-        this.currentSource = '';
+      if (currentSource === '' || currentSource !== core.snapshot.source) {
         this.hintState = 'WAITING';
         this.message = WAITING_MESSAGE;
         this.updateStatus();
@@ -109,9 +106,13 @@ export class VodBufferController {
         this.currentCore = core;
         this.currentSource = currentSource;
         this.generation += 1;
+        this.generationResult = undefined;
         this.hintState = 'WAITING';
         this.message = '';
         this.applyHintForGeneration(core);
+      } else if (this.hintState === 'WAITING' && this.generationResult !== undefined) {
+        this.hintState = this.generationResult.state;
+        this.message = this.generationResult.message;
       }
     } catch (error) {
       if (this.destroyed || !this.started) {
@@ -123,7 +124,7 @@ export class VodBufferController {
       } else {
         const normalized = toBufferScriptError(error, 'VOD_RECONCILE_FAILED', '点播播放器内核刷新失败');
         this.logger.error('点播播放器内核刷新失败', normalized);
-        this.hintState = 'FAILED';
+        this.hintState = 'WAITING';
         this.message = `${normalized.code}: ${normalized.message}`;
       }
     }
@@ -134,6 +135,7 @@ export class VodBufferController {
     if (core.supports('setStableBufferTime') !== true) {
       this.hintState = 'UNSUPPORTED';
       this.message = `当前内核不支持 ${this.config.stableBufferSeconds} 秒原生缓存提示`;
+      this.generationResult = { state: this.hintState, message: this.message };
       return;
     }
     try {
@@ -141,11 +143,17 @@ export class VodBufferController {
       this.hintState = 'APPLIED';
       this.message = '';
     } catch (error) {
+      if (error?.code === 'BRIDGE_CORE_STALE') {
+        this.hintState = 'WAITING';
+        this.message = WAITING_MESSAGE;
+        return;
+      }
       const normalized = toBufferScriptError(error, 'VOD_STABLE_BUFFER_FAILED', '原生缓存提示调用失败');
       this.logger.error('原生缓存提示调用失败', normalized);
       this.hintState = 'FAILED';
       this.message = `${normalized.code}: ${normalized.message}`;
     }
+    this.generationResult = { state: this.hintState, message: this.message };
   }
 
   readForwardBuffer() {
