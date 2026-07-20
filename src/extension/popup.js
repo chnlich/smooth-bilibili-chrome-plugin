@@ -28,6 +28,10 @@ function unavailableSnapshot() {
 
 function renderSnapshot(snapshot, tabId) {
   const values = snapshot === undefined ? unavailableSnapshot() : snapshot;
+  const mode = values.mode;
+  for (const row of document.querySelectorAll('[data-live-only="true"]')) {
+    row.hidden = mode === '点播';
+  }
   for (const field of FIELDS) {
     const element = document.querySelector(`[data-status-field="${field}"]`);
     element.textContent = displayValue(values[field]);

@@ -1,10 +1,6 @@
 import {
   assertOperation,
-  BRIDGE_CORE_EVENTS,
   BRIDGE_CORE_SYNC_METHODS,
-  BRIDGE_PLAYER_CAPABILITIES,
-  BRIDGE_PLAYER_READ_METHODS,
-  BRIDGE_EVENT_EVENT,
   BRIDGE_PLAYER_METHODS,
   BRIDGE_REQUEST_EVENT,
   BRIDGE_RESPONSE_ATTRIBUTE,
@@ -14,42 +10,11 @@ import {
   encodeMessage,
   serializeError,
 } from './bridge-contract.js';
-import { createCoreEventSubscription, supportsCoreEvents } from './core-events.js';
 
 const coreRecords = new WeakMap();
 const coreRecordsById = new Map();
-const subscriptions = new Map();
 let nextCoreId = 1;
 let activeCoreRecord;
-
-const QUALITY_FIELDS = Object.freeze([
-  'qn',
-  'qualityNumber',
-  'quality',
-  'nowQ',
-  'realQ',
-  'id',
-  'value',
-  'width',
-  'height',
-  'videoWidth',
-  'videoHeight',
-  'oldA',
-  'nowA',
-  'newA',
-  'acceptQuality',
-  'accept_quality',
-  'acceptQn',
-  'accept_qn',
-  'availableQuality',
-  'availableQualities',
-  'qualities',
-  'oldQ',
-  'newQ',
-  'oldRQ',
-]);
-
-const MEDIA_INFO_FIELDS = Object.freeze(['bitrate', 'bandwidth', 'video', 'audio']);
 
 function pagePlayerObject() {
   const player = globalThis.player;
@@ -75,26 +40,9 @@ function currentCore() {
   return core;
 }
 
-function detachSubscriptionsForCore(coreId) {
-  for (const [subscriptionId, subscription] of subscriptions) {
-    if (subscription.coreId !== coreId) {
-      continue;
-    }
-    try {
-      subscription.remove();
-    } catch (error) {
-      console.warn('[BilibiliBuffer] 清理已替换内核的桥接订阅失败', serializeError(error));
-    }
-    subscriptions.delete(subscriptionId);
-  }
-}
-
 function recordFor(core) {
   if (activeCoreRecord?.core === core) {
     return activeCoreRecord;
-  }
-  if (activeCoreRecord !== undefined) {
-    detachSubscriptionsForCore(activeCoreRecord.id);
   }
   let record = coreRecords.get(core);
   if (record === undefined) {
@@ -121,135 +69,22 @@ function readCurrentVideoSource() {
   return video === undefined ? '' : video.currentSrc || video.src || '';
 }
 
-function serializeObserved(value, allowedFields = QUALITY_FIELDS, depth = 0) {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
-    return value;
-  }
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : null;
-  }
-  if (depth >= 4 || value === undefined || typeof value === 'function') {
-    return undefined;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => serializeObserved(item, allowedFields, depth + 1)).filter((item) => item !== undefined);
-  }
-  const output = {};
-  for (const field of allowedFields) {
-    if (!(field in value)) {
-      continue;
-    }
-    const serialized = serializeObserved(value[field], allowedFields, depth + 1);
-    if (serialized !== undefined) {
-      output[field] = serialized;
-    }
-  }
-  return output;
-}
-
-function serializeMediaInfo(value) {
-  return serializeObserved(value, MEDIA_INFO_FIELDS);
-}
-
-function serializeTimeRanges(value) {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-  const ranges = [];
-  for (let index = 0; index < value.length; index += 1) {
-    const start = Number(value.start(index));
-    const end = Number(value.end(index));
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
-      throw Object.assign(new Error(`播放器 buffered range ${index} 无效`), { code: 'VOD_BUFFER_RANGES_INVALID' });
-    }
-    ranges.push({ start, end });
-  }
-  return ranges;
-}
-
-function serializeBufferedRanges(core) {
-  if (typeof core.getBufferedRanges !== 'function') {
-    return undefined;
-  }
-  const ranges = core.getBufferedRanges();
-  if (ranges === undefined || ranges === null) {
-    return undefined;
-  }
-  if (ranges.video !== undefined || ranges.audio !== undefined) {
-    return {
-      video: serializeTimeRanges(ranges.video),
-      audio: serializeTimeRanges(ranges.audio),
-    };
-  }
-  return serializeTimeRanges(ranges);
-}
-
 function readCoreCapabilities(core) {
   return {
-    getQuality: typeof core.getQuality === 'function',
-    getSupportedQualityList: typeof core.getSupportedQualityList === 'function',
-    getBufferedRanges: typeof core.getBufferedRanges === 'function',
-    getMediaInfo: typeof core.getMediaInfo === 'function',
-    getCurrentMediaInfo: typeof core.getCurrentMediaInfo === 'function',
-    getQualityInfo: typeof core.getQualityInfo === 'function',
-    getStableBufferTime: typeof core.getStableBufferTime === 'function',
-    getStableBufferSeconds: typeof core.getStableBufferSeconds === 'function',
     setStableBufferTime: typeof core.setStableBufferTime === 'function',
-    setScheduleWhilePaused: typeof core.setScheduleWhilePaused === 'function',
-    events: supportsCoreEvents(core),
   };
-}
-
-function readPlayerCapabilities(player) {
-  return Object.fromEntries(
-    BRIDGE_PLAYER_CAPABILITIES.map((method) => [method, typeof player[method] === 'function']),
-  );
-}
-
-function readOptional(core, names, serializer = serializeObserved) {
-  for (const name of names) {
-    if (typeof core[name] === 'function') {
-      return serializer(core[name]());
-    }
-  }
-  return undefined;
-}
-
-function readOptionalQuality(core, names) {
-  for (const name of names) {
-    if (typeof core[name] !== 'function') {
-      continue;
-    }
-    try {
-      return serializeObserved(core[name]());
-    } catch (error) {
-      console.warn(`[BilibiliBuffer] 读取 core 画质 getter ${name} 失败`, serializeError(error));
-      return undefined;
-    }
-  }
-  return undefined;
 }
 
 function getCoreSnapshot() {
-  const player = pagePlayer();
   const core = currentCore();
   const record = recordFor(core);
-  const hasCoreEventSupport = supportsCoreEvents(core);
-  const snapshot = {
+  return {
     coreId: record.id,
     source: readCurrentVideoSource(),
-    quality: readOptionalQuality(core, ['getQuality']),
-    supportedQualityList: readOptionalQuality(core, ['getSupportedQualityList']),
-    bufferedRanges: serializeBufferedRanges(core),
-    mediaInfo: readOptional(core, ['getMediaInfo', 'getCurrentMediaInfo', 'getQualityInfo'], serializeMediaInfo),
-    stableBufferTime: readOptional(core, ['getStableBufferTime', 'getStableBufferSeconds']),
-    supportsCoreEvents: hasCoreEventSupport,
     capabilities: {
-      player: readPlayerCapabilities(player),
       core: readCoreCapabilities(core),
     },
   };
-  return snapshot;
 }
 
 function requireCurrentRecord(coreId) {
@@ -300,22 +135,6 @@ async function callPlayer(args) {
   return true;
 }
 
-function callPlayerSync(args) {
-  const [method, methodArgs] = requireArguments(args, 2);
-  if (!BRIDGE_PLAYER_READ_METHODS.includes(method)) {
-    throw Object.assign(new Error(`页面播放器同步读取未允许: ${method}`), { code: 'BRIDGE_OPERATION_DENIED' });
-  }
-  const values = methodArgs === undefined ? [] : methodArgs;
-  if (!Array.isArray(values) || values.length !== 0) {
-    throw Object.assign(new Error(`${method} 不接受参数`), { code: 'BRIDGE_ARGUMENTS_INVALID' });
-  }
-  const player = pagePlayerObject();
-  if (typeof player[method] !== 'function') {
-    throw Object.assign(new Error(`当前页面播放器没有 ${method}`), { code: 'BRIDGE_METHOD_UNAVAILABLE' });
-  }
-  return serializeObserved(player[method]());
-}
-
 function callCoreSync(args) {
   const [coreId, method, methodArgs] = requireArguments(args, 3);
   if (!Number.isInteger(coreId) || !BRIDGE_CORE_SYNC_METHODS.includes(method)) {
@@ -329,82 +148,10 @@ function callCoreSync(args) {
   if (typeof record.core[method] !== 'function') {
     throw Object.assign(new Error(`当前内核没有 ${method}`), { code: 'BRIDGE_METHOD_UNAVAILABLE' });
   }
-  if (
-    [
-      'getQuality',
-      'getSupportedQualityList',
-      'getBufferedRanges',
-      'getMediaInfo',
-      'getCurrentMediaInfo',
-      'getQualityInfo',
-      'getStableBufferTime',
-      'getStableBufferSeconds',
-    ].includes(method) &&
-    values.length !== 0
-  ) {
-    throw Object.assign(new Error(`${method} 不接受参数`), { code: 'BRIDGE_ARGUMENTS_INVALID' });
-  }
   if (method === 'setStableBufferTime' && (values.length !== 1 || !Number.isFinite(values[0]) || values[0] <= 0)) {
     throw Object.assign(new Error('稳定缓冲秒数必须是正数'), { code: 'BRIDGE_ARGUMENTS_INVALID' });
   }
-  if (method === 'setScheduleWhilePaused' && (values.length !== 1 || typeof values[0] !== 'boolean')) {
-    throw Object.assign(new Error('暂停调度参数必须是布尔值'), { code: 'BRIDGE_ARGUMENTS_INVALID' });
-  }
-  const result = record.core[method](...values);
-  if (method === 'getBufferedRanges') {
-    return serializeBufferedRanges(record.core);
-  }
-  if (['getMediaInfo', 'getCurrentMediaInfo', 'getQualityInfo'].includes(method)) {
-    return serializeMediaInfo(result);
-  }
-  return serializeObserved(result);
-}
-
-function errorFromEvent(event) {
-  const value = event?.error ?? event?.detail?.error ?? event?.detail ?? event;
-  return serializeObserved(value, ['code', 'name', 'message', 'type', 'error'], 0);
-}
-
-function emitCoreEvent(coreId, name, event) {
-  document.dispatchEvent(
-    new CustomEvent(BRIDGE_EVENT_EVENT, {
-      detail: encodeMessage({
-        version: BRIDGE_VERSION,
-        coreId,
-        source: readCurrentVideoSource(),
-        name,
-        value: { error: errorFromEvent(event) },
-      }),
-    }),
-  );
-}
-
-function subscribeCoreEvents(args, subscriptionId) {
-  const [coreId, name] = requireArguments(args, 2);
-  if (!Number.isInteger(coreId) || !BRIDGE_CORE_EVENTS.includes(name)) {
-    throw Object.assign(new Error(`内核事件未允许: ${name}`), { code: 'BRIDGE_OPERATION_DENIED' });
-  }
-  const record = requireCurrentRecord(coreId);
-  const callback = (event) => emitCoreEvent(coreId, name, event);
-  const subscribe = createCoreEventSubscription(record.core);
-  if (subscribe === undefined) {
-    throw Object.assign(new Error('当前内核没有事件接口'), { code: 'BRIDGE_METHOD_UNAVAILABLE' });
-  }
-  subscriptions.set(subscriptionId, { coreId, remove: subscribe(name, callback) });
-  return { subscriptionId };
-}
-
-function unsubscribeCoreEvents(args) {
-  const [subscriptionId] = requireArguments(args, 1);
-  if (!Number.isInteger(subscriptionId)) {
-    throw Object.assign(new Error('订阅编号无效'), { code: 'BRIDGE_ARGUMENTS_INVALID' });
-  }
-  const subscription = subscriptions.get(subscriptionId);
-  if (subscription !== undefined) {
-    subscription.remove();
-    subscriptions.delete(subscriptionId);
-  }
-  return true;
+  return record.core[method](...values);
 }
 
 function invoke(request) {
@@ -415,14 +162,8 @@ function invoke(request) {
       return getCoreSnapshot();
     case 'callPlayer':
       return callPlayer(request.args);
-    case 'callPlayerSync':
-      return callPlayerSync(request.args);
     case 'callCoreSync':
       return callCoreSync(request.args);
-    case 'subscribeCoreEvents':
-      return subscribeCoreEvents(request.args, request.id);
-    case 'unsubscribeCoreEvents':
-      return unsubscribeCoreEvents(request.args);
     default:
       throw new Error(`未处理的桥接操作: ${request.operation}`);
   }

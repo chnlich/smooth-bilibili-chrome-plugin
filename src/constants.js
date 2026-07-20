@@ -11,6 +11,7 @@ export const EXTENSION_MANIFEST = Object.freeze({
   matches: Object.freeze([
     'https://live.bilibili.com/*',
     'https://www.bilibili.com/video/*',
+    'https://www.bilibili.com/list/watchlater*',
   ]),
   hostPermissions: Object.freeze([
     'https://api.live.bilibili.com/*',
@@ -48,10 +49,5 @@ export const LIVE_CONFIG = Object.freeze({
 });
 
 export const VOD_CONFIG = Object.freeze({
-  playbackRate: 2,
-  stableBufferSeconds: 180,
-  startupBufferSeconds: 120,
-  lowBufferSeconds: 30,
-  quotaFallbackSeconds: Object.freeze([120, 90]),
-  metricsWindowsSeconds: Object.freeze([30, 60]),
+  stableBufferSeconds: 120,
 });

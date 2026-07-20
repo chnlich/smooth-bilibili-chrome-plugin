@@ -13,6 +13,7 @@ const bridge = await fs.readFile(path.join(extensionDirectory, 'main-bridge.js')
 const controller = await fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8');
 const popup = await fs.readFile(path.join(extensionDirectory, 'popup.js'), 'utf8');
 const externalSmoke = await fs.readFile(path.join(root, 'scripts', 'smoke-external.mjs'), 'utf8');
+const vodController = await fs.readFile(path.join(root, 'src', 'vod', 'controller.js'), 'utf8');
 const productSource = await readTree(path.join(root, 'src'));
 const productOutput = `${bridge}\n${controller}\n${popup}`;
 
@@ -89,22 +90,23 @@ for (const pattern of forbidden) {
   assert.doesNotMatch(productOutput, pattern, `dist contains forbidden pattern ${pattern}`);
 }
 assert.match(controller, /credentials:\s*"omit"/);
-assert.match(controller, /realQ/);
 assert.match(controller, /GAP_MANIFEST_SEQUENCE_ROLLBACK/);
-assert.match(controller, /quotaFallbackSeconds/);
 assert.doesNotMatch(bridge, /chrome\./);
 assert.doesNotMatch(bridge, /window\.Hls\b/);
 assert.doesNotMatch(productSource, /data-bilibili-buffer-panel|attachShadow|shadowRoot/);
 assert.doesNotMatch(controller, /data-bilibili-buffer-panel|attachShadow|shadowRoot/);
 assert.doesNotMatch(productSource, /\.(?:muted|volume)\s*=/);
 assert.doesNotMatch(controller, /\.(?:muted|volume)\s*=/);
+assert.match(vodController, /setStableBufferTime/);
+assert.equal((vodController.match(/\.setStableBufferTime\(/g) || []).length, 1);
+assert.doesNotMatch(vodController, /\b(?:play|pause)\s*\(/);
+assert.doesNotMatch(vodController, /\.(?:currentTime|playbackRate|muted|volume|src|currentSrc)\s*=/);
+assert.doesNotMatch(vodController, /\bsetScheduleWhilePaused\b|\bquota\b|\bquality\b|\bthroughput\b|\bfetch\s*\(/i);
+assert.doesNotMatch(vodController, /\bMediaSource\b|\bSourceBuffer\b/);
 assert.equal(LIVE_CONFIG.recoveryWatermarkSeconds, 15);
 assert.equal(LIVE_CONFIG.aggressiveBufferSeconds, 60);
 assert.equal(LIVE_CONFIG.hideDanmakuAfterSeconds, 3);
-assert.equal(VOD_CONFIG.playbackRate, 2);
-assert.equal(VOD_CONFIG.stableBufferSeconds, 180);
-assert.equal(VOD_CONFIG.startupBufferSeconds, 120);
-assert.equal(VOD_CONFIG.lowBufferSeconds, 30);
-assert.deepEqual(VOD_CONFIG.quotaFallbackSeconds, [120, 90]);
+assert.deepEqual(Object.keys(VOD_CONFIG), ['stableBufferSeconds']);
+assert.equal(VOD_CONFIG.stableBufferSeconds, 120);
 assert.match(HLS_DEPENDENCY.integrity, /^sha512-[A-Za-z0-9+/]+=*$/);
 console.log('extension build contract passed');

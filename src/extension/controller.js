@@ -2,7 +2,7 @@ import { EXTENSION_PREFERENCES, VERSION } from '../constants.js';
 import { toBufferScriptError } from '../errors.js';
 import { LiveController, roomIdFromLocation, waitForVideo } from '../live/controller.js';
 import { getPinnedHls } from '../live/hls.js';
-import { VodController } from '../vod/controller.js';
+import { VodBufferController } from '../vod/controller.js';
 import {
   STATUS_MESSAGE_VERSION,
   createStatusPanel,
@@ -11,15 +11,18 @@ import {
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
 
-function isLivePage(locationObject) {
+export function isLivePage(locationObject) {
   return locationObject.hostname === 'live.bilibili.com';
 }
 
-function isVodPage(locationObject) {
-  return locationObject.hostname === 'www.bilibili.com' && locationObject.pathname.startsWith('/video/');
+export function isVodPage(locationObject) {
+  return locationObject.hostname === 'www.bilibili.com' && (
+    locationObject.pathname.startsWith('/video/') ||
+    locationObject.pathname.startsWith('/list/watchlater')
+  );
 }
 
-function modeForLocation(locationObject) {
+export function modeForLocation(locationObject) {
   if (isLivePage(locationObject)) {
     return 'live';
   }
@@ -273,18 +276,15 @@ export class ExtensionCoordinator {
           return;
         }
       } else {
-        const controller = new VodController({
-          windowObject: pageAdapter.pageWindow,
-          documentObject: this.documentObject,
+        const controller = new VodBufferController({
           video,
           panel,
           runtimeObject: this.runtimeObject,
           logger: this.logger,
-          fetchImpl: this.runtimeObject.fetch.bind(this.runtimeObject),
-          beforeReconcile: () => pageAdapter.refreshCore(),
+          refreshCore: () => pageAdapter.refreshCore(),
         });
         this.active.controller = controller;
-        panel.setSnapshotRefresh(() => controller.refreshQualityStatus());
+        panel.setSnapshotRefresh(() => controller.refreshStatus());
         controller.start();
         if (!routeStillCurrent()) {
           controller.destroy();
@@ -338,6 +338,8 @@ export class ExtensionCoordinator {
   }
 }
 
-installPopupMessageHandler();
-const coordinator = new ExtensionCoordinator();
-void coordinator.start().catch((error) => console.error('[BilibiliBuffer] 扩展启动失败', error));
+if (typeof chrome !== 'undefined' && typeof document !== 'undefined' && typeof window !== 'undefined') {
+  installPopupMessageHandler();
+  const coordinator = new ExtensionCoordinator();
+  void coordinator.start().catch((error) => console.error('[BilibiliBuffer] 扩展启动失败', error));
+}

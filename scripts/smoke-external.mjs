@@ -166,6 +166,30 @@ function audioGuard() {
   };
 }
 
+function ownershipAudit() {
+  const calls = [];
+  const record = (name) => calls.push({ name, at: performance.now() });
+  for (const name of ['play', 'pause']) {
+    const original = HTMLMediaElement.prototype[name];
+    Object.defineProperty(HTMLMediaElement.prototype, name, {
+      configurable: true,
+      writable: true,
+      value(...args) {
+        record(name);
+        return original.apply(this, args);
+      },
+    });
+  }
+  window.__bilibiliOwnershipAudit = {
+    reset() {
+      calls.length = 0;
+    },
+    read() {
+      return [...calls];
+    },
+  };
+}
+
 function playInfoUrl(roomId) {
   const url = new URL('https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo');
   url.searchParams.set('room_id', String(roomId));
@@ -315,9 +339,7 @@ function nonProductDiagnosticsAreBlocked(consoleErrors, pageErrors) {
 }
 
 function hasViableTerminalState(mode, state) {
-  return mode === '点播'
-    ? state === 'VOD_READY'
-    : state === 'LIVE' || state === 'DELAYED';
+  return mode === '点播' ? state === 'APPLIED' : state === 'LIVE' || state === 'DELAYED';
 }
 
 function evaluateSnapshot(snapshot, mode) {
@@ -350,11 +372,10 @@ function evaluateSnapshot(snapshot, mode) {
       reason: 'anonymous page did not converge to a usable media resource',
     };
   }
-  const expectedSpeed = mode === '直播' ? '1×' : '2×';
-  if (status.speed !== expectedSpeed) {
+  if (mode === '直播' && status.speed !== '1×') {
     return {
       status: 'FAIL',
-      reason: `controller reported speed ${status.speed || 'missing'} instead of ${expectedSpeed}`,
+      reason: `controller reported live speed ${status.speed || 'missing'} instead of 1×`,
     };
   }
   if (snapshot.media.muted !== true || snapshot.media.volume !== 0) {
@@ -363,11 +384,10 @@ function evaluateSnapshot(snapshot, mode) {
       reason: 'media was not synchronously muted with zero volume',
     };
   }
-  const qualityStatus = (status.quality || '').trim();
-  if (mode === '点播' && !/^(?:qn\d+|当前画质未知)/.test(qualityStatus)) {
+  if (mode === '点播' && status.state !== 'APPLIED') {
     return {
-      status: 'FAIL',
-      reason: `VOD readonly quality diagnostic was invalid: ${qualityStatus || 'missing'}`,
+      status: status.state === 'WAITING' ? 'BLOCKED' : 'FAIL',
+      reason: `VOD native buffer hint state was ${status.state || 'missing'}: ${status.message || 'no message'}`,
     };
   }
   if (mode === '直播') {
@@ -462,6 +482,19 @@ async function runExternalPage(context, url, mode) {
   const pageErrors = [];
   const readMedia = () => page.evaluate(() => {
     const video = document.querySelector('video');
+    const forwardBuffer = (media) => {
+      if (media === null) {
+        return undefined;
+      }
+      for (let index = 0; index < media.buffered.length; index += 1) {
+        const start = media.buffered.start(index);
+        const end = media.buffered.end(index);
+        if (start <= media.currentTime && media.currentTime <= end) {
+          return Math.max(0, end - media.currentTime);
+        }
+      }
+      return 0;
+    };
     return {
       media: video === null
         ? undefined
@@ -473,6 +506,7 @@ async function runExternalPage(context, url, mode) {
             muted: video.muted,
             volume: video.volume,
             paused: video.paused,
+            forwardBuffer: forwardBuffer(video),
           },
     };
   });
@@ -677,6 +711,9 @@ async function runExternalPage(context, url, mode) {
         extensionErrors,
       };
     }
+    if (mode === '点播') {
+      await page.evaluate(() => window.__bilibiliOwnershipAudit.reset());
+    }
     await wait(5000);
     const second = await readSnapshot();
     lastSnapshot = second;
@@ -719,6 +756,51 @@ async function runExternalPage(context, url, mode) {
         extensionErrors: secondExtensionErrors,
       };
     }
+    const ownershipCalls = mode === '点播'
+      ? await page.evaluate(() => window.__bilibiliOwnershipAudit.read())
+      : [];
+    if (mode === '点播' && ownershipCalls.length > 0) {
+      return {
+        status: 'FAIL',
+        url,
+        reason: `VOD playback ownership methods were called after the native hint settled: ${JSON.stringify(ownershipCalls)}`,
+        first,
+        second,
+        beforePlay,
+        ownershipCalls,
+        consoleErrors,
+        pageErrors,
+        extensionErrors: secondExtensionErrors,
+      };
+    }
+    if (mode === '点播' && second.media.playbackRate !== first.media.playbackRate) {
+      return {
+        status: 'FAIL',
+        url,
+        reason: `VOD playbackRate changed during the observation: ${first.media.playbackRate} -> ${second.media.playbackRate}`,
+        first,
+        second,
+        beforePlay,
+        ownershipCalls,
+        consoleErrors,
+        pageErrors,
+        extensionErrors: secondExtensionErrors,
+      };
+    }
+    if (mode === '点播' && second.media.currentSrc !== first.media.currentSrc) {
+      return {
+        status: 'FAIL',
+        url,
+        reason: `VOD media source changed during the observation: ${first.media.currentSrc} -> ${second.media.currentSrc}`,
+        first,
+        second,
+        beforePlay,
+        ownershipCalls,
+        consoleErrors,
+        pageErrors,
+        extensionErrors: secondExtensionErrors,
+      };
+    }
     if (second.media.currentTime <= first.media.currentTime) {
       return {
         status: 'BLOCKED',
@@ -738,6 +820,7 @@ async function runExternalPage(context, url, mode) {
       first,
       second,
       beforePlay,
+      ownershipCalls,
       consoleErrors,
       pageErrors,
       extensionErrors: secondExtensionErrors,
@@ -857,6 +940,7 @@ try {
     ],
   });
   await context.addInitScript({ content: `(${audioGuard.toString()})();` });
+  await context.addInitScript({ content: `(${ownershipAudit.toString()})();` });
   report.vod = await runVodSmoke(context);
   report.live = await runExternalPage(
     context,

@@ -14,6 +14,7 @@ const DISPLAY_FIELDS = Object.freeze([
   'message',
   'stage',
 ]);
+const VOD_DISPLAY_FIELDS = Object.freeze(['mode', 'state', 'inventory', 'message']);
 
 let currentSurface;
 
@@ -48,6 +49,7 @@ export class StatusPanel {
       fail('UI_MODE_INVALID', '状态 surface 缺少模式');
     }
     this.surfaceId = createSurfaceId();
+    this.mode = mode;
     this.model = emptyModel(mode);
     this.actions = new Map();
     this.destroyed = false;
@@ -140,7 +142,10 @@ export class StatusPanel {
     return {
       version: STATUS_MESSAGE_VERSION,
       surfaceId: this.surfaceId,
-      ...Object.fromEntries(DISPLAY_FIELDS.map((field) => [field, displayValue(this.model[field])])),
+      ...Object.fromEntries(
+        (this.mode === '点播' ? VOD_DISPLAY_FIELDS : DISPLAY_FIELDS)
+          .map((field) => [field, displayValue(this.model[field])]),
+      ),
       actions,
     };
   }

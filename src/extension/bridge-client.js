@@ -1,9 +1,6 @@
 import { BufferScriptError, fail } from '../errors.js';
 import {
   assertOperation,
-  BRIDGE_CORE_EVENTS,
-  BRIDGE_PLAYER_CAPABILITIES,
-  BRIDGE_EVENT_EVENT,
   BRIDGE_REQUEST_EVENT,
   BRIDGE_RESPONSE_ATTRIBUTE,
   BRIDGE_RESPONSE_EVENT,
@@ -16,12 +13,6 @@ import {
 const CORE_SNAPSHOT_FIELDS = Object.freeze([
   'coreId',
   'source',
-  'quality',
-  'supportedQualityList',
-  'bufferedRanges',
-  'mediaInfo',
-  'stableBufferTime',
-  'supportsCoreEvents',
   'capabilities',
 ]);
 
@@ -77,36 +68,11 @@ function validateCoreSnapshot(snapshot) {
   ) {
     fail('BRIDGE_SNAPSHOT_INVALID', '桥接内核快照缺少有效身份');
   }
-  if (typeof snapshot.supportsCoreEvents !== 'boolean') {
-    fail('BRIDGE_SNAPSHOT_INVALID', '桥接内核快照缺少事件能力标记');
-  }
-  const playerCapabilities = snapshot.capabilities?.player;
   const coreCapabilities = snapshot.capabilities?.core;
-  if (
-    !isObject(snapshot.capabilities) ||
-    !isObject(playerCapabilities) ||
-    !isObject(coreCapabilities)
-  ) {
+  if (!isObject(snapshot.capabilities) || !isObject(coreCapabilities)) {
     fail('BRIDGE_SNAPSHOT_INVALID', '桥接内核快照缺少真实能力标记');
   }
-  for (const field of BRIDGE_PLAYER_CAPABILITIES) {
-    if (typeof playerCapabilities[field] !== 'boolean') {
-      fail('BRIDGE_SNAPSHOT_INVALID', `桥接内核快照缺少页面播放器能力标记: ${field}`);
-    }
-  }
-  for (const field of [
-    'getQuality',
-    'getSupportedQualityList',
-    'getBufferedRanges',
-    'getMediaInfo',
-    'getCurrentMediaInfo',
-    'getQualityInfo',
-    'getStableBufferTime',
-    'getStableBufferSeconds',
-    'setStableBufferTime',
-    'setScheduleWhilePaused',
-    'events',
-  ]) {
+  for (const field of ['setStableBufferTime']) {
     if (typeof coreCapabilities[field] !== 'boolean') {
       fail('BRIDGE_SNAPSHOT_INVALID', `桥接内核快照缺少能力标记: ${field}`);
     }
@@ -119,64 +85,12 @@ function validateCoreSnapshot(snapshot) {
   return snapshot;
 }
 
-function parseCoreEvent(serialized) {
-  if (typeof serialized !== 'string') {
-    fail('BRIDGE_EVENT_INVALID', '桥接内核事件不是字符串');
-  }
-  const event = JSON.parse(serialized);
-  if (
-    !isObject(event) ||
-    event.version !== BRIDGE_VERSION ||
-    !Number.isInteger(event.coreId) ||
-    event.coreId <= 0 ||
-    typeof event.source !== 'string' ||
-    !BRIDGE_CORE_EVENTS.includes(event.name) ||
-    !isObject(event.value) ||
-    Object.keys(event.value).some((field) => field !== 'error') ||
-    (Object.prototype.hasOwnProperty.call(event.value, 'error') && !isSerializable(event.value.error))
-  ) {
-    fail('BRIDGE_EVENT_INVALID', '桥接内核事件格式无效');
-  }
-  return event;
-}
-
-function customEventClass(documentObject) {
-  return documentObject.defaultView?.CustomEvent || globalThis.CustomEvent;
-}
-
-function timeRangesFromSnapshot(snapshot) {
-  if (snapshot === undefined || snapshot === null) {
-    return undefined;
-  }
-  const createRanges = (ranges) => {
-    if (ranges === undefined) {
-      return undefined;
-    }
-    return {
-      length: ranges.length,
-      start(index) {
-        return ranges[index].start;
-      },
-      end(index) {
-        return ranges[index].end;
-      },
-    };
-  };
-  if (snapshot.video !== undefined || snapshot.audio !== undefined) {
-    return { video: createRanges(snapshot.video), audio: createRanges(snapshot.audio) };
-  }
-  return createRanges(snapshot);
-}
-
 function responseError(response) {
   return new BufferScriptError(response.error?.code || 'BRIDGE_CALL_FAILED', response.error?.message || '桥接调用失败');
 }
 
-function remapUnavailable(error, code, message) {
-  if (error?.code === 'BRIDGE_METHOD_UNAVAILABLE') {
-    fail(code, message, error);
-  }
-  throw error;
+function customEventClass(documentObject) {
+  return documentObject.defaultView?.CustomEvent || globalThis.CustomEvent;
 }
 
 export class BridgeClient {
@@ -185,12 +99,9 @@ export class BridgeClient {
     this.runtimeObject = runtimeObject;
     this.nextId = 1;
     this.pending = new Map();
-    this.eventListeners = new Map();
     this.destroyed = false;
     this.onResponse = (event) => this.resolveResponse(event.detail);
-    this.onCoreEvent = (event) => this.emitCoreEvent(event.detail);
     documentObject.addEventListener(BRIDGE_RESPONSE_EVENT, this.onResponse);
-    documentObject.addEventListener(BRIDGE_EVENT_EVENT, this.onCoreEvent);
   }
 
   nextRequestId() {
@@ -288,62 +199,12 @@ export class BridgeClient {
     }
   }
 
-  subscribeCore(coreId, name, source, callback) {
-    if (!Number.isInteger(coreId) || coreId <= 0 || !BRIDGE_CORE_EVENTS.includes(name) || typeof source !== 'string') {
-      fail('BRIDGE_SUBSCRIPTION_INVALID', '桥接内核订阅参数无效');
-    }
-    const result = this.callSync('subscribeCoreEvents', [coreId, name]);
-    const subscriptionId = result.subscriptionId;
-    if (!Number.isInteger(subscriptionId) || subscriptionId <= 0) {
-      fail('BRIDGE_SUBSCRIPTION_INVALID', '桥接内核订阅没有返回有效编号');
-    }
-    this.eventListeners.set(subscriptionId, { coreId, name, source, callback });
-    return subscriptionId;
-  }
-
-  unsubscribeCore(subscriptionId) {
-    this.callSync('unsubscribeCoreEvents', [subscriptionId]);
-    this.eventListeners.delete(subscriptionId);
-  }
-
-  emitCoreEvent(serialized) {
-    let event;
-    try {
-      event = parseCoreEvent(serialized);
-    } catch (error) {
-      logInvalidBridgePayload('内核事件', error);
-      return;
-    }
-    for (const subscription of this.eventListeners.values()) {
-      if (
-        subscription.coreId === event.coreId &&
-        subscription.name === event.name &&
-        subscription.source === event.source
-      ) {
-        try {
-          subscription.callback(event.value);
-        } catch (error) {
-          console.error('[BilibiliBuffer] 桥接内核事件回调失败', serializeError(error));
-        }
-      }
-    }
-  }
-
   destroy() {
     if (this.destroyed) {
       return;
     }
-    for (const subscriptionId of this.eventListeners.keys()) {
-      try {
-        this.callSync('unsubscribeCoreEvents', [subscriptionId]);
-      } catch (error) {
-        console.warn('[BilibiliBuffer] 清理桥接事件订阅失败', serializeError(error));
-      }
-    }
-    this.eventListeners.clear();
     this.destroyed = true;
     this.documentObject.removeEventListener(BRIDGE_RESPONSE_EVENT, this.onResponse);
-    this.documentObject.removeEventListener(BRIDGE_EVENT_EVENT, this.onCoreEvent);
     for (const pending of this.pending.values()) {
       this.runtimeObject.clearTimeout(pending.timer);
       pending.reject(new BufferScriptError('BRIDGE_CLIENT_DESTROYED', '桥接客户端已经销毁'));
@@ -358,12 +219,7 @@ export class BridgeCore {
     this.client = client;
     this.coreId = snapshot.coreId;
     this.snapshot = snapshot;
-    this.subscriptions = new Map();
     this.stale = false;
-    if (!snapshot.supportsCoreEvents) {
-      this.addEventListener = undefined;
-      this.removeEventListener = undefined;
-    }
   }
 
   update(snapshot) {
@@ -386,9 +242,6 @@ export class BridgeCore {
 
   supports(method) {
     this.assertActive();
-    if (method === 'events') {
-      return this.snapshot.capabilities.core.events;
-    }
     return this.snapshot.capabilities.core[method] === true;
   }
 
@@ -397,14 +250,6 @@ export class BridgeCore {
       return;
     }
     this.stale = true;
-    for (const subscriptionId of this.subscriptions.values()) {
-      try {
-        this.client.unsubscribeCore(subscriptionId);
-      } catch (error) {
-        console.warn('[BilibiliBuffer] 清理过期桥接内核订阅失败', serializeError(error));
-      }
-    }
-    this.subscriptions.clear();
   }
 
   callCoreSync(method, args = []) {
@@ -419,111 +264,16 @@ export class BridgeCore {
     }
   }
 
-  readFirstAvailable(methods, snapshotField, args = []) {
-    let unavailable;
-    for (const method of methods) {
-      if (!this.supports(method)) {
-        continue;
-      }
-      try {
-        const value = this.callCoreSync(method, args);
-        this.snapshot[snapshotField] = value;
-        return value;
-      } catch (error) {
-        if (error?.code !== 'BRIDGE_METHOD_UNAVAILABLE') {
-          throw error;
-        }
-        unavailable = error;
-      }
-    }
-    if (unavailable !== undefined) {
-      return undefined;
-    }
-    return undefined;
-  }
-
-  getQuality() {
-    return this.readFirstAvailable(['getQuality'], 'quality');
-  }
-
-  getSupportedQualityList() {
-    return this.readFirstAvailable(['getSupportedQualityList'], 'supportedQualityList');
-  }
-
-  getBufferedRanges() {
-    return timeRangesFromSnapshot(this.readFirstAvailable(['getBufferedRanges'], 'bufferedRanges'));
-  }
-
-  getMediaInfo() {
-    return this.readFirstAvailable(['getMediaInfo', 'getCurrentMediaInfo', 'getQualityInfo'], 'mediaInfo');
-  }
-
-  getCurrentMediaInfo() {
-    return this.getMediaInfo();
-  }
-
-  getQualityInfo() {
-    return this.getMediaInfo();
-  }
-
-  getStableBufferTime() {
-    return this.readFirstAvailable(['getStableBufferTime', 'getStableBufferSeconds'], 'stableBufferTime');
-  }
-
   setStableBufferTime(seconds) {
     if (!this.supports('setStableBufferTime')) {
       fail('VOD_STABLE_BUFFER_UNAVAILABLE', '点播内核没有稳定缓冲设置能力');
     }
-    let result;
-    try {
-      result = this.callCoreSync('setStableBufferTime', [seconds]);
-    } catch (error) {
-      remapUnavailable(error, 'VOD_STABLE_BUFFER_UNAVAILABLE', '点播内核没有稳定缓冲设置能力');
-    }
-    this.snapshot.stableBufferTime = seconds;
-    return result;
-  }
-
-  setScheduleWhilePaused(enabled) {
-    if (!this.supports('setScheduleWhilePaused')) {
-      fail('VOD_PAUSED_SCHEDULE_UNAVAILABLE', '点播内核没有暂停时继续调度能力');
-    }
-    try {
-      return this.callCoreSync('setScheduleWhilePaused', [enabled]);
-    } catch (error) {
-      remapUnavailable(error, 'VOD_PAUSED_SCHEDULE_UNAVAILABLE', '点播内核没有暂停时继续调度能力');
-    }
-  }
-
-  addEventListener(name, callback) {
-    this.assertActive();
-    if (!this.supports('events')) {
-      fail('VOD_CORE_EVENTS_UNAVAILABLE', '当前播放器内核没有事件能力');
-    }
-    let subscriptionId;
-    try {
-      subscriptionId = this.client.subscribeCore(this.coreId, name, this.snapshot.source, callback);
-    } catch (error) {
-      remapUnavailable(error, 'VOD_CORE_EVENTS_UNAVAILABLE', '当前播放器内核没有事件能力');
-    }
-    this.subscriptions.set(callback, subscriptionId);
-  }
-
-  removeEventListener(name, callback) {
-    const subscriptionId = this.subscriptions.get(callback);
-    if (subscriptionId === undefined) {
-      return;
-    }
-    if (!this.stale) {
-      this.client.unsubscribeCore(subscriptionId);
-    }
-    this.subscriptions.delete(callback);
+    return this.callCoreSync('setStableBufferTime', [seconds]);
   }
 }
 
 export function createPageWindowAdapter(client, windowObject = window) {
   const state = { core: undefined };
-  let playerCapabilities = Object.fromEntries(BRIDGE_PLAYER_CAPABILITIES.map((method) => [method, false]));
   let refreshPromise;
   const player = {
     __core() {
@@ -541,21 +291,6 @@ export function createPageWindowAdapter(client, windowObject = window) {
     pause() {
       return client.callAsync('callPlayer', ['pause']);
     },
-    getQuality() {
-      return client.callSync('callPlayerSync', ['getQuality', []]);
-    },
-    getSupportedQualityList() {
-      return client.callSync('callPlayerSync', ['getSupportedQualityList', []]);
-    },
-    supports(method) {
-      if (!BRIDGE_PLAYER_CAPABILITIES.includes(method)) {
-        fail('BRIDGE_CAPABILITY_UNKNOWN', `页面播放器能力未定义: ${method}`);
-      }
-      return playerCapabilities[method] === true;
-    },
-    get capabilities() {
-      return { ...playerCapabilities };
-    },
   };
   const pageWindow = {
     location: windowObject.location,
@@ -572,7 +307,6 @@ export function createPageWindowAdapter(client, windowObject = window) {
           .callAsync('getCoreSnapshot', [])
           .then((snapshot) => {
             validateCoreSnapshot(snapshot);
-            playerCapabilities = snapshot.capabilities.player;
             if (
               state.core === undefined ||
               state.core.stale ||
