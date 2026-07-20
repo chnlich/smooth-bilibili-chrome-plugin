@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { EXTENSION_MANIFEST, LIVE_CONFIG, VOD_CONFIG } from '../src/constants.js';
 import { createManifest } from '../src/extension/manifest-source.js';
 import { EVENT_CODES, MEDIA_EVENT_NAMES } from '../src/diagnostics/catalog.js';
@@ -9,7 +12,8 @@ import { EVENT_CODES, MEDIA_EVENT_NAMES } from '../src/diagnostics/catalog.js';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
 const packageMetadata = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
-const manifest = JSON.parse(await fs.readFile(path.join(extensionDirectory, 'manifest.json'), 'utf8'));
+const execFileAsync = promisify(execFile);
+const npmExecutable = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 async function readTree(directory) {
   const entries = await fs.readdir(directory, { withFileTypes: true });
@@ -40,6 +44,52 @@ async function readJavaScriptFiles(directory, prefix = '') {
   return files;
 }
 
+async function snapshotExtensionOutput(directory, prefix = '') {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const entryPath = path.join(directory, entry.name);
+    const relativePath = path.join(prefix, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await snapshotExtensionOutput(entryPath, relativePath));
+    } else {
+      const content = await fs.readFile(entryPath);
+      files.push({
+        path: relativePath.replaceAll(path.sep, '/'),
+        sha256: crypto.createHash('sha256').update(content).digest('hex'),
+      });
+    }
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function extractBuildId(bundles) {
+  const buildIds = new Set(
+    bundles
+      .map((bundle) => bundle.match(/src-[a-f0-9]{24}/)?.[0])
+      .filter((buildId) => buildId !== undefined),
+  );
+  assert.equal(buildIds.size, 1);
+  const [buildId] = buildIds;
+  assert.match(buildId, /^src-[a-f0-9]{24}$/);
+  return buildId;
+}
+
+async function buildAndSnapshot() {
+  await execFileAsync(npmExecutable, ['run', 'build'], { cwd: root });
+  const files = await snapshotExtensionOutput(extensionDirectory);
+  const bundles = await Promise.all(
+    ['controller.js', 'worker.js'].map((bundle) => fs.readFile(path.join(extensionDirectory, bundle), 'utf8')),
+  );
+  return { files, buildId: extractBuildId(bundles) };
+}
+
+const firstBuild = await buildAndSnapshot();
+const secondBuild = await buildAndSnapshot();
+assert.deepEqual(secondBuild.files, firstBuild.files);
+assert.equal(secondBuild.buildId, firstBuild.buildId);
+
+const manifest = JSON.parse(await fs.readFile(path.join(extensionDirectory, 'manifest.json'), 'utf8'));
 const source = await readTree(path.join(root, 'src'));
 const sourceFiles = await readJavaScriptFiles(path.join(root, 'src'));
 const controller = await fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8');
@@ -77,14 +127,8 @@ assert.deepEqual(manifest.content_scripts, [
 assert.equal(manifest.permissions.includes('tabs'), false);
 assert.equal(manifest.permissions.includes('downloads'), false);
 assert.equal(manifest.action.default_popup, 'popup.html');
-const buildIds = new Set(
-  [controller, worker]
-    .map((bundle) => bundle.match(/src-[a-f0-9]{24}/)?.[0])
-    .filter((buildId) => buildId !== undefined),
-);
-assert.equal(buildIds.size, 1);
-const [buildId] = buildIds;
-assert.match(buildId, /^src-[a-f0-9]{24}$/);
+const buildId = extractBuildId([controller, worker]);
+assert.equal(buildId, secondBuild.buildId);
 
 const expectedFiles = [
   'controller.js',
