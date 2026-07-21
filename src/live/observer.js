@@ -3,6 +3,9 @@ import { serializeError } from '../extension/bridge-contract.js';
 import { MediaEventRecorder, readMediaFacts } from '../diagnostics/media.js';
 
 const UNKNOWN = '未提供';
+const CORRECTION_EVENT_TOLERANCE_SECONDS = 0.1;
+const CORRECTION_SETTLE_MILLISECONDS = 500;
+const FRAME_PROGRESS_EPSILON_SECONDS = 0.001;
 
 function currentSource(video) {
   return video?.currentSrc || video?.src || '';
@@ -121,6 +124,7 @@ function isUserSeekIntent(event, video, documentObject) {
   const path = eventPath(event);
   const timeline = path.some((element) => isTimelineControl(element));
   if (event?.type === 'pointerdown') return timeline;
+  if (event?.type === 'input') return timeline;
   if (event?.type !== 'keydown' || !SEEK_KEYS.has(event.key)) return false;
   return timeline || path.includes(video) || documentObject.activeElement === video;
 }
@@ -168,11 +172,16 @@ export class LiveObserver {
     this.destroyed = false;
     this.hasDecodedFrame = false;
     this.lastDecodedAtMilliseconds = undefined;
+    this.lastDecodedMediaTime = undefined;
     this.recentEvent = UNKNOWN;
     this.recentError = UNKNOWN;
+    // activeStall is only the currently unresolved genuine stall.  A separate
+    // delayProtection fact survives the first decoded recovery frame.
     this.activeStall = undefined;
+    this.delayProtection = undefined;
     this.awaitingUserSeekFrame = false;
     this.userSeekAuthorization = undefined;
+    this.lastCorrection = undefined;
     this.correcting = false;
     this.replacementNeedsCorrection = false;
     this.frameCanvas = undefined;
@@ -184,12 +193,38 @@ export class LiveObserver {
     this.boundMutation = () => this.reconcileVideo();
   }
 
+  currentProtectedDelay() {
+    if (this.activeStall !== undefined) {
+      this.updateStallTarget(this.activeStall);
+      return this.activeStall.targetDelay;
+    }
+    if (this.delayProtection !== undefined) return this.delayProtection.protectedDelay;
+    return undefined;
+  }
+
+  updateStallTarget(stall) {
+    const elapsedSeconds = Math.max(0, nowMilliseconds(this.runtimeObject) - stall.startedAt) / 1000;
+    const timedTarget = stall.delayBeforeStall + elapsedSeconds;
+    stall.targetDelay = Math.max(stall.targetDelay, timedTarget);
+    if (Number.isFinite(stall.lastObservedDelay)) stall.protectedDelay = stall.lastObservedDelay;
+    return stall.targetDelay;
+  }
+
+  observeProtectedDelay(video, observedDelay) {
+    if (this.delayProtection === undefined || this.delayProtection.video !== video ||
+      this.delayProtection.videoInstance !== this.videoInstance ||
+      this.delayProtection.sourceInstance !== this.sourceInstance || !Number.isFinite(observedDelay)) return;
+    this.delayProtection.lastObservedDelay = observedDelay;
+    this.delayProtection.protectedDelay = observedDelay;
+  }
+
   start() {
     if (this.destroyed) throw new Error('直播观察器已经销毁');
     if (this.started) throw new Error('直播观察器已经启动');
     this.started = true;
     this.documentObject.addEventListener('pointerdown', this.boundUserInput, true);
     this.documentObject.addEventListener('keydown', this.boundUserInput, true);
+    this.documentObject.addEventListener('input', this.boundUserInput, true);
     if (typeof this.windowObject.MutationObserver === 'function') {
       this.mutationObserver = new this.windowObject.MutationObserver(this.boundMutation);
       this.mutationObserver.observe(this.documentObject, { childList: true, subtree: true });
@@ -237,6 +272,7 @@ export class LiveObserver {
     const previousVideo = this.video;
     const previousSource = this.sourceKey;
     const previousStall = this.activeStall;
+    const previousProtection = this.delayProtection;
     this.hideOverlay();
     this.recorder?.destroy();
     this.video = video;
@@ -244,6 +280,7 @@ export class LiveObserver {
     this.videoInstance += 1;
     this.hasDecodedFrame = false;
     this.lastDecodedAtMilliseconds = undefined;
+    this.lastDecodedMediaTime = undefined;
     this.recentError = UNKNOWN;
     this.sourceKey = currentSource(video);
     if (this.sourceKey !== '') this.sourceInstance += 1;
@@ -252,7 +289,7 @@ export class LiveObserver {
       this.diagnostics?.log('live.source_replaced', {
         previousSource,
         source: this.sourceKey,
-        status: previousStall === undefined ? 'observed' : 'protected',
+        status: previousStall === undefined && previousProtection === undefined ? 'observed' : 'protected',
       }, undefined, this.context());
       this.diagnostics?.log('video.source_replaced', {
         previousSource,
@@ -271,6 +308,16 @@ export class LiveObserver {
         video,
         videoInstance: this.videoInstance,
         sourceInstance: this.sourceInstance,
+        lastDecodedMediaTime: undefined,
+      };
+      this.replacementNeedsCorrection = true;
+    }
+    if (previousProtection !== undefined) {
+      this.delayProtection = {
+        ...previousProtection,
+        video,
+        videoInstance: this.videoInstance,
+        sourceInstance: this.sourceInstance,
       };
       this.replacementNeedsCorrection = true;
     }
@@ -282,7 +329,7 @@ export class LiveObserver {
       runtimeObject: this.runtimeObject,
       context: () => this.context(),
       onEvent: (name, currentVideo) => this.onMediaEvent(name, currentVideo),
-      onFrame: (currentVideo) => this.onDecodedFrame(currentVideo),
+      onFrame: (currentVideo, metadata) => this.onDecodedFrame(currentVideo, metadata),
     });
     this.recorder.start();
     if (previousStall !== undefined) this.showOverlay();
@@ -296,16 +343,25 @@ export class LiveObserver {
     const previousSource = this.sourceKey;
     this.sourceKey = nextSource;
     this.sourceInstance += 1;
+    this.lastDecodedMediaTime = undefined;
     if (previousSource !== '') this.sourceReplacements += 1;
+    if (this.activeStall === undefined) this.hasDecodedFrame = false;
     if (this.activeStall !== undefined) this.showOverlay();
     if (this.activeStall !== undefined) {
-      this.activeStall = { ...this.activeStall, sourceInstance: this.sourceInstance };
+      this.activeStall = {
+        ...this.activeStall,
+        sourceInstance: this.sourceInstance,
+        lastDecodedMediaTime: undefined,
+      };
     }
-    this.replacementNeedsCorrection = this.activeStall !== undefined;
+    if (this.delayProtection !== undefined) {
+      this.delayProtection = { ...this.delayProtection, sourceInstance: this.sourceInstance };
+    }
+    this.replacementNeedsCorrection = this.activeStall !== undefined || this.delayProtection !== undefined;
     this.diagnostics?.log('live.source_replaced', {
       previousSource,
       source: nextSource,
-      status: this.activeStall === undefined ? 'observed' : 'protected',
+      status: this.activeStall === undefined && this.delayProtection === undefined ? 'observed' : 'protected',
     }, undefined, this.context());
     this.diagnostics?.log('video.source_replaced', { previousSource, source: nextSource }, undefined, this.context());
     if (this.replacementNeedsCorrection) this.applyReplacementCorrection();
@@ -314,8 +370,10 @@ export class LiveObserver {
 
   onMediaEvent(name, video) {
     if (video !== this.video || this.destroyed) return;
+    this.rebindSourceIfNeeded();
     this.recentEvent = name;
-    if (name === 'loadeddata' && !this.hasDecodedFrame) this.onDecodedFrame(video);
+    if (name === 'loadeddata' && !this.hasDecodedFrame &&
+      typeof video.requestVideoFrameCallback !== 'function') this.onDecodedFrame(video);
     if (name === 'emptied' && this.activeStall !== undefined) this.showOverlay();
     if (name === 'waiting' || name === 'stalled') this.maybeArmStall(name);
     if (name === 'seeking') this.handleSeeking(video);
@@ -331,30 +389,54 @@ export class LiveObserver {
     this.updateStatus();
   }
 
-  onDecodedFrame(video) {
-    if (video !== this.video || this.destroyed) return;
+  onDecodedFrame(video, metadata) {
+    if (video !== this.video || video.isConnected === false || this.destroyed) return;
+    const mediaTime = Number.isFinite(metadata?.mediaTime) ? metadata.mediaTime : undefined;
+    if (this.activeStall !== undefined && Number.isFinite(mediaTime) &&
+      Number.isFinite(this.activeStall.lastDecodedMediaTime) &&
+      mediaTime <= this.activeStall.lastDecodedMediaTime + FRAME_PROGRESS_EPSILON_SECONDS) return;
+    if (this.lastCorrection !== undefined && this.lastCorrection.video === video &&
+      this.lastCorrection.videoInstance === this.videoInstance &&
+      this.lastCorrection.sourceInstance === this.sourceInstance) this.lastCorrection = undefined;
     const wasAwaiting = this.awaitingUserSeekFrame;
     this.hasDecodedFrame = true;
     this.lastDecodedAtMilliseconds = nowMilliseconds(this.runtimeObject);
+    if (Number.isFinite(mediaTime)) this.lastDecodedMediaTime = mediaTime;
     this.captureFrame(video);
     this.hideOverlay();
     if (wasAwaiting) this.awaitingUserSeekFrame = false;
     const observedDelay = delayOrUnknown(video, this.diagnostics, 'decoded-seekable-read', this.context());
-    if (this.activeStall !== undefined && Number.isFinite(observedDelay)) {
-      this.activeStall.lastObservedDelay = observedDelay;
-      if (this.activeStall.recoveredAt === undefined) {
-        this.activeStall.protectedDelay = Math.max(this.activeStall.protectedDelay, observedDelay);
-      } else if (observedDelay > this.activeStall.protectedDelay) {
-        this.activeStall.protectedDelay = observedDelay;
-      }
-    }
-    if (this.activeStall !== undefined && this.activeStall.recoveredAt === undefined) {
-      this.activeStall.recoveredAt = this.lastDecodedAtMilliseconds;
+    if (this.activeStall !== undefined) {
+      const stall = this.activeStall;
+      this.updateStallTarget(stall);
+      if (Number.isFinite(observedDelay)) stall.lastObservedDelay = observedDelay;
+      const targetDelay = stall.targetDelay;
+      this.activeStall = undefined;
+      this.delayProtection = {
+        video,
+        videoInstance: this.videoInstance,
+        sourceInstance: this.sourceInstance,
+        protectedDelay: targetDelay,
+        targetDelay,
+        lastObservedDelay: Number.isFinite(observedDelay) ? observedDelay : UNKNOWN,
+      };
+      this.applyReplacementCorrection(true);
+      const actualDelay = delayOrUnknown(
+        video,
+        this.diagnostics,
+        'recovered-seekable-read',
+        this.context(),
+      );
+      if (Number.isFinite(actualDelay)) this.observeProtectedDelay(video, actualDelay);
       this.diagnostics?.log('live.stall.recovered', {
-        delayBeforeStall: this.activeStall.delayBeforeStall,
-        stallDuration: Math.max(0, this.lastDecodedAtMilliseconds - this.activeStall.startedAt) / 1000,
-        protectedDelay: this.activeStall.protectedDelay,
+        delayBeforeStall: stall.delayBeforeStall,
+        stallDuration: Math.max(0, this.lastDecodedAtMilliseconds - stall.startedAt) / 1000,
+        targetDelay,
+        protectedDelay: Number.isFinite(actualDelay) ? actualDelay : targetDelay,
       }, undefined, this.context());
+    } else {
+      if (this.replacementNeedsCorrection) this.applyReplacementCorrection();
+      this.observeProtectedDelay(video, observedDelay);
     }
     this.updateStatus();
   }
@@ -366,6 +448,13 @@ export class LiveObserver {
       return;
     }
     if (this.video === undefined) return;
+    if (event.type === 'input') {
+      this.cancelProtection('user_seek');
+      this.awaitingUserSeekFrame = true;
+      this.hasDecodedFrame = false;
+      this.frameCanvas = undefined;
+      return;
+    }
     this.userSeekAuthorization = {
       video: this.video,
       initialTime: Number.isFinite(this.video?.currentTime) ? this.video.currentTime : undefined,
@@ -389,19 +478,31 @@ export class LiveObserver {
   handleSeeking(video) {
     if (this.correcting || video !== this.video) return;
     if (this.consumeUserSeekAuthorization(video)) {
-      this.cancelProtection('user_seek');
-      this.awaitingUserSeekFrame = true;
-      this.hasDecodedFrame = false;
-      this.frameCanvas = undefined;
+      this.cancelUserSeek();
       return;
     }
-    if (this.userSeekAuthorization !== undefined) return;
-    if (this.activeStall === undefined || this.activeStall.video !== video ||
-      this.activeStall.videoInstance !== this.videoInstance ||
-      this.activeStall.sourceInstance !== this.sourceInstance ||
+    if (this.userSeekAuthorization !== undefined) {
+      const authorization = this.userSeekAuthorization;
+      if (this.consumeUserSeekAuthorization(video) || video.currentTime === authorization.initialTime) {
+        this.cancelUserSeek();
+      }
+      return;
+    }
+    const protection = this.activeStall || this.delayProtection;
+    if (protection === undefined || protection.video !== video ||
+      protection.videoInstance !== this.videoInstance || protection.sourceInstance !== this.sourceInstance ||
       this.awaitingUserSeekFrame || video.paused !== false) return;
-    const protectedDelay = this.activeStall.protectedDelay;
+    const protectedDelay = this.currentProtectedDelay();
     const requestedTime = video.currentTime;
+    if (this.lastCorrection !== undefined) {
+      const correction = this.lastCorrection;
+      const correctionExpired = nowMilliseconds(this.runtimeObject) > correction.expiresAtMilliseconds;
+      const correctionMatches = correction.video === video &&
+        correction.videoInstance === this.videoInstance && correction.sourceInstance === this.sourceInstance;
+      if (correctionExpired || !correctionMatches) this.lastCorrection = undefined;
+      else if (Number.isFinite(requestedTime) &&
+        Math.abs(requestedTime - correction.target) <= CORRECTION_EVENT_TOLERANCE_SECONDS) return;
+    }
     const requestedDelay = delayOrUnknown(video, this.diagnostics, 'seeking-delay-read', this.context());
     if (!Number.isFinite(protectedDelay) || !Number.isFinite(requestedTime) || !Number.isFinite(requestedDelay) ||
       requestedDelay >= protectedDelay) return;
@@ -417,6 +518,13 @@ export class LiveObserver {
     this.correcting = true;
     try {
       video.currentTime = target;
+      this.lastCorrection = {
+        video,
+        videoInstance: this.videoInstance,
+        sourceInstance: this.sourceInstance,
+        target: video.currentTime,
+        expiresAtMilliseconds: nowMilliseconds(this.runtimeObject) + CORRECTION_SETTLE_MILLISECONDS,
+      };
       this.diagnostics?.log('live.delay.corrected', {
         reason: 'automatic_forward_seek',
         targetTime: target,
@@ -451,8 +559,10 @@ export class LiveObserver {
       sourceInstance: this.sourceInstance,
       startedAt,
       delayBeforeStall,
+      targetDelay: delayBeforeStall,
       protectedDelay: delayBeforeStall,
       lastObservedDelay: delayBeforeStall,
+      lastDecodedMediaTime: this.lastDecodedMediaTime,
     };
     this.replacementNeedsCorrection = false;
     this.diagnostics?.log('live.stall.detected', {
@@ -529,9 +639,11 @@ export class LiveObserver {
       });
   }
 
-  applyReplacementCorrection() {
-    if (!this.replacementNeedsCorrection || this.activeStall === undefined || this.video === undefined ||
-      this.sourceKey === '' || this.video.paused !== false || this.userSeekAuthorization !== undefined) return;
+  applyReplacementCorrection(force = false) {
+    if ((!this.replacementNeedsCorrection && !force) || this.video === undefined || this.sourceKey === '' ||
+      this.video.paused !== false || this.userSeekAuthorization !== undefined) return;
+    const protectedDelay = this.currentProtectedDelay();
+    if (!Number.isFinite(protectedDelay)) return;
     let ranges;
     try {
       ranges = readSeekable(this.video);
@@ -539,7 +651,7 @@ export class LiveObserver {
       this.diagnostics?.log('extension.observer_error', { reason: 'replacement-seekable-read' }, error, this.context());
       return;
     }
-    const target = seekablePositionForDelay(ranges, this.activeStall.protectedDelay);
+    const target = seekablePositionForDelay(ranges, protectedDelay);
     if (!Number.isFinite(target) || !Number.isFinite(this.video.currentTime)) return;
     const currentTime = this.video.currentTime;
     const currentDelay = delayOrUnknown(
@@ -548,28 +660,44 @@ export class LiveObserver {
       'replacement-seekable-read-current',
       this.context(),
     );
-    if (Number.isFinite(currentDelay) && currentDelay >= this.activeStall.protectedDelay) {
-      this.activeStall.protectedDelay = currentDelay;
+    if (Number.isFinite(currentDelay) && currentDelay >= protectedDelay) {
+      this.observeProtectedDelay(this.video, currentDelay);
       this.replacementNeedsCorrection = false;
       return;
     }
     this.correcting = true;
     try {
       this.video.currentTime = target;
+      this.lastCorrection = {
+        video: this.video,
+        videoInstance: this.videoInstance,
+        sourceInstance: this.sourceInstance,
+        target: this.video.currentTime,
+        expiresAtMilliseconds: nowMilliseconds(this.runtimeObject) + CORRECTION_SETTLE_MILLISECONDS,
+      };
       if (!Number.isFinite(this.video.currentTime) ||
         Math.abs(this.video.currentTime - target) > this.config.correctionToleranceSeconds) return;
-      this.activeStall.protectedDelay = delayOrUnknown(
+      const actualDelay = delayOrUnknown(
         this.video,
         this.diagnostics,
         'replacement-seekable-read-after-correction',
         this.context(),
       );
+      if (this.activeStall !== undefined) {
+        if (Number.isFinite(actualDelay)) {
+          this.activeStall.lastObservedDelay = actualDelay;
+          this.activeStall.protectedDelay = actualDelay;
+        }
+      } else {
+        this.observeProtectedDelay(this.video, actualDelay);
+      }
       this.replacementNeedsCorrection = false;
       this.diagnostics?.log('live.delay.corrected', {
         reason: 'source_replaced',
         targetTime: target,
         currentTime,
-        protectedDelay: this.activeStall.protectedDelay,
+        targetDelay: protectedDelay,
+        protectedDelay: Number.isFinite(actualDelay) ? actualDelay : protectedDelay,
       }, undefined, this.context());
     } catch (error) {
       this.diagnostics?.log('live.delay_protection.failed', { reason: 'source_replaced', status: 'failed' }, error, this.context());
@@ -651,22 +779,28 @@ export class LiveObserver {
     this.reconcileVideo();
     this.checkForNoFrameStall();
     this.applyReplacementCorrection();
-    if (this.activeStall !== undefined && this.video !== undefined) {
+    if (this.video !== undefined) {
       const estimatedDelay = delayOrUnknown(
         this.video,
         this.diagnostics,
         'sample-seekable-read',
         this.context(),
       );
-      if (Number.isFinite(estimatedDelay)) {
-        this.activeStall.lastObservedDelay = estimatedDelay;
-        if (estimatedDelay > this.activeStall.protectedDelay) this.activeStall.protectedDelay = estimatedDelay;
+      if (this.activeStall !== undefined) {
+        if (Number.isFinite(estimatedDelay)) this.activeStall.lastObservedDelay = estimatedDelay;
+        this.updateStallTarget(this.activeStall);
+      } else {
+        this.observeProtectedDelay(this.video, estimatedDelay);
       }
-      this.diagnostics?.log('live.delay.observed', {
-        estimatedDelay,
-        currentTime: this.video.currentTime,
-        protectedDelay: this.activeStall.protectedDelay,
-      }, undefined, this.context());
+      if (this.activeStall !== undefined || this.delayProtection !== undefined) {
+        const protectedDelay = this.currentProtectedDelay();
+        this.diagnostics?.log('live.delay.observed', {
+          estimatedDelay,
+          currentTime: this.video.currentTime,
+          protectedDelay,
+          targetDelay: protectedDelay,
+        }, undefined, this.context());
+      }
     }
     this.updateStatus();
   }
@@ -728,15 +862,25 @@ export class LiveObserver {
   }
 
   cancelProtection(reason) {
-    if (this.activeStall === undefined) return;
+    if (this.activeStall === undefined && this.delayProtection === undefined) return;
     this.diagnostics?.log('live.delay_protection.cancelled', {
       reason,
       status: 'cancelled',
       currentTime: this.video?.currentTime,
     }, undefined, this.context());
     this.activeStall = undefined;
+    this.delayProtection = undefined;
     this.replacementNeedsCorrection = false;
     this.hideOverlay();
+  }
+
+  cancelUserSeek() {
+    this.userSeekAuthorization = undefined;
+    this.lastCorrection = undefined;
+    this.cancelProtection('user_seek');
+    this.awaitingUserSeekFrame = true;
+    this.hasDecodedFrame = false;
+    this.frameCanvas = undefined;
   }
 
   destroy() {
@@ -747,6 +891,7 @@ export class LiveObserver {
     this.mutationObserver = undefined;
     this.documentObject.removeEventListener('pointerdown', this.boundUserInput, true);
     this.documentObject.removeEventListener('keydown', this.boundUserInput, true);
+    this.documentObject.removeEventListener('input', this.boundUserInput, true);
     this.recorder?.destroy();
     this.recorder = undefined;
     if (this.statusTimer !== undefined) this.runtimeObject.clearInterval(this.statusTimer);
@@ -755,6 +900,8 @@ export class LiveObserver {
     this.frameCanvas = undefined;
     this.videoParent = undefined;
     this.activeStall = undefined;
+    this.delayProtection = undefined;
+    this.lastCorrection = undefined;
     this.video = undefined;
   }
 }

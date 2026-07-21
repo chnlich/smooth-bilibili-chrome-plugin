@@ -199,7 +199,11 @@ function sanitizeSerializedError(error) {
     }
     seen.add(source);
     for (const field of ['name', 'code', 'message', 'stack']) {
-      if (typeof source[field] === 'string') result[field] = scrubErrorText(source[field]);
+      if (typeof source[field] === 'string') {
+        result[field] = scrubErrorText(source[field]);
+      } else if (field === 'code' && typeof source[field] === 'number' && Number.isFinite(source[field])) {
+        result[field] = String(source[field]);
+      }
     }
     if (!Object.prototype.hasOwnProperty.call(source, 'cause')) break;
     const cause = source.cause;

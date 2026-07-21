@@ -83,7 +83,7 @@ function assertPopupMessage(message) {
   if (message === null || typeof message !== 'object' || Array.isArray(message)) {
     fail('POPUP_MESSAGE_INVALID', 'popup 消息必须是对象');
   }
-  if (message.version !== STATUS_MESSAGE_VERSION || message.type !== 'status:get') {
+  if (message.version !== STATUS_MESSAGE_VERSION || !['status:get', 'diagnostics:session-id:get'].includes(message.type)) {
     fail('POPUP_MESSAGE_INVALID', 'popup 消息版本或类型未允许');
   }
   if (Object.keys(message).some((field) => !['version', 'type'].includes(field))) {
@@ -92,19 +92,26 @@ function assertPopupMessage(message) {
   return message;
 }
 
-async function handlePopupMessage(message) {
+async function handlePopupMessage(message, getDiagnosticsSessionId) {
   assertPopupMessage(message);
+  if (message.type === 'diagnostics:session-id:get') {
+    return {
+      version: STATUS_MESSAGE_VERSION,
+      ok: true,
+      sessionId: getDiagnosticsSessionId(),
+    };
+  }
   const surface = getCurrentStatusSurface();
   if (surface === undefined) return createUnavailableStatusSnapshot(modeForLocation(window.location));
   return surface.getSnapshot();
 }
 
-export function installPopupMessageHandler(runtimeObject = chrome.runtime) {
+export function installPopupMessageHandler(runtimeObject = chrome.runtime, getDiagnosticsSessionId = () => '未提供') {
   if (runtimeObject?.onMessage === undefined || typeof runtimeObject.onMessage.addListener !== 'function') {
     throw new Error('Chrome runtime message API 不可用');
   }
   runtimeObject.onMessage.addListener((message, _sender, sendResponse) => {
-    void handlePopupMessage(message)
+    void handlePopupMessage(message, getDiagnosticsSessionId)
       .then((response) => sendResponse(response))
       .catch((error) => sendResponse({
         version: STATUS_MESSAGE_VERSION,
@@ -384,7 +391,7 @@ export class ExtensionCoordinator {
 
 if (typeof chrome !== 'undefined' && typeof document !== 'undefined' && typeof window !== 'undefined') {
   const diagnostics = new DiagnosticsClient();
-  installPopupMessageHandler();
+  installPopupMessageHandler(chrome.runtime, () => diagnostics.getStatus().sessionId);
   const coordinator = new ExtensionCoordinator({ diagnostics });
   void coordinator.start().catch((error) => {
     console.error('[BilibiliBuffer] 扩展启动失败', error);

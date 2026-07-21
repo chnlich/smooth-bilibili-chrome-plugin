@@ -128,6 +128,29 @@ test('tab-scoped popup status requests do not require a popup sender tab', async
   panel.destroy();
 });
 
+test('popup diagnostics session request is a fixed narrow message and never expands video status', async () => {
+  let listener;
+  const panel = createStatusPanel({}, 'video');
+  panel.setModel({ state: 'APPLIED', buffered: '12.0 秒', target: '120 秒' });
+  installPopupMessageHandler({
+    onMessage: {
+      addListener(callback) {
+        listener = callback;
+      },
+    },
+  }, () => 'session-video-popup');
+  const response = await new Promise((resolve) => {
+    const result = listener({ version: STATUS_MESSAGE_VERSION, type: 'diagnostics:session-id:get' }, {}, resolve);
+    assert.equal(result, true);
+  });
+  assert.deepEqual(response, {
+    version: STATUS_MESSAGE_VERSION,
+    ok: true,
+    sessionId: 'session-video-popup',
+  });
+  panel.destroy();
+});
+
 test('bridge contract allows only native video hint and narrow live capability operations', () => {
   assert.deepEqual(BRIDGE_CORE_SYNC_METHODS, ['setStableBufferTime']);
   assert.deepEqual(BRIDGE_LIVE_METHODS, ['setAutoSyncProgressCfg', 'setAutoDiscardFrameCfg']);

@@ -65,6 +65,9 @@
     const values = snapshot || {};
     const fields = fieldsForSnapshot(values);
     const live = values.mode === "直播";
+    for (const row of document.querySelectorAll("[data-mode-only]")) {
+      row.hidden = row.dataset.modeOnly !== (live ? "live" : values.mode === "视频" ? "video" : "none");
+    }
     for (const row of document.querySelectorAll('[data-live-only="true"]')) row.hidden = !live;
     for (const row of document.querySelectorAll('[data-video-only="true"]')) row.hidden = live;
     for (const field of /* @__PURE__ */ new Set([...VIDEO_FIELDS, ...LIVE_FIELDS])) {
@@ -111,10 +114,24 @@
     });
   }
   document.querySelector("[data-open-logs]").addEventListener("click", () => {
-    const fragment = logSessionFragment(latestStatusSnapshot?.sessionId);
-    void chrome.tabs.create({ url: chrome.runtime.getURL(`logs.html${fragment}`) }).catch((error) => {
-      console.error("[BilibiliBuffer] 打开开发日志失败", error);
-    });
+    void (async () => {
+      let fragment = "";
+      try {
+        const tab = await activeTab();
+        if (tab !== void 0) {
+          const response = await chrome.tabs.sendMessage(tab.id, {
+            version: MESSAGE_VERSION,
+            type: "diagnostics:session-id:get"
+          });
+          if (response?.ok !== true) throw new Error(response?.error?.message || "当前页面拒绝日志 session 请求");
+          fragment = logSessionFragment(response.sessionId);
+        }
+        await chrome.tabs.create({ url: chrome.runtime.getURL(`logs.html${fragment}`) });
+      } catch (error) {
+        console.error("[BilibiliBuffer] 打开开发日志失败", error);
+        await chrome.tabs.create({ url: chrome.runtime.getURL("logs.html") });
+      }
+    })();
   });
   void loadPreferences().catch((error) => {
     console.error("[BilibiliBuffer] Popup 读取设置失败", error);

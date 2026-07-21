@@ -38,6 +38,11 @@
     return operation;
   }
   function serializeError(error) {
+    const errorCode = (value2) => {
+      if (typeof value2 === "string") return value2;
+      if (typeof value2 === "number" && Number.isFinite(value2)) return String(value2);
+      return void 0;
+    };
     const seen = /* @__PURE__ */ new WeakSet();
     let value = error;
     let serialized;
@@ -55,7 +60,7 @@
         }
         seen.add(value);
         const name = typeof value.name === "string" ? value.name : void 0;
-        const code = typeof value.code === "string" ? value.code : void 0;
+        const code = errorCode(value.code);
         const message = typeof value.message === "string" ? value.message : String(value);
         const stack = typeof value.stack === "string" ? value.stack : void 0;
         if (name !== void 0) current.name = name;

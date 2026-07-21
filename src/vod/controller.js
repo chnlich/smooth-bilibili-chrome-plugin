@@ -1,6 +1,7 @@
 import { VOD_CONFIG } from '../constants.js';
 import { fail, toBufferScriptError } from '../errors.js';
 import { MediaEventRecorder } from '../diagnostics/media.js';
+import { UNKNOWN_VALUE } from '../diagnostics/privacy.js';
 import { computeForwardInventory, copyTimeRanges } from './buffer.js';
 
 const WAITING_MESSAGE = '等待原生 video、媒体 source 和播放器内核';
@@ -194,11 +195,20 @@ export class VodBufferController {
         targetSeconds: this.config.stableBufferSeconds,
       }, undefined, this.generationContext('buffer_hint'));
       core.setStableBufferTime(this.config.stableBufferSeconds);
+      let actualSeconds = UNKNOWN_VALUE;
+      try {
+        const measured = this.readForwardBuffer();
+        if (Number.isFinite(measured)) actualSeconds = measured;
+      } catch (error) {
+        this.diagnostics?.log('extension.observer_error', {
+          reason: 'buffer-hint-actual-read',
+        }, error, this.generationContext('buffer_hint'));
+      }
       this.hintState = 'APPLIED';
       this.message = '';
       this.diagnostics?.log('video.buffer_hint.applied', {
         targetSeconds: this.config.stableBufferSeconds,
-        actualSeconds: this.config.stableBufferSeconds,
+        actualSeconds,
       }, undefined, this.generationContext('buffer_hint'));
     } catch (error) {
       if (error?.code === 'BRIDGE_CORE_STALE') {

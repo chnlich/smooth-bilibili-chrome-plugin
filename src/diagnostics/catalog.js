@@ -137,6 +137,7 @@ export const DATA_ALLOWLIST = Object.freeze({
     'reason',
     'delayBeforeStall',
     'stallDuration',
+    'targetDelay',
     'protectedDelay',
     'targetTime',
     'currentTime',

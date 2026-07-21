@@ -61,6 +61,12 @@ function mediaFacts() {
   };
   const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : '未提供';
   const seekable = read(video.seekable);
+  const contiguousBufferSeconds = () => {
+    if (typeof currentTime !== 'number' || !Array.isArray(read(video.buffered))) return '未提供';
+    const buffered = read(video.buffered);
+    const range = buffered.find(({ start, end }) => start <= currentTime && currentTime <= end);
+    return range === undefined ? 0 : Math.max(0, range.end - currentTime);
+  };
   const estimatedDelay = () => {
     if (typeof currentTime !== 'number' || !Array.isArray(seekable) || seekable.length === 0) return '未提供';
     const seekableEnd = seekable[seekable.length - 1].end;
@@ -72,6 +78,7 @@ function mediaFacts() {
     paused: video.paused,
     readyState: video.readyState,
     buffered: read(video.buffered),
+    contiguousBufferSeconds: contiguousBufferSeconds(),
     seekable,
     estimatedDelay: estimatedDelay(),
     resolution: [video.videoWidth, video.videoHeight],
@@ -113,6 +120,83 @@ function bridgeAuditRecord(request) {
   const mode = request?.mode === 'sync' || request?.mode === 'async' ? request.mode : 'invalid';
   if (!Number.isSafeInteger(request?.id) || request.id <= 0) return { operation, mode };
   return { operation, mode, id: request.id };
+}
+
+async function readStoredEvents(context, extensionId, startAfterEventId = 0) {
+  const page = await context.newPage();
+  try {
+    await page.goto(`chrome-extension://${extensionId}/logs.html`, { waitUntil: 'domcontentloaded' });
+    return await page.evaluate((initialAfterEventId) => new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ version: 1, type: 'logs:max-event-id' }, (snapshot) => {
+        if (chrome.runtime.lastError !== undefined) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        const events = [];
+        let afterEventId = initialAfterEventId;
+        const readPage = () => chrome.runtime.sendMessage({
+          version: 1,
+          type: 'logs:events-page',
+          limit: 250,
+          afterEventId,
+          maxEventId: snapshot.maxEventId,
+        }, (response) => {
+          if (chrome.runtime.lastError !== undefined) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          events.push(...response.events);
+          if (!response.hasMore) {
+            resolve({ maxEventId: snapshot.maxEventId, events });
+            return;
+          }
+          afterEventId = response.nextAfterEventId;
+          readPage();
+        });
+        readPage();
+      });
+    }), startAfterEventId);
+  } finally {
+    await page.close();
+  }
+}
+
+async function readMaxEventId(context, extensionId) {
+  const page = await context.newPage();
+  try {
+    await page.goto(`chrome-extension://${extensionId}/logs.html`, { waitUntil: 'domcontentloaded' });
+    return await page.evaluate(() => new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ version: 1, type: 'logs:max-event-id' }, (snapshot) => {
+        if (chrome.runtime.lastError !== undefined) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(snapshot.maxEventId);
+      });
+    }));
+  } finally {
+    await page.close();
+  }
+}
+
+async function waitForVideoHint(context, extensionId, pathname, startAfterEventId, timeout = 10000) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const stored = await readStoredEvents(context, extensionId, startAfterEventId);
+    const sessionIds = new Set(stored.events
+      .filter((event) => event.code === 'route.session_started' && event.data?.pathname === pathname)
+      .map((event) => event.sessionId));
+    const hint = stored.events
+      .filter((event) => sessionIds.has(event.sessionId) && [
+        'video.buffer_hint.applied',
+        'video.buffer_hint.unsupported',
+        'video.buffer_hint.failed',
+      ].includes(event.code))
+      .at(-1);
+    if (hint !== undefined) return { hint, stored };
+    if (Date.now() >= deadline) return { hint: undefined, stored };
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 function hasReadablePlayingVideo(media) {
@@ -408,10 +492,11 @@ async function runLiveOfflineInterruption(context, page) {
   };
 }
 
-async function runPage(context, kind, url, { keepPage = false } = {}) {
+async function runPage(context, extensionId, kind, url, { keepPage = false } = {}) {
   const page = await context.newPage();
   let retained = false;
   const bridgeRequests = [];
+  let startAfterEventId;
   await page.exposeFunction('__recordExternalBridge', (request) => bridgeRequests.push(bridgeAuditRecord(request)));
   await page.addInitScript(() => {
     document.addEventListener('bilibili-buffer:bridge-request-v1', (event) => {
@@ -424,6 +509,7 @@ async function runPage(context, kind, url, { keepPage = false } = {}) {
   });
   await page.addInitScript({ content: `(${mediaEventInit.toString()})()` });
   try {
+    if (kind === 'video') startAfterEventId = await readMaxEventId(context, extensionId);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(15000);
     const media = await page.evaluate(mediaFacts);
@@ -441,6 +527,59 @@ async function runPage(context, kind, url, { keepPage = false } = {}) {
           silent,
         },
       };
+    }
+    let videoHint;
+    if (kind === 'video') {
+      videoHint = (await waitForVideoHint(
+        context,
+        extensionId,
+        new URL(url).pathname,
+        startAfterEventId,
+      )).hint;
+      if (videoHint === undefined) {
+        return {
+          result: {
+            kind,
+            status: 'BLOCKED',
+            reason: '公共页面有可读取 video，但没有持久化的 buffer hint attempt 结果',
+            browserStarted: true,
+            pageStarted: true,
+            media,
+            bridgeRequests,
+            silent,
+          },
+        };
+      }
+      if (videoHint.data?.targetSeconds !== 120) {
+        return {
+          result: {
+            kind,
+            status: 'FAIL',
+            reason: '公共页面 buffer hint 结果没有记录批准的 120 秒请求目标',
+            browserStarted: true,
+            pageStarted: true,
+            media,
+            bridgeRequests,
+            silent,
+            videoHint,
+          },
+        };
+      }
+      if (typeof media.contiguousBufferSeconds !== 'number') {
+        return {
+          result: {
+            kind,
+            status: 'BLOCKED',
+            reason: '公共页面 video 存在，但无法读取当前真实连续缓存秒数',
+            browserStarted: true,
+            pageStarted: true,
+            media,
+            bridgeRequests,
+            silent,
+            videoHint,
+          },
+        };
+      }
     }
     const forbiddenOperations = bridgeRequests.filter((request) => !bridgeAuditOperations.has(request.operation));
     if (forbiddenOperations.length > 0 || silent.some(({ muted, volume }) => muted !== true || volume !== 0)) {
@@ -463,11 +602,12 @@ async function runPage(context, kind, url, { keepPage = false } = {}) {
       browserStarted: true,
       pageStarted: true,
       reason: kind === 'video'
-        ? '读取到原生 video；实际 120 秒提示结果以页面内核和日志为准'
+        ? '读取到原生 video，并取得持久化 buffer hint 结果与真实连续缓存'
         : '读取到原生 video；未观察到扩展播放所有权操作',
       media,
       bridgeRequests,
       silent,
+      ...(videoHint === undefined ? {} : { videoHint }),
     };
     if (keepPage) {
       retained = true;
@@ -511,10 +651,12 @@ try {
     ],
   });
   report.browser.browserStarted = true;
+  const serviceWorker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
+  const extensionId = new URL(serviceWorker.url()).hostname;
   await context.addInitScript({ content: `(${mutedInit.toString()})()` });
-  const video = await runPage(context, 'video', 'https://www.bilibili.com/video/BV1ohQVBFEsh');
+  const video = await runPage(context, extensionId, 'video', 'https://www.bilibili.com/video/BV1ohQVBFEsh');
   report.results.push(video.result);
-  const live = await runPage(context, 'live', 'https://live.bilibili.com/6363772', { keepPage: true });
+  const live = await runPage(context, extensionId, 'live', 'https://live.bilibili.com/6363772', { keepPage: true });
   report.results.push(live.result);
   if (live.page === undefined) {
     report.results.push({

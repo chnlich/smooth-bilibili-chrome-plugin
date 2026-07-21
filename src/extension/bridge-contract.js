@@ -43,6 +43,11 @@ export function assertOperation(operation) {
 }
 
 export function serializeError(error) {
+  const errorCode = (value) => {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return undefined;
+  };
   const seen = new WeakSet();
   let value = error;
   let serialized;
@@ -60,7 +65,7 @@ export function serializeError(error) {
       }
       seen.add(value);
       const name = typeof value.name === 'string' ? value.name : undefined;
-      const code = typeof value.code === 'string' ? value.code : undefined;
+      const code = errorCode(value.code);
       const message = typeof value.message === 'string' ? value.message : String(value);
       const stack = typeof value.stack === 'string' ? value.stack : undefined;
       if (name !== undefined) current.name = name;

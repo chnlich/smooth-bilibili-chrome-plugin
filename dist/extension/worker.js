@@ -152,6 +152,7 @@
       "reason",
       "delayBeforeStall",
       "stallDuration",
+      "targetDelay",
       "protectedDelay",
       "targetTime",
       "currentTime",
@@ -382,7 +383,11 @@
       }
       seen.add(source);
       for (const field of ["name", "code", "message", "stack"]) {
-        if (typeof source[field] === "string") result[field] = scrubErrorText(source[field]);
+        if (typeof source[field] === "string") {
+          result[field] = scrubErrorText(source[field]);
+        } else if (field === "code" && typeof source[field] === "number" && Number.isFinite(source[field])) {
+          result[field] = String(source[field]);
+        }
       }
       if (!Object.prototype.hasOwnProperty.call(source, "cause")) break;
       const cause = source.cause;
@@ -484,6 +489,11 @@
   ]);
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function serializeError(error) {
+    const errorCode = (value2) => {
+      if (typeof value2 === "string") return value2;
+      if (typeof value2 === "number" && Number.isFinite(value2)) return String(value2);
+      return void 0;
+    };
     const seen = /* @__PURE__ */ new WeakSet();
     let value = error;
     let serialized;
@@ -501,7 +511,7 @@
         }
         seen.add(value);
         const name = typeof value.name === "string" ? value.name : void 0;
-        const code = typeof value.code === "string" ? value.code : void 0;
+        const code = errorCode(value.code);
         const message = typeof value.message === "string" ? value.message : String(value);
         const stack = typeof value.stack === "string" ? value.stack : void 0;
         if (name !== void 0) current.name = name;
