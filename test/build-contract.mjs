@@ -137,7 +137,7 @@ assert.deepEqual(manifest.content_scripts, [
     matches: [...EXTENSION_MANIFEST.matches],
     js: ['source-buffer-shim.js'],
     run_at: 'document_start',
-    all_frames: false,
+    all_frames: true,
     world: 'MAIN',
   },
   {

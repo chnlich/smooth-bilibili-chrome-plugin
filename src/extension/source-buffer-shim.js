@@ -37,15 +37,16 @@ function findLiveVideoCurrentTime() {
 function dispatchObservation(detail) {
   try {
     observationSequence += 1;
-    document.documentElement.setAttribute(
-      SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE,
-      String(observationSequence),
-    );
-    document.documentElement.setAttribute(
-      SHIM_OBSERVATION_ATTRIBUTE,
-      JSON.stringify(detail),
-    );
-  } catch { /* page tearing down */ }
+    const seq = String(observationSequence);
+    const payload = JSON.stringify(detail);
+    const target = (window !== window.top && window.parent !== window)
+      ? (window.parent?.document?.documentElement ?? document.documentElement)
+      : document.documentElement;
+    if (target !== null) {
+      target.setAttribute(SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE, seq);
+      target.setAttribute(SHIM_OBSERVATION_ATTRIBUTE, payload);
+    }
+  } catch { /* page tearing down or cross-origin parent */ }
 }
 
 if (typeof SourceBuffer !== 'undefined' && SourceBuffer.prototype && typeof SourceBuffer.prototype.remove === 'function') {

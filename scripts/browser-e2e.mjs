@@ -1122,6 +1122,27 @@ try {
   }
   markScenario('SourceBuffer.remove hook 保留 30 秒直播缓冲');
 
+  const iframeRetention = await livePage.evaluate(async () => {
+    const iframe = document.createElement('iframe');
+    iframe.src = 'https://live.bilibili.com/fixture-iframe';
+    iframe.style.display = 'none';
+    document.body.append(iframe);
+    await new Promise((resolve, reject) => {
+      iframe.addEventListener('load', resolve, { once: true });
+      setTimeout(() => reject(new Error('iframe load 超时')), 5000);
+    });
+    const iframeWin = iframe.contentWindow;
+    const iframeDoc = iframe.contentDocument;
+    if (!iframeWin || !iframeDoc) throw new Error('同源 iframe 不可访问');
+    const hasShim = !!iframeWin.__smoothBufferShim;
+    const removeIsNative = iframeWin.SourceBuffer?.prototype?.remove?.toString()?.includes('[native code]') ?? true;
+    iframe.remove();
+    return { hasShim, removeIsNative };
+  });
+  assert.equal(iframeRetention.hasShim, true, 'shim 未注入到同源 iframe');
+  assert.equal(iframeRetention.removeIsNative, false, 'iframe SourceBuffer.remove 仍是原生实现');
+  markScenario('shim 注入到同源 iframe 并 hook SourceBuffer.remove');
+
   stored = await readStoredEvents(context, extensionId);
   assert.ok(stored.events.some((event) => event.code === 'live.delay.corrected'));
   assert.ok(stored.events.some((event) => event.code === 'media.volumechange' && event.data.eventType === 'volumechange'));
