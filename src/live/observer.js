@@ -128,8 +128,19 @@ function isUserSeekIntent(event, video, documentObject) {
   return timeline || path.includes(video) || documentObject.activeElement === video;
 }
 
+function collectSameOriginVideos(documentObject) {
+  const videos = [...documentObject.querySelectorAll('video')];
+  for (const iframe of documentObject.querySelectorAll('iframe')) {
+    try {
+      const iframeDocument = iframe.contentDocument;
+      if (iframeDocument !== null) videos.push(...iframeDocument.querySelectorAll('video'));
+    } catch { /* cross-origin iframe */ }
+  }
+  return videos;
+}
+
 function selectVideo(documentObject) {
-  const videos = [...documentObject.querySelectorAll('video')].filter((video) => video.isConnected !== false);
+  const videos = collectSameOriginVideos(documentObject).filter((video) => video.isConnected !== false);
   return videos.sort((left, right) => {
     const leftArea = (left.clientWidth || 0) * (left.clientHeight || 0);
     const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);
@@ -183,6 +194,7 @@ export class LiveObserver {
     this.lastCorrection = undefined;
     this.correcting = false;
     this.replacementNeedsCorrection = false;
+    this.iframeMutationObservers = [];
     this.frameCanvas = undefined;
     this.overlayCanvas = undefined;
     this.autoCatchupAttempted = false;
@@ -231,6 +243,7 @@ export class LiveObserver {
       this.mutationObserver.observe(this.documentObject, { childList: true, subtree: true });
     }
     this.statusTimer = this.runtimeObject.setInterval(() => this.sample(), this.config.statusRefreshMilliseconds);
+    this.attachIframeObservers();
     if (this.video !== undefined) {
       const initialVideo = this.video;
       this.video = undefined;
@@ -239,6 +252,25 @@ export class LiveObserver {
       this.reconcileVideo();
     }
     this.updateStatus();
+  }
+
+  attachIframeObservers() {
+    this.detachIframeObservers();
+    if (typeof this.windowObject.MutationObserver !== 'function') return;
+    for (const iframe of this.documentObject.querySelectorAll('iframe')) {
+      try {
+        const iframeDocument = iframe.contentDocument;
+        if (iframeDocument === null) continue;
+        const observer = new this.windowObject.MutationObserver(this.boundMutation);
+        observer.observe(iframeDocument, { childList: true, subtree: true });
+        this.iframeMutationObservers.push(observer);
+      } catch { /* cross-origin iframe */ }
+    }
+  }
+
+  detachIframeObservers() {
+    for (const observer of this.iframeMutationObservers) observer.disconnect();
+    this.iframeMutationObservers = [];
   }
 
   context() {
@@ -336,6 +368,7 @@ export class LiveObserver {
       onFrame: (currentVideo, metadata) => this.onDecodedFrame(currentVideo, metadata),
     });
     this.recorder.start();
+    this.attachIframeObservers();
     if (previousStall !== undefined) this.showOverlay();
     this.applyReplacementCorrection();
     this.updateStatus();
@@ -853,6 +886,7 @@ export class LiveObserver {
     this.destroyed = true;
     this.mutationObserver?.disconnect();
     this.mutationObserver = undefined;
+    this.detachIframeObservers();
     this.documentObject.removeEventListener('pointerdown', this.boundUserInput, true);
     this.documentObject.removeEventListener('keydown', this.boundUserInput, true);
     this.documentObject.removeEventListener('input', this.boundUserInput, true);

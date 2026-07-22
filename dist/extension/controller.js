@@ -418,7 +418,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-a9b2b50da63db8ab6164b02c" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-6d6750c02ab82db80449fa9c" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1234,8 +1234,19 @@
     if (event?.type !== "keydown" || !SEEK_KEYS.has(event.key)) return false;
     return timeline || path.includes(video) || documentObject.activeElement === video;
   }
+  function collectSameOriginVideos(documentObject) {
+    const videos = [...documentObject.querySelectorAll("video")];
+    for (const iframe of documentObject.querySelectorAll("iframe")) {
+      try {
+        const iframeDocument = iframe.contentDocument;
+        if (iframeDocument !== null) videos.push(...iframeDocument.querySelectorAll("video"));
+      } catch {
+      }
+    }
+    return videos;
+  }
   function selectVideo(documentObject) {
-    const videos = [...documentObject.querySelectorAll("video")].filter((video) => video.isConnected !== false);
+    const videos = collectSameOriginVideos(documentObject).filter((video) => video.isConnected !== false);
     return videos.sort((left, right) => {
       const leftArea = (left.clientWidth || 0) * (left.clientHeight || 0);
       const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);
@@ -1286,6 +1297,7 @@
       this.lastCorrection = void 0;
       this.correcting = false;
       this.replacementNeedsCorrection = false;
+      this.iframeMutationObservers = [];
       this.frameCanvas = void 0;
       this.overlayCanvas = void 0;
       this.autoCatchupAttempted = false;
@@ -1328,6 +1340,7 @@
         this.mutationObserver.observe(this.documentObject, { childList: true, subtree: true });
       }
       this.statusTimer = this.runtimeObject.setInterval(() => this.sample(), this.config.statusRefreshMilliseconds);
+      this.attachIframeObservers();
       if (this.video !== void 0) {
         const initialVideo = this.video;
         this.video = void 0;
@@ -1336,6 +1349,24 @@
         this.reconcileVideo();
       }
       this.updateStatus();
+    }
+    attachIframeObservers() {
+      this.detachIframeObservers();
+      if (typeof this.windowObject.MutationObserver !== "function") return;
+      for (const iframe of this.documentObject.querySelectorAll("iframe")) {
+        try {
+          const iframeDocument = iframe.contentDocument;
+          if (iframeDocument === null) continue;
+          const observer = new this.windowObject.MutationObserver(this.boundMutation);
+          observer.observe(iframeDocument, { childList: true, subtree: true });
+          this.iframeMutationObservers.push(observer);
+        } catch {
+        }
+      }
+    }
+    detachIframeObservers() {
+      for (const observer of this.iframeMutationObservers) observer.disconnect();
+      this.iframeMutationObservers = [];
     }
     context() {
       return {
@@ -1430,6 +1461,7 @@
         onFrame: (currentVideo, metadata) => this.onDecodedFrame(currentVideo, metadata)
       });
       this.recorder.start();
+      this.attachIframeObservers();
       if (previousStall !== void 0) this.showOverlay();
       this.applyReplacementCorrection();
       this.updateStatus();
@@ -1912,6 +1944,7 @@
       this.destroyed = true;
       this.mutationObserver?.disconnect();
       this.mutationObserver = void 0;
+      this.detachIframeObservers();
       this.documentObject.removeEventListener("pointerdown", this.boundUserInput, true);
       this.documentObject.removeEventListener("keydown", this.boundUserInput, true);
       this.documentObject.removeEventListener("input", this.boundUserInput, true);
@@ -2830,7 +2863,7 @@
     if (isVideoPage(locationObject)) return "video";
     return void 0;
   }
-  function collectSameOriginVideos(documentObject) {
+  function collectSameOriginVideos2(documentObject) {
     const videos = [...documentObject.querySelectorAll("video")];
     for (const iframe of documentObject.querySelectorAll("iframe")) {
       try {
@@ -2842,7 +2875,7 @@
     return videos;
   }
   function findLargestVideo(documentObject) {
-    const videos = collectSameOriginVideos(documentObject).filter((video) => video.isConnected !== false);
+    const videos = collectSameOriginVideos2(documentObject).filter((video) => video.isConnected !== false);
     return videos.sort((left, right) => {
       const leftArea = (left.clientWidth || 0) * (left.clientHeight || 0);
       const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);
