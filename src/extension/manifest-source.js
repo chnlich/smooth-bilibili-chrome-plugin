@@ -19,6 +19,13 @@ export function createManifest() {
     content_scripts: [
       {
         matches: [...EXTENSION_MANIFEST.matches],
+        js: ['source-buffer-shim.js'],
+        run_at: 'document_start',
+        all_frames: false,
+        world: 'MAIN',
+      },
+      {
+        matches: [...EXTENSION_MANIFEST.matches],
         js: ['main-bridge.js'],
         run_at: 'document_start',
         all_frames: false,

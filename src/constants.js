@@ -25,6 +25,7 @@ export const LIVE_CONFIG = Object.freeze({
   correctionToleranceSeconds: 2.5,
   statusRefreshMilliseconds: 500,
   delayUnavailableCheckMilliseconds: 5000,
+  liveRetainSeconds: 30,
 });
 
 export const DIAGNOSTIC_MESSAGE_VERSION = 1;

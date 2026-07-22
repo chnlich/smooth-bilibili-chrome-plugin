@@ -11,6 +11,7 @@ import {
   getCurrentStatusSurface,
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
+import { SHIM_OBSERVATION_EVENT } from './bridge-contract.js';
 
 export function isLivePage(locationObject) {
   return locationObject.hostname === 'live.bilibili.com';
@@ -160,10 +161,17 @@ export class ExtensionCoordinator {
     this.routeAbort = undefined;
     this.routeTimer = undefined;
     this.destroyed = false;
+    this.shimListener = undefined;
   }
 
   async start() {
     if (this.routeTimer !== undefined) throw new Error('扩展路由协调器已经启动');
+    this.shimListener = (event) => {
+      if (event?.detail && typeof event.detail === 'object') {
+        this.diagnostics?.log('live.buffer.retained', event.detail);
+      }
+    };
+    this.documentObject.addEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
     this.diagnostics?.log('extension.started', { action: 'coordinator' });
     this.preferences = await readPreferences(this.storage);
     this.diagnostics?.log('preference.read', {
@@ -392,6 +400,10 @@ export class ExtensionCoordinator {
     this.routeAbort?.abort();
     if (this.routeTimer !== undefined) this.runtimeObject.clearInterval(this.routeTimer);
     this.routeTimer = undefined;
+    if (this.shimListener !== undefined) {
+      this.documentObject.removeEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
+      this.shimListener = undefined;
+    }
     await this.teardownActive();
     this.diagnostics?.log('extension.destroyed', { action: 'coordinator' });
     this.destroyed = true;

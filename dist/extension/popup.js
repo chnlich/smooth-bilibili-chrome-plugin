@@ -21,7 +21,8 @@
     userSeekAuthorizationMilliseconds: 1e3,
     correctionToleranceSeconds: 2.5,
     statusRefreshMilliseconds: 500,
-    delayUnavailableCheckMilliseconds: 5e3
+    delayUnavailableCheckMilliseconds: 5e3,
+    liveRetainSeconds: 30
   });
 
   // src/diagnostics/log-session.js

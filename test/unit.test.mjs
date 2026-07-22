@@ -5,6 +5,7 @@ import { serializeError } from '../src/extension/bridge-contract.js';
 import { LiveObserver } from '../src/live/observer.js';
 import { ExtensionCoordinator } from '../src/extension/controller.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
+import { computeRetentionAction } from '../src/live/buffer-retention.js';
 import { VodBufferController } from '../src/vod/controller.js';
 import { DiagnosticsClient, createRouteIdentity } from '../src/diagnostics/client.js';
 import { MediaEventRecorder, readMediaFacts } from '../src/diagnostics/media.js';
@@ -1505,4 +1506,30 @@ test('resource timing omits non-media and unknown resource names while retaining
   assert.equal(JSON.stringify(resourceEvents).includes('account'), false);
   assert.equal(JSON.stringify(resourceEvents).includes('cookie'), false);
   client.destroy();
+});
+
+test('computeRetentionAction 放行保留窗口之前的驱逐', () => {
+  assert.equal(computeRetentionAction(100, 0, 60, 30), null);
+  assert.equal(computeRetentionAction(100, 0, 70, 30), null);
+  assert.equal(computeRetentionAction(100, 50, 70, 30), null);
+});
+
+test('computeRetentionAction 跳过完全在保留窗口内的驱逐', () => {
+  const result = computeRetentionAction(100, 75, 95, 30);
+  assert.deepEqual(result, { action: 'skipped', adjustedEnd: undefined });
+});
+
+test('computeRetentionAction 截断跨越保留窗口边界的驱逐', () => {
+  const result = computeRetentionAction(100, 60, 90, 30);
+  assert.deepEqual(result, { action: 'truncated', adjustedEnd: 70 });
+});
+
+test('computeRetentionAction 对无效输入放行', () => {
+  assert.equal(computeRetentionAction(undefined, 0, 60, 30), null);
+  assert.equal(computeRetentionAction(0, 0, 60, 30), null);
+  assert.equal(computeRetentionAction(NaN, 0, 60, 30), null);
+  assert.equal(computeRetentionAction(100, NaN, 60, 30), null);
+  assert.equal(computeRetentionAction(100, 0, NaN, 30), null);
+  assert.equal(computeRetentionAction(100, 60, 60, 30), null);
+  assert.equal(computeRetentionAction(100, 70, 60, 30), null);
 });

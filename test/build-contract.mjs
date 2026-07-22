@@ -114,6 +114,7 @@ const sourceVisibleAssets = await readTextFiles(path.join(root, 'src'), ['.html'
 const extensionVisibleFiles = await readTextFiles(extensionDirectory, ['.js', '.html', '.css', '.json']);
 const controller = await fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8');
 const bridge = await fs.readFile(path.join(extensionDirectory, 'main-bridge.js'), 'utf8');
+const shim = await fs.readFile(path.join(extensionDirectory, 'source-buffer-shim.js'), 'utf8');
 const popup = await fs.readFile(path.join(extensionDirectory, 'popup.js'), 'utf8');
 const worker = await fs.readFile(path.join(extensionDirectory, 'worker.js'), 'utf8');
 const logs = await fs.readFile(path.join(extensionDirectory, 'logs.js'), 'utf8');
@@ -132,6 +133,13 @@ assert.deepEqual(manifest.permissions, ['storage', 'unlimitedStorage']);
 assert.deepEqual(manifest.host_permissions, [...EXTENSION_MANIFEST.hostPermissions]);
 assert.deepEqual(manifest.background, { service_worker: 'worker.js' });
 assert.deepEqual(manifest.content_scripts, [
+  {
+    matches: [...EXTENSION_MANIFEST.matches],
+    js: ['source-buffer-shim.js'],
+    run_at: 'document_start',
+    all_frames: false,
+    world: 'MAIN',
+  },
   {
     matches: [...EXTENSION_MANIFEST.matches],
     js: ['main-bridge.js'],
@@ -167,11 +175,13 @@ const expectedFiles = [
   'popup.html',
   'popup.js',
   'popup.js.map',
+  'source-buffer-shim.js',
+  'source-buffer-shim.js.map',
   'worker.js',
   'worker.js.map',
 ];
 assert.deepEqual((await fs.readdir(extensionDirectory)).sort(), expectedFiles);
-for (const bundle of ['controller.js', 'main-bridge.js', 'popup.js', 'worker.js', 'logs.js']) {
+for (const bundle of ['controller.js', 'main-bridge.js', 'source-buffer-shim.js', 'popup.js', 'worker.js', 'logs.js']) {
   assert.match(await fs.readFile(path.join(extensionDirectory, `${bundle}.map`), 'utf8'), /"sources"/);
   assert.match(await fs.readFile(path.join(extensionDirectory, bundle), 'utf8'), /sourceMappingURL/);
 }
@@ -184,6 +194,15 @@ for (const oldModule of ['api', 'controller', 'danmaku', 'fetcher', 'guard', 'hl
 }
 assert.doesNotMatch(bridge, /chrome\./);
 assert.doesNotMatch(bridge, /\b(?:fetch|MediaSource|SourceBuffer)\b/);
+const sourceBufferSourceAllowlist = new Set([
+  'extension/source-buffer-shim.js',
+]);
+for (const { relativePath, content } of sourceFiles) {
+  if (!sourceBufferSourceAllowlist.has(relativePath)) {
+    assert.doesNotMatch(content, /\bSourceBuffer\b/, `${relativePath} 不得直接使用 SourceBuffer`);
+  }
+}
+assert.match(shim, /SourceBuffer\.prototype\.remove/);
 const indexedDbReference = /\bindexedDB\b|['"]indexedDB['"]/;
 const indexedDbSourceAllowlist = new Set([
   'diagnostics/idb.js',
@@ -199,6 +218,7 @@ assert.match(await fs.readFile(path.join(root, 'src/diagnostics/idb.js'), 'utf8'
 assert.match(worker, indexedDbReference);
 for (const [bundleName, bundle] of Object.entries({
   'main bridge': bridge,
+  'source buffer shim': shim,
   controller,
   popup,
 })) {
@@ -213,7 +233,7 @@ assert.doesNotMatch(passiveMediaSource, /\b(?:play|pause)\s*\(/);
 assert.doesNotMatch(passiveMediaSource, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
 assert.doesNotMatch(passiveMediaSource, /\b(?:fetch|MediaSource|SourceBuffer)\b/);
 assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /document\.cookie|localStorage|sessionStorage|sendBeacon/);
-assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /fetch\s*\(|XMLHttpRequest|MediaSource|SourceBuffer/);
+assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /fetch\s*\(|XMLHttpRequest|MediaSource/);
 assert.doesNotMatch(source, /window\.onerror|window\.onunhandledrejection/);
 const diagnosticStorageSource = `${await fs.readFile(path.join(root, 'src/diagnostics/idb.js'), 'utf8')}\n${await fs.readFile(path.join(root, 'src/diagnostics/worker.js'), 'utf8')}`;
 assert.doesNotMatch(diagnosticStorageSource, /\.put\s*\(|\.delete\s*\(|\.clear\s*\(/);
@@ -221,10 +241,12 @@ assert.match(vodSource, /setStableBufferTime/);
 assert.equal((vodSource.match(/\.setStableBufferTime\(/g) || []).length, 1);
 assert.equal(VOD_CONFIG.stableBufferSeconds, 120);
 assert.equal(LIVE_CONFIG.noDecodedFrameStallMilliseconds, 2000);
+assert.equal(LIVE_CONFIG.liveRetainSeconds, 30);
 assert.equal(EVENT_CODES.includes('log.persist.result'), true);
 assert.equal(EVENT_CODES.includes('live.delay_protection.applied'), true);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
 assert.equal(EVENT_CODES.includes('live.delay.unavailable'), true);
+assert.equal(EVENT_CODES.includes('live.buffer.retained'), true);
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.match(bridgeContractSource, /setChasingFrameThreshold/);
 for (const mediaEvent of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${mediaEvent}`));

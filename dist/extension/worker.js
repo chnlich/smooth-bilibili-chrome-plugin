@@ -21,7 +21,8 @@
     userSeekAuthorizationMilliseconds: 1e3,
     correctionToleranceSeconds: 2.5,
     statusRefreshMilliseconds: 500,
-    delayUnavailableCheckMilliseconds: 5e3
+    delayUnavailableCheckMilliseconds: 5e3,
+    liveRetainSeconds: 30
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -79,6 +80,7 @@
     "live.delay.observed",
     "live.delay.corrected",
     "live.delay.unavailable",
+    "live.buffer.retained",
     "live.source_replaced",
     "live.delay_protection.capability",
     "live.delay_protection.applied",
@@ -169,7 +171,9 @@
       "sourceInstance",
       "capability",
       "status",
-      "waitedSeconds"
+      "waitedSeconds",
+      "retainSeconds",
+      "originalEnd"
     ]),
     bridge: Object.freeze(["operation", "direction", "status"]),
     extension: Object.freeze(["action", "reason", "status"]),

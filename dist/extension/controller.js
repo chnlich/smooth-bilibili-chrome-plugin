@@ -22,7 +22,8 @@
     userSeekAuthorizationMilliseconds: 1e3,
     correctionToleranceSeconds: 2.5,
     statusRefreshMilliseconds: 500,
-    delayUnavailableCheckMilliseconds: 5e3
+    delayUnavailableCheckMilliseconds: 5e3,
+    liveRetainSeconds: 30
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -80,6 +81,7 @@
     "live.delay.observed",
     "live.delay.corrected",
     "live.delay.unavailable",
+    "live.buffer.retained",
     "live.source_replaced",
     "live.delay_protection.capability",
     "live.delay_protection.applied",
@@ -170,7 +172,9 @@
       "sourceInstance",
       "capability",
       "status",
-      "waitedSeconds"
+      "waitedSeconds",
+      "retainSeconds",
+      "originalEnd"
     ]),
     bridge: Object.freeze(["operation", "direction", "status"]),
     extension: Object.freeze(["action", "reason", "status"]),
@@ -418,7 +422,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-41a8f8af84c443648f74a26a" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-d3c96ff434f5048aedb1cf72" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -485,6 +489,7 @@
   var BRIDGE_REQUEST_EVENT = "bilibili-buffer:bridge-request-v1";
   var BRIDGE_RESPONSE_EVENT = "bilibili-buffer:bridge-response-v1";
   var BRIDGE_RESPONSE_ATTRIBUTE = "data-bilibili-buffer-bridge-response-v1";
+  var SHIM_OBSERVATION_EVENT = "bilibili-buffer:shim-observation-v1";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
     "callCoreSync",
@@ -2980,9 +2985,16 @@
       this.routeAbort = void 0;
       this.routeTimer = void 0;
       this.destroyed = false;
+      this.shimListener = void 0;
     }
     async start() {
       if (this.routeTimer !== void 0) throw new Error("扩展路由协调器已经启动");
+      this.shimListener = (event) => {
+        if (event?.detail && typeof event.detail === "object") {
+          this.diagnostics?.log("live.buffer.retained", event.detail);
+        }
+      };
+      this.documentObject.addEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
       this.diagnostics?.log("extension.started", { action: "coordinator" });
       this.preferences = await readPreferences(this.storage);
       this.diagnostics?.log("preference.read", {
@@ -3189,6 +3201,10 @@
       this.routeAbort?.abort();
       if (this.routeTimer !== void 0) this.runtimeObject.clearInterval(this.routeTimer);
       this.routeTimer = void 0;
+      if (this.shimListener !== void 0) {
+        this.documentObject.removeEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
+        this.shimListener = void 0;
+      }
       await this.teardownActive();
       this.diagnostics?.log("extension.destroyed", { action: "coordinator" });
       this.destroyed = true;
