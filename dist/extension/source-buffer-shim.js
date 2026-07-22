@@ -26,7 +26,8 @@
   });
 
   // src/extension/bridge-contract.js
-  var SHIM_OBSERVATION_EVENT = "bilibili-buffer:shim-observation-v1";
+  var SHIM_OBSERVATION_ATTRIBUTE = "data-bilibili-buffer-shim-observation";
+  var SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = "data-bilibili-buffer-shim-seq";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
     "callCoreSync",
@@ -56,6 +57,7 @@
   // src/extension/source-buffer-shim.js
   var RETAIN_SECONDS = LIVE_CONFIG.liveRetainSeconds;
   var installed = false;
+  var observationSequence = 0;
   var stats = {
     removeCalls: 0,
     intercepted: 0,
@@ -86,7 +88,15 @@
   }
   function dispatchObservation(detail) {
     try {
-      document.dispatchEvent(new CustomEvent(SHIM_OBSERVATION_EVENT, { detail }));
+      observationSequence += 1;
+      document.documentElement.setAttribute(
+        SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE,
+        String(observationSequence)
+      );
+      document.documentElement.setAttribute(
+        SHIM_OBSERVATION_ATTRIBUTE,
+        JSON.stringify(detail)
+      );
     } catch {
     }
   }

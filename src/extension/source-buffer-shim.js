@@ -1,9 +1,10 @@
 import { LIVE_CONFIG } from '../constants.js';
-import { SHIM_OBSERVATION_EVENT } from './bridge-contract.js';
+import { SHIM_OBSERVATION_ATTRIBUTE, SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE } from './bridge-contract.js';
 import { computeRetentionAction } from '../live/buffer-retention.js';
 
 const RETAIN_SECONDS = LIVE_CONFIG.liveRetainSeconds;
 let installed = false;
+let observationSequence = 0;
 const stats = {
   removeCalls: 0,
   intercepted: 0,
@@ -35,7 +36,15 @@ function findLiveVideoCurrentTime() {
 
 function dispatchObservation(detail) {
   try {
-    document.dispatchEvent(new CustomEvent(SHIM_OBSERVATION_EVENT, { detail }));
+    observationSequence += 1;
+    document.documentElement.setAttribute(
+      SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE,
+      String(observationSequence),
+    );
+    document.documentElement.setAttribute(
+      SHIM_OBSERVATION_ATTRIBUTE,
+      JSON.stringify(detail),
+    );
   } catch { /* page tearing down */ }
 }
 

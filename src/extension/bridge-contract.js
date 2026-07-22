@@ -2,7 +2,8 @@ export const BRIDGE_VERSION = 1;
 export const BRIDGE_REQUEST_EVENT = 'bilibili-buffer:bridge-request-v1';
 export const BRIDGE_RESPONSE_EVENT = 'bilibili-buffer:bridge-response-v1';
 export const BRIDGE_RESPONSE_ATTRIBUTE = 'data-bilibili-buffer-bridge-response-v1';
-export const SHIM_OBSERVATION_EVENT = 'bilibili-buffer:shim-observation-v1';
+export const SHIM_OBSERVATION_ATTRIBUTE = 'data-bilibili-buffer-shim-observation';
+export const SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = 'data-bilibili-buffer-shim-seq';
 
 export const BRIDGE_OPERATIONS = Object.freeze([
   'getCoreSnapshot',

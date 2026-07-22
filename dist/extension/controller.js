@@ -422,7 +422,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-d3c96ff434f5048aedb1cf72" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-a7758d471e06f2dcd70c96c6" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -489,7 +489,8 @@
   var BRIDGE_REQUEST_EVENT = "bilibili-buffer:bridge-request-v1";
   var BRIDGE_RESPONSE_EVENT = "bilibili-buffer:bridge-response-v1";
   var BRIDGE_RESPONSE_ATTRIBUTE = "data-bilibili-buffer-bridge-response-v1";
-  var SHIM_OBSERVATION_EVENT = "bilibili-buffer:shim-observation-v1";
+  var SHIM_OBSERVATION_ATTRIBUTE = "data-bilibili-buffer-shim-observation";
+  var SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = "data-bilibili-buffer-shim-seq";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
     "callCoreSync",
@@ -2985,16 +2986,33 @@
       this.routeAbort = void 0;
       this.routeTimer = void 0;
       this.destroyed = false;
-      this.shimListener = void 0;
+      this.shimMutationObserver = void 0;
+      this.shimLastSequence = 0;
     }
     async start() {
       if (this.routeTimer !== void 0) throw new Error("扩展路由协调器已经启动");
-      this.shimListener = (event) => {
-        if (event?.detail && typeof event.detail === "object") {
-          this.diagnostics?.log("live.buffer.retained", event.detail);
-        }
-      };
-      this.documentObject.addEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
+      if (typeof MutationObserver === "function" && this.documentObject.documentElement !== null) {
+        this.shimMutationObserver = new MutationObserver(() => {
+          const root = this.documentObject.documentElement;
+          if (root === null) return;
+          const seq = Number.parseInt(root.getAttribute(SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE) || "0", 10);
+          if (!Number.isInteger(seq) || seq <= this.shimLastSequence) return;
+          this.shimLastSequence = seq;
+          const raw = root.getAttribute(SHIM_OBSERVATION_ATTRIBUTE);
+          if (raw === null) return;
+          try {
+            const detail = JSON.parse(raw);
+            if (detail !== null && typeof detail === "object") {
+              this.diagnostics?.log("live.buffer.retained", detail);
+            }
+          } catch {
+          }
+        });
+        this.shimMutationObserver.observe(this.documentObject.documentElement, {
+          attributes: true,
+          attributeFilter: [SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE]
+        });
+      }
       this.diagnostics?.log("extension.started", { action: "coordinator" });
       this.preferences = await readPreferences(this.storage);
       this.diagnostics?.log("preference.read", {
@@ -3201,9 +3219,9 @@
       this.routeAbort?.abort();
       if (this.routeTimer !== void 0) this.runtimeObject.clearInterval(this.routeTimer);
       this.routeTimer = void 0;
-      if (this.shimListener !== void 0) {
-        this.documentObject.removeEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
-        this.shimListener = void 0;
+      if (this.shimMutationObserver !== void 0) {
+        this.shimMutationObserver.disconnect();
+        this.shimMutationObserver = void 0;
       }
       await this.teardownActive();
       this.diagnostics?.log("extension.destroyed", { action: "coordinator" });

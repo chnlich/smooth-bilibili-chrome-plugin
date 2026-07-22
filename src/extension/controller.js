@@ -11,7 +11,7 @@ import {
   getCurrentStatusSurface,
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
-import { SHIM_OBSERVATION_EVENT } from './bridge-contract.js';
+import { SHIM_OBSERVATION_ATTRIBUTE, SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE } from './bridge-contract.js';
 
 export function isLivePage(locationObject) {
   return locationObject.hostname === 'live.bilibili.com';
@@ -161,17 +161,33 @@ export class ExtensionCoordinator {
     this.routeAbort = undefined;
     this.routeTimer = undefined;
     this.destroyed = false;
-    this.shimListener = undefined;
+    this.shimMutationObserver = undefined;
+    this.shimLastSequence = 0;
   }
 
   async start() {
     if (this.routeTimer !== undefined) throw new Error('扩展路由协调器已经启动');
-    this.shimListener = (event) => {
-      if (event?.detail && typeof event.detail === 'object') {
-        this.diagnostics?.log('live.buffer.retained', event.detail);
-      }
-    };
-    this.documentObject.addEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
+    if (typeof MutationObserver === 'function' && this.documentObject.documentElement !== null) {
+      this.shimMutationObserver = new MutationObserver(() => {
+        const root = this.documentObject.documentElement;
+        if (root === null) return;
+        const seq = Number.parseInt(root.getAttribute(SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE) || '0', 10);
+        if (!Number.isInteger(seq) || seq <= this.shimLastSequence) return;
+        this.shimLastSequence = seq;
+        const raw = root.getAttribute(SHIM_OBSERVATION_ATTRIBUTE);
+        if (raw === null) return;
+        try {
+          const detail = JSON.parse(raw);
+          if (detail !== null && typeof detail === 'object') {
+            this.diagnostics?.log('live.buffer.retained', detail);
+          }
+        } catch { /* malformed observation payload */ }
+      });
+      this.shimMutationObserver.observe(this.documentObject.documentElement, {
+        attributes: true,
+        attributeFilter: [SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE],
+      });
+    }
     this.diagnostics?.log('extension.started', { action: 'coordinator' });
     this.preferences = await readPreferences(this.storage);
     this.diagnostics?.log('preference.read', {
@@ -400,9 +416,9 @@ export class ExtensionCoordinator {
     this.routeAbort?.abort();
     if (this.routeTimer !== undefined) this.runtimeObject.clearInterval(this.routeTimer);
     this.routeTimer = undefined;
-    if (this.shimListener !== undefined) {
-      this.documentObject.removeEventListener(SHIM_OBSERVATION_EVENT, this.shimListener);
-      this.shimListener = undefined;
+    if (this.shimMutationObserver !== undefined) {
+      this.shimMutationObserver.disconnect();
+      this.shimMutationObserver = undefined;
     }
     await this.teardownActive();
     this.diagnostics?.log('extension.destroyed', { action: 'coordinator' });

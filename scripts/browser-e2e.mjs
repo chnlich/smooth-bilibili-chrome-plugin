@@ -1042,6 +1042,80 @@ try {
   assertNoForbiddenExtensionMediaWrites(await livePage.evaluate(() => window.__e2eAudit.extensionOwnership()));
   markScenario('unrelated keyboard input does not touch playback ownership');
 
+  const retentionResult = await livePage.evaluate(async () => {
+    const shim = window.__smoothBufferShim;
+    if (!shim?.installed) throw new Error('SourceBuffer.remove hook 未安装');
+    if (typeof SourceBuffer.prototype.remove !== 'function') throw new Error('SourceBuffer.prototype.remove 不可用');
+    const nativeMarker = SourceBuffer.prototype.remove.toString().includes('[native code]');
+    if (nativeMarker) throw new Error('SourceBuffer.prototype.remove 仍是原生实现');
+    const probeVideo = document.createElement('video');
+    probeVideo.muted = true;
+    document.body.append(probeVideo);
+    Object.defineProperty(probeVideo, 'currentTime', { value: 100, configurable: true, writable: true });
+    const mediaSource = new MediaSource();
+    const url = URL.createObjectURL(mediaSource);
+    probeVideo.src = url;
+    await new Promise((resolve, reject) => {
+      mediaSource.addEventListener('sourceopen', resolve, { once: true });
+      mediaSource.addEventListener('error', reject, { once: true });
+      setTimeout(() => reject(new Error('fixture retention probe sourceopen 超时')), 5000);
+    });
+    const sourceBuffer = mediaSource.addSourceBuffer('video/webm;codecs=vp8');
+    const tick = () => new Promise((r) => setTimeout(r, 50));
+    const callsBeforePass = shim.stats.removeCalls;
+    const interceptedBeforePass = shim.stats.intercepted;
+    try { sourceBuffer.remove(0, 60); } catch { /* empty buffer native remove throws */ }
+    await tick();
+    const passCalls = shim.stats.removeCalls - callsBeforePass;
+    const passIntercepted = shim.stats.intercepted - interceptedBeforePass;
+    sourceBuffer.remove(75, 95);
+    await tick();
+    const skipIntercepted = shim.stats.intercepted - interceptedBeforePass - passIntercepted;
+    const skipReason = shim.stats.lastReason;
+    const interceptedBeforeTrunc = shim.stats.intercepted;
+    try { sourceBuffer.remove(60, 90); } catch { /* empty buffer native remove throws */ }
+    await tick();
+    const truncIntercepted = shim.stats.intercepted - interceptedBeforeTrunc;
+    const truncReason = shim.stats.lastReason;
+    probeVideo.remove();
+    URL.revokeObjectURL(url);
+    return {
+      passCalls, passIntercepted,
+      skipIntercepted, skipReason,
+      truncIntercepted, truncReason,
+      retainSeconds: shim.retainSeconds,
+    };
+  });
+  assert.equal(retentionResult.retainSeconds, 30);
+  assert.equal(retentionResult.passIntercepted, 0);
+  assert.ok(retentionResult.passCalls >= 1, JSON.stringify(retentionResult));
+  assert.equal(retentionResult.skipIntercepted, 1);
+  assert.equal(retentionResult.skipReason, 'skipped');
+  assert.equal(retentionResult.truncIntercepted, 1);
+  assert.equal(retentionResult.truncReason, 'truncated');
+  const shimAttributes = await livePage.evaluate(() => {
+    const root = document.documentElement;
+    return {
+      seq: root.getAttribute('data-bilibili-buffer-shim-seq'),
+      data: root.getAttribute('data-bilibili-buffer-shim-observation'),
+    };
+  });
+  assert.ok(shimAttributes.seq !== null, 'shim 没有设置 sequence 属性');
+  assert.ok(shimAttributes.data !== null, 'shim 没有设置 observation 属性');
+  const retainedPayload = JSON.parse(shimAttributes.data);
+  assert.ok(retainedPayload.reason === 'truncated' || retainedPayload.reason === 'skipped');
+  await livePage.waitForTimeout(500);
+  stored = await readStoredEvents(context, extensionId);
+  const retainedEvents = stored.events.filter((event) => event.code === 'live.buffer.retained');
+  assert.ok(retainedEvents.length > 0, 'live.buffer.retained 事件未持久化: seq=' + shimAttributes.seq);
+  assert.ok(retainedEvents.some((event) => event.data.reason === 'truncated'), JSON.stringify(retainedEvents));
+  assert.ok(retainedEvents.some((event) => event.data.reason === 'skipped'), JSON.stringify(retainedEvents));
+  for (const event of retainedEvents) {
+    assert.equal(event.data.retainSeconds, 30);
+    assert.equal(typeof event.data.currentTime, 'number');
+  }
+  markScenario('SourceBuffer.remove hook 保留 30 秒直播缓冲');
+
   stored = await readStoredEvents(context, extensionId);
   assert.ok(stored.events.some((event) => event.code === 'live.delay.corrected'));
   assert.ok(stored.events.some((event) => event.code === 'media.volumechange' && event.data.eventType === 'volumechange'));
