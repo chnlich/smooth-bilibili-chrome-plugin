@@ -418,7 +418,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-66877514e0dc85691799fb9b" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-a9b2b50da63db8ab6164b02c" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -2830,8 +2830,19 @@
     if (isVideoPage(locationObject)) return "video";
     return void 0;
   }
+  function collectSameOriginVideos(documentObject) {
+    const videos = [...documentObject.querySelectorAll("video")];
+    for (const iframe of documentObject.querySelectorAll("iframe")) {
+      try {
+        const iframeDocument = iframe.contentDocument;
+        if (iframeDocument !== null) videos.push(...iframeDocument.querySelectorAll("video"));
+      } catch {
+      }
+    }
+    return videos;
+  }
   function findLargestVideo(documentObject) {
-    const videos = [...documentObject.querySelectorAll("video")].filter((video) => video.isConnected !== false);
+    const videos = collectSameOriginVideos(documentObject).filter((video) => video.isConnected !== false);
     return videos.sort((left, right) => {
       const leftArea = (left.clientWidth || 0) * (left.clientHeight || 0);
       const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);

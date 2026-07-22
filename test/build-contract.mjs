@@ -136,14 +136,14 @@ assert.deepEqual(manifest.content_scripts, [
     matches: [...EXTENSION_MANIFEST.matches],
     js: ['main-bridge.js'],
     run_at: 'document_start',
-    all_frames: true,
+    all_frames: false,
     world: 'MAIN',
   },
   {
     matches: [...EXTENSION_MANIFEST.matches],
     js: ['controller.js'],
     run_at: 'document_start',
-    all_frames: true,
+    all_frames: false,
     world: 'ISOLATED',
   },
 ]);

@@ -100,10 +100,19 @@
   var activeCoreRecord;
   function pagePlayerObject() {
     const player = globalThis.player;
-    if (player === void 0 || player === null || typeof player !== "object" && typeof player !== "function") {
-      throw Object.assign(new Error("window.player 尚未可用"), { code: "PLAYER_UNAVAILABLE" });
+    if (player !== void 0 && player !== null && (typeof player === "object" || typeof player === "function")) {
+      return player;
     }
-    return player;
+    for (const iframe of document.querySelectorAll("iframe")) {
+      try {
+        const iframePlayer = iframe.contentWindow?.player;
+        if (iframePlayer !== void 0 && iframePlayer !== null && (typeof iframePlayer === "object" || typeof iframePlayer === "function")) {
+          return iframePlayer;
+        }
+      } catch {
+      }
+    }
+    throw Object.assign(new Error("window.player 尚未可用"), { code: "PLAYER_UNAVAILABLE" });
   }
   function pagePlayer() {
     const player = pagePlayerObject();
@@ -136,6 +145,13 @@
   }
   function findLargestVideo() {
     const videos = [...document.querySelectorAll("video")];
+    for (const iframe of document.querySelectorAll("iframe")) {
+      try {
+        const iframeDocument = iframe.contentDocument;
+        if (iframeDocument !== null) videos.push(...iframeDocument.querySelectorAll("video"));
+      } catch {
+      }
+    }
     if (videos.length === 0) {
       return void 0;
     }
@@ -176,12 +192,24 @@
     return args;
   }
   function livePlayerCandidates() {
-    return [
-      globalThis.EmbedPlayer?.instance,
-      globalThis.livePlayer,
-      globalThis.__PLAYER_GLOBAL_INSTANCE__,
-      globalThis.player
-    ].filter((candidate) => candidate !== void 0 && candidate !== null);
+    const windows = [globalThis];
+    for (const iframe of document.querySelectorAll("iframe")) {
+      try {
+        const contentWindow = iframe.contentWindow;
+        if (contentWindow !== null) windows.push(contentWindow);
+      } catch {
+      }
+    }
+    const candidates = [];
+    for (const windowObject of windows) {
+      candidates.push(
+        windowObject.__PLAYER_GLOBAL_INSTANCE__,
+        windowObject.EmbedPlayer?.instance,
+        windowObject.livePlayer,
+        windowObject.player
+      );
+    }
+    return candidates.filter((candidate) => candidate !== void 0 && candidate !== null);
   }
   function liveAutoCatchupCandidate() {
     return livePlayerCandidates().find((candidate) => BRIDGE_LIVE_METHODS.some((method) => typeof candidate?.[method] === "function"));
