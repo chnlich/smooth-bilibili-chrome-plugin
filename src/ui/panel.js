@@ -8,6 +8,7 @@ const VIDEO_FIELDS = Object.freeze([
   'state',
   'buffered',
   'target',
+  'effective',
   'error',
 ]);
 const LIVE_FIELDS = Object.freeze([
@@ -16,6 +17,7 @@ const LIVE_FIELDS = Object.freeze([
   'recentFrame',
   'buffered',
   'delay',
+  'effective',
   'resolution',
   'quality',
   'speed',

@@ -3,13 +3,14 @@ import { logSessionFragment } from '../diagnostics/log-session.js';
 
 const MESSAGE_VERSION = 2;
 const PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
-const VIDEO_FIELDS = Object.freeze(['mode', 'state', 'buffered', 'target', 'error']);
+const VIDEO_FIELDS = Object.freeze(['mode', 'state', 'buffered', 'target', 'effective', 'error']);
 const LIVE_FIELDS = Object.freeze([
   'mode',
   'paused',
   'recentFrame',
   'buffered',
   'delay',
+  'effective',
   'resolution',
   'quality',
   'speed',

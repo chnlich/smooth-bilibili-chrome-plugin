@@ -24,6 +24,7 @@ export const LIVE_CONFIG = Object.freeze({
   userSeekAuthorizationMilliseconds: 1000,
   correctionToleranceSeconds: 2.5,
   statusRefreshMilliseconds: 500,
+  delayUnavailableCheckMilliseconds: 5000,
 });
 
 export const DIAGNOSTIC_MESSAGE_VERSION = 1;

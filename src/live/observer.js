@@ -187,6 +187,8 @@ export class LiveObserver {
     this.frameCanvas = undefined;
     this.overlayCanvas = undefined;
     this.autoCatchupAttempted = false;
+    this.delayUnavailableTimer = undefined;
+    this.delayUnavailableEmitted = false;
     this.liveCapabilities = undefined;
     this.liveCapabilitiesPromise = undefined;
     this.boundUserInput = (event) => this.noteUserInput(event);
@@ -323,6 +325,9 @@ export class LiveObserver {
     }
     this.diagnostics?.markVideoAvailable();
     this.diagnostics?.log('video.attached', { source: this.sourceKey }, undefined, this.context());
+    this.autoCatchupAttempted = false;
+    this.delayUnavailableEmitted = false;
+    this.clearDelayUnavailableTimer();
     this.recorder = new MediaEventRecorder({
       video,
       logger: this.diagnostics,
@@ -344,6 +349,9 @@ export class LiveObserver {
     this.sourceKey = nextSource;
     this.sourceInstance += 1;
     this.lastDecodedMediaTime = undefined;
+    this.autoCatchupAttempted = false;
+    this.delayUnavailableEmitted = false;
+    this.clearDelayUnavailableTimer();
     if (previousSource !== '') this.sourceReplacements += 1;
     if (this.activeStall === undefined) this.hasDecodedFrame = false;
     if (this.activeStall !== undefined) this.showOverlay();
@@ -399,9 +407,11 @@ export class LiveObserver {
       this.lastCorrection.videoInstance === this.videoInstance &&
       this.lastCorrection.sourceInstance === this.sourceInstance) this.lastCorrection = undefined;
     const wasAwaiting = this.awaitingUserSeekFrame;
+    const firstFrameForInstance = !this.hasDecodedFrame;
     this.hasDecodedFrame = true;
     this.lastDecodedAtMilliseconds = nowMilliseconds(this.runtimeObject);
     if (Number.isFinite(mediaTime)) this.lastDecodedMediaTime = mediaTime;
+    if (firstFrameForInstance) this.scheduleDelayUnavailableCheck();
     this.captureFrame(video);
     this.hideOverlay();
     if (wasAwaiting) this.awaitingUserSeekFrame = false;
@@ -837,6 +847,18 @@ export class LiveObserver {
           return UNKNOWN;
         }
       })(),
+      effective: video === undefined ? UNKNOWN : (() => {
+        try {
+          const delay = delayFromSeekable(video);
+          if (!Number.isFinite(delay)) return '失活(seekable 不可读)';
+          if (this.activeStall !== undefined || this.delayProtection !== undefined) {
+            return `保护中(实测延迟${Math.round(delay)}s)`;
+          }
+          return `监测中(延迟${Math.round(delay)}s)`;
+        } catch {
+          return '失活(seekable 不可读)';
+        }
+      })(),
       resolution,
       quality: UNKNOWN,
       speed: Number.isFinite(video?.playbackRate) ? `${video.playbackRate}×` : UNKNOWN,
@@ -883,6 +905,29 @@ export class LiveObserver {
     this.frameCanvas = undefined;
   }
 
+  clearDelayUnavailableTimer() {
+    if (this.delayUnavailableTimer !== undefined) {
+      this.runtimeObject.clearTimeout(this.delayUnavailableTimer);
+      this.delayUnavailableTimer = undefined;
+    }
+  }
+
+  scheduleDelayUnavailableCheck() {
+    if (this.delayUnavailableEmitted || this.delayUnavailableTimer !== undefined) return;
+    this.delayUnavailableTimer = this.runtimeObject.setTimeout(() => {
+      this.delayUnavailableTimer = undefined;
+      if (this.destroyed || this.video === undefined) return;
+      const delay = delayOrUnknown(this.video, this.diagnostics, 'delay-unavailable-check', this.context());
+      if (Number.isFinite(delay)) return;
+      this.delayUnavailableEmitted = true;
+      this.diagnostics?.log('live.delay.unavailable', {
+        reason: 'seekable_unreadable',
+        waitedSeconds: this.config.delayUnavailableCheckMilliseconds / 1000,
+        status: 'unavailable',
+      }, undefined, this.context());
+    }, this.config.delayUnavailableCheckMilliseconds);
+  }
+
   destroy() {
     if (this.destroyed) return;
     this.diagnostics?.log('video.destroyed', { reason: 'live_observer_destroyed' }, undefined, this.context());
@@ -896,6 +941,7 @@ export class LiveObserver {
     this.recorder = undefined;
     if (this.statusTimer !== undefined) this.runtimeObject.clearInterval(this.statusTimer);
     this.statusTimer = undefined;
+    this.clearDelayUnavailableTimer();
     this.hideOverlay();
     this.frameCanvas = undefined;
     this.videoParent = undefined;

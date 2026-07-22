@@ -1,6 +1,7 @@
 import {
   assertOperation,
   BRIDGE_CORE_SYNC_METHODS,
+  BRIDGE_LIVE_DISABLE_ARGS,
   BRIDGE_LIVE_METHODS,
   BRIDGE_REQUEST_EVENT,
   BRIDGE_RESPONSE_ATTRIBUTE,
@@ -105,9 +106,9 @@ function requireArguments(args, count) {
 
 function livePlayerCandidates() {
   return [
-    globalThis.__PLAYER_GLOBAL_INSTANCE__,
     globalThis.EmbedPlayer?.instance,
     globalThis.livePlayer,
+    globalThis.__PLAYER_GLOBAL_INSTANCE__,
     globalThis.player,
   ].filter((candidate) => candidate !== undefined && candidate !== null);
 }
@@ -133,12 +134,21 @@ async function disableLiveAutoCatchup() {
       code: 'LIVE_AUTO_CATCHUP_UNAVAILABLE',
     });
   }
+  const applied = [];
   for (const method of BRIDGE_LIVE_METHODS) {
-    if (typeof candidate[method] === 'function') {
-      await candidate[method]({ enable: false });
+    if (typeof candidate[method] !== 'function') continue;
+    const args = BRIDGE_LIVE_DISABLE_ARGS[method];
+    try {
+      await candidate[method](args);
+      applied.push(method);
+    } catch (error) {
+      throw Object.assign(new Error(`关闭自动追赶方法 ${method} 调用失败: ${error?.message || error}`), {
+        code: 'LIVE_AUTO_CATCHUP_FAILED',
+        cause: error,
+      });
     }
   }
-  return true;
+  return { applied };
 }
 
 function callCoreSync(args) {

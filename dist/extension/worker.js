@@ -20,7 +20,8 @@
     noDecodedFrameStallMilliseconds: 2e3,
     userSeekAuthorizationMilliseconds: 1e3,
     correctionToleranceSeconds: 2.5,
-    statusRefreshMilliseconds: 500
+    statusRefreshMilliseconds: 500,
+    delayUnavailableCheckMilliseconds: 5e3
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -72,10 +73,12 @@
     "video.buffer_hint.applied",
     "video.buffer_hint.unsupported",
     "video.buffer_hint.failed",
+    "video.buffer_observed",
     "live.stall.detected",
     "live.stall.recovered",
     "live.delay.observed",
     "live.delay.corrected",
+    "live.delay.unavailable",
     "live.source_replaced",
     "live.delay_protection.capability",
     "live.delay_protection.applied",
@@ -120,6 +123,9 @@
       "state",
       "targetSeconds",
       "actualSeconds",
+      "peakSeconds",
+      "sampledSeconds",
+      "samples",
       "reason"
     ]),
     media: Object.freeze([
@@ -162,7 +168,8 @@
       "videoInstance",
       "sourceInstance",
       "capability",
-      "status"
+      "status",
+      "waitedSeconds"
     ]),
     bridge: Object.freeze(["operation", "direction", "status"]),
     extension: Object.freeze(["action", "reason", "status"]),
@@ -298,7 +305,18 @@
     }
     if (field === "enabled") return value === true || value === false ? value : UNKNOWN_VALUE;
     if (field === "message") return scrubErrorText(value);
+    if (field === "samples") return safeSampleList(value);
     return safeScalar(value);
+  }
+  function safeSampleList(value) {
+    if (!Array.isArray(value)) return UNKNOWN_VALUE;
+    const out = [];
+    for (const item of value) {
+      if (typeof item === "number" && Number.isFinite(item)) out.push(Math.round(item * 1e3) / 1e3);
+      else out.push(UNKNOWN_VALUE);
+      if (out.length >= 600) break;
+    }
+    return out;
   }
   function sanitizeEventData(code, data = {}) {
     assertEventCode(code);
@@ -484,9 +502,15 @@
     "disableLiveAutoCatchup"
   ]);
   var BRIDGE_LIVE_METHODS = Object.freeze([
+    "setChasingFrameThreshold",
     "setAutoSyncProgressCfg",
     "setAutoDiscardFrameCfg"
   ]);
+  var BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
+    setChasingFrameThreshold: 600,
+    setAutoSyncProgressCfg: { enable: false },
+    setAutoDiscardFrameCfg: { enable: false }
+  });
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function serializeError(error) {
     const errorCode = (value2) => {

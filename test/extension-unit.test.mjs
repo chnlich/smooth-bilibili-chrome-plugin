@@ -87,6 +87,7 @@ test('video status surface exposes exactly the approved snapshot fields', () => 
     state: 'APPLIED',
     buffered: '8.0 秒',
     target: '120 秒',
+    effective: '已应用(目标120s, 实测峰值8s)',
     error: '未提供',
     recentEvent: 'playing',
     sessionId: 'unapproved-session',
@@ -100,6 +101,7 @@ test('video status surface exposes exactly the approved snapshot fields', () => 
     'state',
     'buffered',
     'target',
+    'effective',
     'error',
   ]);
   assert.equal(Object.hasOwn(snapshot, 'recentEvent'), false);
@@ -153,7 +155,11 @@ test('popup diagnostics session request is a fixed narrow message and never expa
 
 test('bridge contract allows only native video hint and narrow live capability operations', () => {
   assert.deepEqual(BRIDGE_CORE_SYNC_METHODS, ['setStableBufferTime']);
-  assert.deepEqual(BRIDGE_LIVE_METHODS, ['setAutoSyncProgressCfg', 'setAutoDiscardFrameCfg']);
+  assert.deepEqual(BRIDGE_LIVE_METHODS, [
+    'setChasingFrameThreshold',
+    'setAutoSyncProgressCfg',
+    'setAutoDiscardFrameCfg',
+  ]);
   assert.deepEqual(BRIDGE_OPERATIONS, [
     'getCoreSnapshot',
     'callCoreSync',

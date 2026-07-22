@@ -111,7 +111,19 @@ function sanitizeField(field, value) {
   }
   if (field === 'enabled') return value === true || value === false ? value : UNKNOWN_VALUE;
   if (field === 'message') return scrubErrorText(value);
+  if (field === 'samples') return safeSampleList(value);
   return safeScalar(value);
+}
+
+function safeSampleList(value) {
+  if (!Array.isArray(value)) return UNKNOWN_VALUE;
+  const out = [];
+  for (const item of value) {
+    if (typeof item === 'number' && Number.isFinite(item)) out.push(Math.round(item * 1000) / 1000);
+    else out.push(UNKNOWN_VALUE);
+    if (out.length >= 600) break;
+  }
+  return out;
 }
 
 export function sanitizeEventData(code, data = {}) {

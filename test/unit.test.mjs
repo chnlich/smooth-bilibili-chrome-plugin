@@ -148,6 +148,8 @@ function runtimeWithIntervals() {
       return callback;
     },
     clearInterval() {},
+    setTimeout() { return 1; },
+    clearTimeout() {},
     callbacks,
   };
 }

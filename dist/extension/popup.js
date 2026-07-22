@@ -20,7 +20,8 @@
     noDecodedFrameStallMilliseconds: 2e3,
     userSeekAuthorizationMilliseconds: 1e3,
     correctionToleranceSeconds: 2.5,
-    statusRefreshMilliseconds: 500
+    statusRefreshMilliseconds: 500,
+    delayUnavailableCheckMilliseconds: 5e3
   });
 
   // src/diagnostics/log-session.js
@@ -33,13 +34,14 @@
   // src/extension/popup.js
   var MESSAGE_VERSION = 2;
   var PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
-  var VIDEO_FIELDS = Object.freeze(["mode", "state", "buffered", "target", "error"]);
+  var VIDEO_FIELDS = Object.freeze(["mode", "state", "buffered", "target", "effective", "error"]);
   var LIVE_FIELDS = Object.freeze([
     "mode",
     "paused",
     "recentFrame",
     "buffered",
     "delay",
+    "effective",
     "resolution",
     "quality",
     "speed",

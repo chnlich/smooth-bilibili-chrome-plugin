@@ -21,7 +21,8 @@
     noDecodedFrameStallMilliseconds: 2e3,
     userSeekAuthorizationMilliseconds: 1e3,
     correctionToleranceSeconds: 2.5,
-    statusRefreshMilliseconds: 500
+    statusRefreshMilliseconds: 500,
+    delayUnavailableCheckMilliseconds: 5e3
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -73,10 +74,12 @@
     "video.buffer_hint.applied",
     "video.buffer_hint.unsupported",
     "video.buffer_hint.failed",
+    "video.buffer_observed",
     "live.stall.detected",
     "live.stall.recovered",
     "live.delay.observed",
     "live.delay.corrected",
+    "live.delay.unavailable",
     "live.source_replaced",
     "live.delay_protection.capability",
     "live.delay_protection.applied",
@@ -121,6 +124,9 @@
       "state",
       "targetSeconds",
       "actualSeconds",
+      "peakSeconds",
+      "sampledSeconds",
+      "samples",
       "reason"
     ]),
     media: Object.freeze([
@@ -163,7 +169,8 @@
       "videoInstance",
       "sourceInstance",
       "capability",
-      "status"
+      "status",
+      "waitedSeconds"
     ]),
     bridge: Object.freeze(["operation", "direction", "status"]),
     extension: Object.freeze(["action", "reason", "status"]),
@@ -274,7 +281,18 @@
     }
     if (field === "enabled") return value === true || value === false ? value : UNKNOWN_VALUE;
     if (field === "message") return scrubErrorText(value);
+    if (field === "samples") return safeSampleList(value);
     return safeScalar(value);
+  }
+  function safeSampleList(value) {
+    if (!Array.isArray(value)) return UNKNOWN_VALUE;
+    const out = [];
+    for (const item of value) {
+      if (typeof item === "number" && Number.isFinite(item)) out.push(Math.round(item * 1e3) / 1e3);
+      else out.push(UNKNOWN_VALUE);
+      if (out.length >= 600) break;
+    }
+    return out;
   }
   function sanitizeEventData(code, data = {}) {
     assertEventCode(code);
@@ -400,7 +418,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-1b5f6968dd2df1743521c88b" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-6429d130a987c11c6f0fd3eb" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -474,9 +492,15 @@
     "disableLiveAutoCatchup"
   ]);
   var BRIDGE_LIVE_METHODS = Object.freeze([
+    "setChasingFrameThreshold",
     "setAutoSyncProgressCfg",
     "setAutoDiscardFrameCfg"
   ]);
+  var BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
+    setChasingFrameThreshold: 600,
+    setAutoSyncProgressCfg: { enable: false },
+    setAutoDiscardFrameCfg: { enable: false }
+  });
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function encodeMessage(message) {
     return JSON.stringify(message);
@@ -1270,6 +1294,8 @@
       this.frameCanvas = void 0;
       this.overlayCanvas = void 0;
       this.autoCatchupAttempted = false;
+      this.delayUnavailableTimer = void 0;
+      this.delayUnavailableEmitted = false;
       this.liveCapabilities = void 0;
       this.liveCapabilitiesPromise = void 0;
       this.boundUserInput = (event) => this.noteUserInput(event);
@@ -1397,6 +1423,9 @@
       }
       this.diagnostics?.markVideoAvailable();
       this.diagnostics?.log("video.attached", { source: this.sourceKey }, void 0, this.context());
+      this.autoCatchupAttempted = false;
+      this.delayUnavailableEmitted = false;
+      this.clearDelayUnavailableTimer();
       this.recorder = new MediaEventRecorder({
         video,
         logger: this.diagnostics,
@@ -1417,6 +1446,9 @@
       this.sourceKey = nextSource;
       this.sourceInstance += 1;
       this.lastDecodedMediaTime = void 0;
+      this.autoCatchupAttempted = false;
+      this.delayUnavailableEmitted = false;
+      this.clearDelayUnavailableTimer();
       if (previousSource !== "") this.sourceReplacements += 1;
       if (this.activeStall === void 0) this.hasDecodedFrame = false;
       if (this.activeStall !== void 0) this.showOverlay();
@@ -1463,9 +1495,11 @@
       if (this.activeStall !== void 0 && Number.isFinite(mediaTime) && Number.isFinite(this.activeStall.lastDecodedMediaTime) && mediaTime <= this.activeStall.lastDecodedMediaTime + FRAME_PROGRESS_EPSILON_SECONDS) return;
       if (this.lastCorrection !== void 0 && this.lastCorrection.video === video && this.lastCorrection.videoInstance === this.videoInstance && this.lastCorrection.sourceInstance === this.sourceInstance) this.lastCorrection = void 0;
       const wasAwaiting = this.awaitingUserSeekFrame;
+      const firstFrameForInstance = !this.hasDecodedFrame;
       this.hasDecodedFrame = true;
       this.lastDecodedAtMilliseconds = nowMilliseconds(this.runtimeObject);
       if (Number.isFinite(mediaTime)) this.lastDecodedMediaTime = mediaTime;
+      if (firstFrameForInstance) this.scheduleDelayUnavailableCheck();
       this.captureFrame(video);
       this.hideOverlay();
       if (wasAwaiting) this.awaitingUserSeekFrame = false;
@@ -1875,6 +1909,18 @@
             return UNKNOWN;
           }
         })(),
+        effective: video === void 0 ? UNKNOWN : (() => {
+          try {
+            const delay = delayFromSeekable(video);
+            if (!Number.isFinite(delay)) return "失活(seekable 不可读)";
+            if (this.activeStall !== void 0 || this.delayProtection !== void 0) {
+              return `保护中(实测延迟${Math.round(delay)}s)`;
+            }
+            return `监测中(延迟${Math.round(delay)}s)`;
+          } catch {
+            return "失活(seekable 不可读)";
+          }
+        })(),
         resolution,
         quality: UNKNOWN,
         speed: Number.isFinite(video?.playbackRate) ? `${video.playbackRate}×` : UNKNOWN,
@@ -1916,6 +1962,27 @@
       this.hasDecodedFrame = false;
       this.frameCanvas = void 0;
     }
+    clearDelayUnavailableTimer() {
+      if (this.delayUnavailableTimer !== void 0) {
+        this.runtimeObject.clearTimeout(this.delayUnavailableTimer);
+        this.delayUnavailableTimer = void 0;
+      }
+    }
+    scheduleDelayUnavailableCheck() {
+      if (this.delayUnavailableEmitted || this.delayUnavailableTimer !== void 0) return;
+      this.delayUnavailableTimer = this.runtimeObject.setTimeout(() => {
+        this.delayUnavailableTimer = void 0;
+        if (this.destroyed || this.video === void 0) return;
+        const delay = delayOrUnknown(this.video, this.diagnostics, "delay-unavailable-check", this.context());
+        if (Number.isFinite(delay)) return;
+        this.delayUnavailableEmitted = true;
+        this.diagnostics?.log("live.delay.unavailable", {
+          reason: "seekable_unreadable",
+          waitedSeconds: this.config.delayUnavailableCheckMilliseconds / 1e3,
+          status: "unavailable"
+        }, void 0, this.context());
+      }, this.config.delayUnavailableCheckMilliseconds);
+    }
     destroy() {
       if (this.destroyed) return;
       this.diagnostics?.log("video.destroyed", { reason: "live_observer_destroyed" }, void 0, this.context());
@@ -1929,6 +1996,7 @@
       this.recorder = void 0;
       if (this.statusTimer !== void 0) this.runtimeObject.clearInterval(this.statusTimer);
       this.statusTimer = void 0;
+      this.clearDelayUnavailableTimer();
       this.hideOverlay();
       this.frameCanvas = void 0;
       this.videoParent = void 0;
@@ -2047,6 +2115,9 @@
       this.message = WAITING_MESSAGE;
       this.reconcileTimer;
       this.statusTimer;
+      this.bufferSamplerTimer;
+      this.bufferSamples = [];
+      this.peakForwardSeconds = 0;
       this.started = false;
       this.destroyed = false;
     }
@@ -2158,6 +2229,7 @@
       this.updateStatus();
     }
     applyHintForGeneration(core) {
+      this.clearBufferSampler();
       try {
         if (core.supports("setStableBufferTime") !== true) {
           this.hintState = "UNSUPPORTED";
@@ -2188,6 +2260,7 @@
           targetSeconds: this.config.stableBufferSeconds,
           actualSeconds
         }, void 0, this.generationContext("buffer_hint"));
+        this.startBufferSampler();
       } catch (error) {
         if (error?.code === "BRIDGE_CORE_STALE") {
           this.currentCore = void 0;
@@ -2209,6 +2282,45 @@
     }
     readForwardBuffer() {
       return readNativeForwardBuffer(this.video);
+    }
+    clearBufferSampler() {
+      if (this.bufferSamplerTimer !== void 0) {
+        this.runtimeObject.clearInterval(this.bufferSamplerTimer);
+        this.bufferSamplerTimer = void 0;
+      }
+      this.bufferSamples = [];
+    }
+    startBufferSampler() {
+      this.clearBufferSampler();
+      const intervalMs = 1e3;
+      const maxSamples = 30;
+      let elapsed = 0;
+      this.bufferSamplerTimer = this.runtimeObject.setInterval(() => {
+        if (this.destroyed || !this.started) {
+          this.clearBufferSampler();
+          return;
+        }
+        elapsed += intervalMs;
+        let forward;
+        try {
+          forward = this.readForwardBuffer();
+        } catch {
+          forward = UNKNOWN_VALUE;
+        }
+        this.bufferSamples.push(Number.isFinite(forward) ? Math.round(forward * 1e3) / 1e3 : UNKNOWN_VALUE);
+        if (this.bufferSamples.length >= maxSamples) {
+          const samples = this.bufferSamples;
+          const finiteSamples = samples.filter((v) => typeof v === "number" && Number.isFinite(v));
+          const peakSeconds = finiteSamples.length > 0 ? Math.max(...finiteSamples) : UNKNOWN_VALUE;
+          this.clearBufferSampler();
+          this.diagnostics?.log("video.buffer_observed", {
+            targetSeconds: this.config.stableBufferSeconds,
+            sampledSeconds: maxSamples,
+            peakSeconds,
+            samples
+          }, void 0, this.generationContext("buffer_observed"));
+        }
+      }, intervalMs);
     }
     generationContext(reason) {
       return {
@@ -2240,14 +2352,27 @@
         return;
       }
       let inventory = "未提供";
+      let effective = "未提供";
       if (this.video !== void 0) {
-        inventory = `${this.readForwardBuffer().toFixed(1)} 秒`;
+        const forward = this.readForwardBuffer();
+        inventory = `${forward.toFixed(1)} 秒`;
+        if (Number.isFinite(forward) && forward > this.peakForwardSeconds) this.peakForwardSeconds = forward;
+        if (this.hintState === "APPLIED") {
+          effective = `已应用(目标${this.config.stableBufferSeconds}s, 实测峰值${this.peakForwardSeconds.toFixed(0)}s)`;
+        } else if (this.hintState === "UNSUPPORTED") {
+          effective = "不支持(setStableBufferTime 不可用)";
+        } else if (this.hintState === "FAILED") {
+          effective = "失败";
+        } else {
+          effective = "等待生效";
+        }
       }
       this.panel.setModel({
         mode: "视频",
         state: this.hintState,
         buffered: inventory,
         target: `${this.config.stableBufferSeconds} 秒`,
+        effective,
         error: this.message
       });
     }
@@ -2260,6 +2385,7 @@
       }
       this.destroyed = true;
       this.started = false;
+      this.clearBufferSampler();
       this.diagnostics?.log("video.destroyed", { reason: "controller_destroyed" }, void 0, this.generationContext("destroyed"));
       if (this.reconcileTimer !== void 0) {
         this.runtimeObject.clearInterval(this.reconcileTimer);
@@ -2282,6 +2408,7 @@
     "state",
     "buffered",
     "target",
+    "effective",
     "error"
   ]);
   var LIVE_FIELDS = Object.freeze([
@@ -2290,6 +2417,7 @@
     "recentFrame",
     "buffered",
     "delay",
+    "effective",
     "resolution",
     "quality",
     "speed",

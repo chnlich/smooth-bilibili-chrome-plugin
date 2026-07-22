@@ -11,9 +11,20 @@ export const BRIDGE_OPERATIONS = Object.freeze([
 ]);
 
 export const BRIDGE_LIVE_METHODS = Object.freeze([
+  'setChasingFrameThreshold',
   'setAutoSyncProgressCfg',
   'setAutoDiscardFrameCfg',
 ]);
+
+// 探测证实真实 Bilibili 直播播放器的自动追赶关闭杠杆是 setChasingFrameThreshold，
+// 它接受一个数值阈值（放大以容忍更大延迟、换取缓存）；setAutoSyncProgressCfg/
+// setAutoDiscardFrameCfg 在探测中不存在，保留为兜底候选。每个方法的"关闭自动追赶"
+// 调用参数形态不同，此处集中描述。
+export const BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
+  setChasingFrameThreshold: 600,
+  setAutoSyncProgressCfg: { enable: false },
+  setAutoDiscardFrameCfg: { enable: false },
+});
 
 export const BRIDGE_CORE_SYNC_METHODS = Object.freeze(['setStableBufferTime']);
 

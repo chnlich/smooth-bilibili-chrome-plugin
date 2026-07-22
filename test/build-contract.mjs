@@ -94,7 +94,7 @@ function extractBuildId(bundles) {
 }
 
 async function buildAndSnapshot() {
-  await execFileAsync(npmExecutable, ['run', 'build'], { cwd: root });
+  await execFileAsync(npmExecutable, ['run', 'build'], { cwd: root, shell: process.platform === 'win32' });
   const files = await snapshotExtensionOutput(extensionDirectory);
   const bundles = await Promise.all(
     ['controller.js', 'worker.js'].map((bundle) => fs.readFile(path.join(extensionDirectory, bundle), 'utf8')),
@@ -136,14 +136,14 @@ assert.deepEqual(manifest.content_scripts, [
     matches: [...EXTENSION_MANIFEST.matches],
     js: ['main-bridge.js'],
     run_at: 'document_start',
-    all_frames: false,
+    all_frames: true,
     world: 'MAIN',
   },
   {
     matches: [...EXTENSION_MANIFEST.matches],
     js: ['controller.js'],
     run_at: 'document_start',
-    all_frames: false,
+    all_frames: true,
     world: 'ISOLATED',
   },
 ]);
@@ -223,6 +223,10 @@ assert.equal(VOD_CONFIG.stableBufferSeconds, 120);
 assert.equal(LIVE_CONFIG.noDecodedFrameStallMilliseconds, 2000);
 assert.equal(EVENT_CODES.includes('log.persist.result'), true);
 assert.equal(EVENT_CODES.includes('live.delay_protection.applied'), true);
+assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
+assert.equal(EVENT_CODES.includes('live.delay.unavailable'), true);
+const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
+assert.match(bridgeContractSource, /setChasingFrameThreshold/);
 for (const mediaEvent of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${mediaEvent}`));
 assert.match(controller, /unlimitedStorage|diagnostic/);
 assert.match(logs, /showSaveFilePicker|createWritable|recordType/);

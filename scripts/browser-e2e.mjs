@@ -1098,7 +1098,7 @@ try {
   assert.deepEqual(
     await popupPage.locator('[data-status-field]:visible').evaluateAll((elements) =>
       elements.map((element) => element.dataset.statusField)),
-    ['mode', 'state', 'buffered', 'target', 'error'],
+    ['mode', 'state', 'buffered', 'target', 'effective', 'error'],
   );
   const videoSessionId = (await readStoredEvents(context, extensionId)).events
     .find((event) => event.code === 'route.session_started' && event.data?.pathname === '/video/BVpopup-fixture')?.sessionId;

@@ -66,6 +66,9 @@ export class VodBufferController {
     this.message = WAITING_MESSAGE;
     this.reconcileTimer;
     this.statusTimer;
+    this.bufferSamplerTimer;
+    this.bufferSamples = [];
+    this.peakForwardSeconds = 0;
     this.started = false;
     this.destroyed = false;
   }
@@ -180,6 +183,7 @@ export class VodBufferController {
   }
 
   applyHintForGeneration(core) {
+    this.clearBufferSampler();
     try {
       if (core.supports('setStableBufferTime') !== true) {
         this.hintState = 'UNSUPPORTED';
@@ -210,6 +214,7 @@ export class VodBufferController {
         targetSeconds: this.config.stableBufferSeconds,
         actualSeconds,
       }, undefined, this.generationContext('buffer_hint'));
+      this.startBufferSampler();
     } catch (error) {
       if (error?.code === 'BRIDGE_CORE_STALE') {
         this.currentCore = undefined;
@@ -232,6 +237,47 @@ export class VodBufferController {
 
   readForwardBuffer() {
     return readNativeForwardBuffer(this.video);
+  }
+
+  clearBufferSampler() {
+    if (this.bufferSamplerTimer !== undefined) {
+      this.runtimeObject.clearInterval(this.bufferSamplerTimer);
+      this.bufferSamplerTimer = undefined;
+    }
+    this.bufferSamples = [];
+  }
+
+  startBufferSampler() {
+    this.clearBufferSampler();
+    const intervalMs = 1000;
+    const maxSamples = 30;
+    let elapsed = 0;
+    this.bufferSamplerTimer = this.runtimeObject.setInterval(() => {
+      if (this.destroyed || !this.started) {
+        this.clearBufferSampler();
+        return;
+      }
+      elapsed += intervalMs;
+      let forward;
+      try {
+        forward = this.readForwardBuffer();
+      } catch {
+        forward = UNKNOWN_VALUE;
+      }
+      this.bufferSamples.push(Number.isFinite(forward) ? Math.round(forward * 1000) / 1000 : UNKNOWN_VALUE);
+      if (this.bufferSamples.length >= maxSamples) {
+        const samples = this.bufferSamples;
+        const finiteSamples = samples.filter((v) => typeof v === 'number' && Number.isFinite(v));
+        const peakSeconds = finiteSamples.length > 0 ? Math.max(...finiteSamples) : UNKNOWN_VALUE;
+        this.clearBufferSampler();
+        this.diagnostics?.log('video.buffer_observed', {
+          targetSeconds: this.config.stableBufferSeconds,
+          sampledSeconds: maxSamples,
+          peakSeconds,
+          samples,
+        }, undefined, this.generationContext('buffer_observed'));
+      }
+    }, intervalMs);
   }
 
   generationContext(reason) {
@@ -266,14 +312,27 @@ export class VodBufferController {
       return;
     }
     let inventory = '未提供';
+    let effective = '未提供';
     if (this.video !== undefined) {
-      inventory = `${this.readForwardBuffer().toFixed(1)} 秒`;
+      const forward = this.readForwardBuffer();
+      inventory = `${forward.toFixed(1)} 秒`;
+      if (Number.isFinite(forward) && forward > this.peakForwardSeconds) this.peakForwardSeconds = forward;
+      if (this.hintState === 'APPLIED') {
+        effective = `已应用(目标${this.config.stableBufferSeconds}s, 实测峰值${this.peakForwardSeconds.toFixed(0)}s)`;
+      } else if (this.hintState === 'UNSUPPORTED') {
+        effective = '不支持(setStableBufferTime 不可用)';
+      } else if (this.hintState === 'FAILED') {
+        effective = '失败';
+      } else {
+        effective = '等待生效';
+      }
     }
     this.panel.setModel({
       mode: '视频',
       state: this.hintState,
       buffered: inventory,
       target: `${this.config.stableBufferSeconds} 秒`,
+      effective,
       error: this.message,
     });
   }
@@ -288,6 +347,7 @@ export class VodBufferController {
     }
     this.destroyed = true;
     this.started = false;
+    this.clearBufferSampler();
     this.diagnostics?.log('video.destroyed', { reason: 'controller_destroyed' }, undefined, this.generationContext('destroyed'));
     if (this.reconcileTimer !== undefined) {
       this.runtimeObject.clearInterval(this.reconcileTimer);

@@ -11,9 +11,15 @@
     "disableLiveAutoCatchup"
   ]);
   var BRIDGE_LIVE_METHODS = Object.freeze([
+    "setChasingFrameThreshold",
     "setAutoSyncProgressCfg",
     "setAutoDiscardFrameCfg"
   ]);
+  var BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
+    setChasingFrameThreshold: 600,
+    setAutoSyncProgressCfg: { enable: false },
+    setAutoDiscardFrameCfg: { enable: false }
+  });
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function encodeMessage(message) {
     return JSON.stringify(message);
@@ -175,9 +181,9 @@
   }
   function livePlayerCandidates() {
     return [
-      globalThis.__PLAYER_GLOBAL_INSTANCE__,
       globalThis.EmbedPlayer?.instance,
       globalThis.livePlayer,
+      globalThis.__PLAYER_GLOBAL_INSTANCE__,
       globalThis.player
     ].filter((candidate) => candidate !== void 0 && candidate !== null);
   }
@@ -199,12 +205,21 @@
         code: "LIVE_AUTO_CATCHUP_UNAVAILABLE"
       });
     }
+    const applied = [];
     for (const method of BRIDGE_LIVE_METHODS) {
-      if (typeof candidate[method] === "function") {
-        await candidate[method]({ enable: false });
+      if (typeof candidate[method] !== "function") continue;
+      const args = BRIDGE_LIVE_DISABLE_ARGS[method];
+      try {
+        await candidate[method](args);
+        applied.push(method);
+      } catch (error) {
+        throw Object.assign(new Error(`关闭自动追赶方法 ${method} 调用失败: ${error?.message || error}`), {
+          code: "LIVE_AUTO_CATCHUP_FAILED",
+          cause: error
+        });
       }
     }
-    return true;
+    return { applied };
   }
   function callCoreSync(args) {
     const [coreId, method, methodArgs, source] = requireArguments(args, 4);
