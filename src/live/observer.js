@@ -3,7 +3,6 @@ import { serializeError } from '../extension/bridge-contract.js';
 import { MediaEventRecorder, readMediaFacts } from '../diagnostics/media.js';
 
 const UNKNOWN = '未提供';
-const CORRECTION_EVENT_TOLERANCE_SECONDS = 0.1;
 const CORRECTION_SETTLE_MILLISECONDS = 500;
 const FRAME_PROGRESS_EPSILON_SECONDS = 0.001;
 
@@ -384,7 +383,6 @@ export class LiveObserver {
       typeof video.requestVideoFrameCallback !== 'function') this.onDecodedFrame(video);
     if (name === 'emptied' && this.activeStall !== undefined) this.showOverlay();
     if (name === 'waiting' || name === 'stalled') this.maybeArmStall(name);
-    if (name === 'seeking') this.handleSeeking(video);
     if (name === 'loadedmetadata' || name === 'canplay' || name === 'loadeddata' || name === 'playing') {
       this.applyReplacementCorrection();
     }
@@ -470,85 +468,6 @@ export class LiveObserver {
       initialTime: Number.isFinite(this.video?.currentTime) ? this.video.currentTime : undefined,
       expiresAt: nowMilliseconds(this.runtimeObject) + this.config.userSeekAuthorizationMilliseconds,
     };
-  }
-
-  consumeUserSeekAuthorization(video) {
-    const authorization = this.userSeekAuthorization;
-    if (authorization === undefined) return false;
-    if (authorization.video !== video || nowMilliseconds(this.runtimeObject) > authorization.expiresAt) {
-      this.userSeekAuthorization = undefined;
-      return false;
-    }
-    if (!Number.isFinite(video.currentTime) ||
-      (authorization.initialTime !== undefined && video.currentTime === authorization.initialTime)) return false;
-    this.userSeekAuthorization = undefined;
-    return true;
-  }
-
-  handleSeeking(video) {
-    if (this.correcting || video !== this.video) return;
-    if (this.consumeUserSeekAuthorization(video)) {
-      this.cancelUserSeek();
-      return;
-    }
-    if (this.userSeekAuthorization !== undefined) {
-      const authorization = this.userSeekAuthorization;
-      if (this.consumeUserSeekAuthorization(video) || video.currentTime === authorization.initialTime) {
-        this.cancelUserSeek();
-      }
-      return;
-    }
-    const protection = this.activeStall || this.delayProtection;
-    if (protection === undefined || protection.video !== video ||
-      protection.videoInstance !== this.videoInstance || protection.sourceInstance !== this.sourceInstance ||
-      this.awaitingUserSeekFrame || video.paused !== false) return;
-    const protectedDelay = this.currentProtectedDelay();
-    const requestedTime = video.currentTime;
-    if (this.lastCorrection !== undefined) {
-      const correction = this.lastCorrection;
-      const correctionExpired = nowMilliseconds(this.runtimeObject) > correction.expiresAtMilliseconds;
-      const correctionMatches = correction.video === video &&
-        correction.videoInstance === this.videoInstance && correction.sourceInstance === this.sourceInstance;
-      if (correctionExpired || !correctionMatches) this.lastCorrection = undefined;
-      else if (Number.isFinite(requestedTime) &&
-        Math.abs(requestedTime - correction.target) <= CORRECTION_EVENT_TOLERANCE_SECONDS) return;
-    }
-    const requestedDelay = delayOrUnknown(video, this.diagnostics, 'seeking-delay-read', this.context());
-    if (!Number.isFinite(protectedDelay) || !Number.isFinite(requestedTime) || !Number.isFinite(requestedDelay) ||
-      requestedDelay >= protectedDelay) return;
-    let ranges;
-    try {
-      ranges = readSeekable(video);
-    } catch (error) {
-      this.diagnostics?.log('extension.observer_error', { reason: 'seekable-read' }, error, this.context());
-      return;
-    }
-    const target = seekablePositionForDelay(ranges, protectedDelay);
-    if (!Number.isFinite(target) || target >= requestedTime) return;
-    this.correcting = true;
-    try {
-      video.currentTime = target;
-      this.lastCorrection = {
-        video,
-        videoInstance: this.videoInstance,
-        sourceInstance: this.sourceInstance,
-        target: video.currentTime,
-        expiresAtMilliseconds: nowMilliseconds(this.runtimeObject) + CORRECTION_SETTLE_MILLISECONDS,
-      };
-      this.diagnostics?.log('live.delay.corrected', {
-        reason: 'automatic_forward_seek',
-        targetTime: target,
-        currentTime: requestedTime,
-        protectedDelay,
-      }, undefined, this.context());
-    } catch (error) {
-      this.diagnostics?.log('live.delay_protection.failed', {
-        reason: 'event_correction',
-        status: 'failed',
-      }, error, this.context());
-    } finally {
-      this.correcting = false;
-    }
   }
 
   maybeArmStall(reason) {

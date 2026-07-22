@@ -155,11 +155,7 @@ test('popup diagnostics session request is a fixed narrow message and never expa
 
 test('bridge contract allows only native video hint and narrow live capability operations', () => {
   assert.deepEqual(BRIDGE_CORE_SYNC_METHODS, ['setStableBufferTime']);
-  assert.deepEqual(BRIDGE_LIVE_METHODS, [
-    'setChasingFrameThreshold',
-    'setAutoSyncProgressCfg',
-    'setAutoDiscardFrameCfg',
-  ]);
+  assert.deepEqual(BRIDGE_LIVE_METHODS, ['setChasingFrameThreshold']);
   assert.deepEqual(BRIDGE_OPERATIONS, [
     'getCoreSnapshot',
     'callCoreSync',

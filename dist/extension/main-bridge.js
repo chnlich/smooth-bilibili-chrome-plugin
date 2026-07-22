@@ -11,14 +11,10 @@
     "disableLiveAutoCatchup"
   ]);
   var BRIDGE_LIVE_METHODS = Object.freeze([
-    "setChasingFrameThreshold",
-    "setAutoSyncProgressCfg",
-    "setAutoDiscardFrameCfg"
+    "setChasingFrameThreshold"
   ]);
   var BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
-    setChasingFrameThreshold: 600,
-    setAutoSyncProgressCfg: { enable: false },
-    setAutoDiscardFrameCfg: { enable: false }
+    setChasingFrameThreshold: 600
   });
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function encodeMessage(message) {

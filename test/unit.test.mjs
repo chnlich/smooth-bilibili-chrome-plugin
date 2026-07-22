@@ -566,11 +566,6 @@ test('native live observer does not touch playback before a genuine post-frame s
   assert.equal(video.pauseCalls, 0);
   assert.deepEqual(video.assignments, []);
   assert.ok(diagnostics.events.some((event) => event.code === 'live.stall.detected'));
-
-  video.assignments.length = 0;
-  video.currentTime = 80;
-  video.emit('seeking');
-  assert.deepEqual(video.assignments, [80, 10]);
   observer.destroy();
 });
 
@@ -609,7 +604,7 @@ test('a normal video without requestVideoFrameCallback does not arm a no-frame s
   observer.destroy();
 });
 
-test('a trusted user seek cancels live protection and suppresses pre-first-frame rearming', async () => {
+test('a trusted timeline pointerdown records user seek authorization without cancelling protection by itself', async () => {
   const video = mediaVideo('https://media.example/live-2');
   const documentObject = eventDocument(video);
   const runtimeObject = runtimeWithIntervals();
@@ -630,13 +625,9 @@ test('a trusted user seek cancels live protection and suppresses pre-first-frame
     isTrusted: true,
     target: timelineControl({ id: 'seek', 'data-seek': '' }),
   });
-  video.currentTime = 70;
-  video.emit('seeking');
-  video.emit('waiting');
-  assert.equal(observer.activeStall, undefined);
-  assert.equal(observer.awaitingUserSeekFrame, true);
+  assert.ok(observer.userSeekAuthorization !== undefined);
+  assert.ok(observer.activeStall !== undefined);
   video.emit('loadeddata');
-  assert.equal(observer.awaitingUserSeekFrame, false);
   observer.destroy();
 });
 
@@ -844,12 +835,6 @@ test('live replacement rebases an unavailable protected time and skips cleared s
     115,
   );
 
-  video.seekable = ranges([[50, 120]]);
-  video.assignments.length = 0;
-  video.currentTime = 115;
-  video.emit('seeking');
-  assert.deepEqual(video.assignments, [115, 50]);
-
   video.currentSrc = '';
   video.src = '';
   video.currentTime = 110;
@@ -883,55 +868,11 @@ test('live protection is continuous in readable delay and never follows an old a
   assert.equal(observer.activeStall, undefined);
   assert.equal(observer.delayProtection.protectedDelay, 35);
 
-  video.assignments.length = 0;
-  video.currentTime = 100;
-  video.emit('seeking');
-  assert.deepEqual(video.assignments, [100, 90]);
-
-  video.assignments.length = 0;
-  video.currentTime = 90;
-  observer.onDecodedFrame(video);
   video.seekable = ranges([[100, 200]]);
   video.currentTime = 165;
+  video.assignments.length = 0;
   observer.onDecodedFrame(video);
-  video.assignments.length = 0;
-  video.emit('seeking');
   assert.deepEqual(video.assignments, []);
-
-  video.seekable = ranges([[100, 210]]);
-  video.currentTime = 175;
-  video.assignments.length = 0;
-  video.emit('seeking');
-  assert.deepEqual(video.assignments, []);
-  observer.destroy();
-});
-
-test('repeated automatic forward seeks keep correcting delay loss without eroding the target', () => {
-  const video = mediaVideo('https://media.example/live-repeat-correction');
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.seekable = ranges([[0, 125]]);
-  video.currentTime = 90;
-  video.emit('waiting');
-  observer.onDecodedFrame(video);
-  video.assignments.length = 0;
-
-  video.currentTime = 105;
-  video.emit('seeking');
-  video.currentTime = 106;
-  video.emit('seeking');
-  assert.deepEqual(video.assignments, [105, 90, 106, 90]);
-  assert.equal(observer.activeStall, undefined);
-  assert.equal(observer.delayProtection.protectedDelay, 35);
   observer.destroy();
 });
 
@@ -960,12 +901,6 @@ test('a frozen seekable range grows the protected target from the monotonic stal
   milliseconds = 4250;
   observer.sample();
   assert.ok(observer.activeStall.targetDelay >= 33.2 && observer.activeStall.targetDelay <= 33.3);
-
-  video.assignments.length = 0;
-  video.currentTime = 100;
-  video.emit('seeking');
-  assert.equal(video.assignments.length, 2);
-  assert.ok(Math.abs(video.assignments[1] - 86.75) <= 0.01);
 
   milliseconds = 5000;
   video.currentTime = 86;
@@ -1046,75 +981,6 @@ test('a genuine waiting immediately after automatic correction starts a new stal
 
   video.emit('waiting');
   assert.equal(observer.activeStall.delayBeforeStall, 32);
-  observer.destroy();
-});
-
-test('only timeline intent and seek keys authorize user control; video, quality, volume, and unrelated keys do not', () => {
-  const video = mediaVideo('https://media.example/live-user-intent');
-  const documentObject = eventDocument(video);
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.seekable = ranges([[0, 125]]);
-  video.currentTime = 90;
-  video.emit('waiting');
-  observer.onDecodedFrame(video);
-
-  const assertAutomaticCorrection = (event) => {
-    video.assignments.length = 0;
-    video.currentTime = 105;
-    documentObject.emit(event.type, event);
-    video.emit('seeking');
-    assert.deepEqual(video.assignments, [105, 90]);
-  };
-  assertAutomaticCorrection({
-    type: 'pointerdown',
-    isTrusted: true,
-    target: video,
-  });
-  assertAutomaticCorrection({
-    type: 'pointerdown',
-    isTrusted: true,
-    target: timelineControl({ id: 'volume', 'aria-label': 'volume' }),
-  });
-  assertAutomaticCorrection({
-    type: 'pointerdown',
-    isTrusted: true,
-    target: timelineControl({ id: 'volume-progress', 'aria-label': 'volume', 'data-progress': '' }),
-  });
-  assertAutomaticCorrection({
-    type: 'pointerdown',
-    isTrusted: true,
-    target: timelineControl({ id: 'quality', 'aria-label': 'quality' }),
-  });
-  assertAutomaticCorrection({
-    type: 'pointerdown',
-    isTrusted: true,
-    target: timelineControl({ id: 'time-display' }),
-  });
-  assertAutomaticCorrection({
-    type: 'keydown',
-    isTrusted: true,
-    key: 'ArrowRight',
-    target: { tagName: 'button', parentElement: null },
-  });
-
-  video.assignments.length = 0;
-  video.currentTime = 90;
-  const timeline = timelineControl({ id: 'timeline', 'data-seek': '' });
-  documentObject.emit('pointerdown', { type: 'pointerdown', isTrusted: true, target: timeline });
-  video.currentTime = 105;
-  video.emit('seeking');
-  assert.deepEqual(video.assignments, [90, 105]);
-  assert.equal(observer.activeStall, undefined);
   observer.destroy();
 });
 
