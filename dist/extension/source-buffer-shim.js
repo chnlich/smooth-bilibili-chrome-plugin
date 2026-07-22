@@ -117,6 +117,13 @@
         stats.lastReason = "skipped";
         stats.lastRemoveEnd = end;
         dispatchObservation({ reason: "skipped", currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
+        const buffer = this;
+        setTimeout(() => {
+          try {
+            buffer.dispatchEvent(new Event("updateend"));
+          } catch {
+          }
+        }, 0);
         return;
       }
       stats.lastReason = "truncated";

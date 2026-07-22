@@ -1068,7 +1068,12 @@ try {
     await tick();
     const passCalls = shim.stats.removeCalls - callsBeforePass;
     const passIntercepted = shim.stats.intercepted - interceptedBeforePass;
+    const skipUpdateEnd = new Promise((resolve, reject) => {
+      sourceBuffer.addEventListener('updateend', () => resolve(true), { once: true });
+      setTimeout(() => reject(new Error('skip updateend 超时')), 3000);
+    });
     sourceBuffer.remove(75, 95);
+    const skipFired = await skipUpdateEnd.catch(() => false);
     await tick();
     const skipIntercepted = shim.stats.intercepted - interceptedBeforePass - passIntercepted;
     const skipReason = shim.stats.lastReason;
@@ -1081,7 +1086,7 @@ try {
     URL.revokeObjectURL(url);
     return {
       passCalls, passIntercepted,
-      skipIntercepted, skipReason,
+      skipIntercepted, skipReason, skipFired,
       truncIntercepted, truncReason,
       retainSeconds: shim.retainSeconds,
     };
@@ -1091,6 +1096,7 @@ try {
   assert.ok(retentionResult.passCalls >= 1, JSON.stringify(retentionResult));
   assert.equal(retentionResult.skipIntercepted, 1);
   assert.equal(retentionResult.skipReason, 'skipped');
+  assert.equal(retentionResult.skipFired, true, 'skipped remove 必须触发 updateend 事件');
   assert.equal(retentionResult.truncIntercepted, 1);
   assert.equal(retentionResult.truncReason, 'truncated');
   const shimAttributes = await livePage.evaluate(() => {
