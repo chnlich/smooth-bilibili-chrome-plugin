@@ -418,7 +418,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-6d6750c02ab82db80449fa9c" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-41a8f8af84c443648f74a26a" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1696,9 +1696,9 @@
       );
       if (Number.isFinite(currentDelay) && currentDelay >= protectedDelay) {
         this.observeProtectedDelay(this.video, currentDelay);
-        this.replacementNeedsCorrection = false;
-        return;
       }
+      this.replacementNeedsCorrection = false;
+      if (!Number.isFinite(currentDelay) || currentDelay >= protectedDelay) return;
       this.correcting = true;
       try {
         this.video.currentTime = target;
@@ -1806,7 +1806,7 @@
       }
       this.reconcileVideo();
       this.checkForNoFrameStall();
-      this.applyReplacementCorrection();
+      if (this.replacementNeedsCorrection) this.applyReplacementCorrection();
       if (this.video !== void 0) {
         const estimatedDelay = delayOrUnknown(
           this.video,

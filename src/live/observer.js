@@ -624,9 +624,9 @@ export class LiveObserver {
     );
     if (Number.isFinite(currentDelay) && currentDelay >= protectedDelay) {
       this.observeProtectedDelay(this.video, currentDelay);
-      this.replacementNeedsCorrection = false;
-      return;
     }
+    this.replacementNeedsCorrection = false;
+    if (!Number.isFinite(currentDelay) || currentDelay >= protectedDelay) return;
     this.correcting = true;
     try {
       this.video.currentTime = target;
@@ -740,7 +740,7 @@ export class LiveObserver {
     }
     this.reconcileVideo();
     this.checkForNoFrameStall();
-    this.applyReplacementCorrection();
+    if (this.replacementNeedsCorrection) this.applyReplacementCorrection();
     if (this.video !== undefined) {
       const estimatedDelay = delayOrUnknown(
         this.video,
