@@ -42,7 +42,7 @@ popup 的“直播增强”和“视频增强”是刷新后的默认开关；�
 
 ## Stall A/B harness
 
-`stall-ab` 用同一个 document-start probe 在真实 Bilibili 视频页上测量 extension-on 和 extension-off 两个 arm。它随机化 arm 顺序，在每个 arm 前清理 profile 的 media cache，并把 extension-on 的 `logs:events-page` 全量分页结果自动写出，不需要点击日志页的导出按钮。
+`stall-ab` 用同一个 document-start probe 在真实 Bilibili 视频页上测量 extension-on 和 extension-off 两个 arm。它随机化 arm 顺序，在每个 arm 前清理 profile 的 media cache，并把 extension-on 的 `logs:events-page` 全量分页结果自动写出，不需要点击日志页的导出按钮。`--start-seconds` 默认为 `0`，harness 将 Bilibili 的 `t` URL 参数设为这个位置；播放开始后会用实际 `currentTime` 校验，容差为 1 秒，用来覆盖 `play()` 调度和 probe 取样时序，同时远小于测量区间。位置不匹配时以 `BLOCKED` 和非零状态退出，不记录该 arm。
 
 stall A/B 只使用一个持久化 profile，profile 必须放在仓库外。先在 `chrome://extensions` 开启开发者模式，把 `dist/extension` 作为未打包扩展安装到这个 profile，一次即可。当前 Chrome 不可用命令行 `--load-extension`，harness 不再传入它或 `--disable-extensions-except`。extension-on 通过移除 Playwright 默认的 `--disable-extensions` 使用 profile 中的扩展；extension-off 保留 Playwright 默认设置，让同一个扩展保持不活动。这样两个 arm 共享登录和 Cookie 状态。`--login` 也使用这个 profile，并保留 `--mute-audio` 与 document-start 静音 guard。
 
@@ -57,10 +57,10 @@ E:\tools\node\node.exe scripts\stall-ab.mjs --login --profile "<persistent-signe
 后续运行使用同一个 profile：
 
 ```bat
-E:\tools\node\node.exe scripts\stall-ab.mjs --bv BV1syga6fEL7 --seconds 180 --rate 2 --arms extension-on,extension-off --profile "<persistent-signed-in-profile-dir>" --out artifacts\stall-ab-20260724T000000Z
+E:\tools\node\node.exe scripts\stall-ab.mjs --bv BV1syga6fEL7 --start-seconds 90 --seconds 180 --rate 2 --arms extension-on,extension-off --profile "<persistent-signed-in-profile-dir>" --out artifacts\stall-ab-20260724T000000Z
 ```
 
-成功的输出目录包含两个 arm 的 `probe.jsonl` 与 `metric.json`、extension-on 的 `extlog.jsonl` 和 `compare.json`。`compare.json` 只报告 Phase 1 gate，不自动改变播放行为。登录失效、页面不可达、没有原生 video、profile 被其他 Chrome 实例占用，或扩展 arm 没有处于预期状态时，命令以非零状态报告 `BLOCKED`，不会伪造比较结果。
+每个 arm 会先读取视频 duration，并拒绝 `start-seconds + seconds * rate` 超出视频的请求，同时报告视频 duration、请求 span 和最大可用的 `--seconds`。成功的输出目录包含两个 arm 的 `probe.jsonl` 与 `metric.json`、extension-on 的 `extlog.jsonl` 和 `compare.json`。每个 `metric.json` 及 `compare.json` 中的 arm 对象都包含 `startCurrentTime`、`endCurrentTime`、`mediaDuration`、`reachedEndOfMedia` 和 `valid`，因此可以直接核对两个 arm 的实际区间。记录期间到达媒体结尾或发生位置回绕会将该 arm 标为无效并以 `BLOCKED` 和非零状态退出，不会写出比较结果。`compare.json` 只报告 Phase 1 gate，不自动改变播放行为。登录失效、页面不可达、没有原生 video、profile 被其他 Chrome 实例占用，或扩展 arm 没有处于预期状态时，命令以非零状态报告 `BLOCKED`，不会伪造比较结果。
 
 如果 profile 已被另一个 Chrome 窗口打开，命令会快速以 `PROFILE_IN_USE` 和非零状态失败；关闭那个窗口后再运行。
 

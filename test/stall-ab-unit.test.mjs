@@ -4,21 +4,58 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
-import { computeStallScore } from '../scripts/stall-score.mjs';
+import { computeArmMetric, computePositionMetrics, computeStallScore } from '../scripts/stall-score.mjs';
 import { readStoredEvents } from '../scripts/extension-log-pull.mjs';
 import { STALL_PROBE_SOURCE } from '../scripts/stall-probe.mjs';
 import {
   assertExtensionInjection,
+  assertMeasurementSpan,
+  assertProbeStartPosition,
   assertProfileNotInUse,
   assertSafePayload,
+  buildComparison,
+  buildPlaybackUrl,
   launchContext,
   launchOptionsForArm,
+  parseArguments,
   PROFILE_LAUNCH_TIMEOUT_MILLISECONDS,
   probeSourceForArm,
+  START_POSITION_TOLERANCE_SECONDS,
   translateProfileInUseError,
 } from '../scripts/stall-ab.mjs';
 
 const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
+
+test('measurement start defaults to zero and is encoded in the Bilibili URL', () => {
+  const commonArguments = [
+    '--bv', 'BV1syga6fEL7', '--seconds', '10', '--rate', '2', '--arms', 'extension-on,extension-off',
+    '--profile', '/tmp/stall-ab-profile', '--out', '/tmp/stall-ab-output',
+  ];
+  assert.equal(parseArguments(commonArguments).startSeconds, 0);
+  assert.equal(parseArguments([...commonArguments, '--start-seconds', '90.5']).startSeconds, 90.5);
+  assert.equal(new URL(buildPlaybackUrl('BV1syga6fEL7', 90.5)).searchParams.get('t'), '90.5');
+});
+
+test('measurement span rejection names the largest fitting --seconds value', () => {
+  assert.throws(
+    () => assertMeasurementSpan({ startSeconds: 10, seconds: 46, rate: 2, duration: 100 }),
+    /duration 100s.*requested span 102s.*largest --seconds that fits is 45/i,
+  );
+});
+
+test('a probe stream that misses the requested start produces a blocked mismatch', async () => {
+  const records = await readProbeFixture('stall-probe-start-mismatch.jsonl');
+  assert.throws(
+    () => assertProbeStartPosition(records, 90),
+    (error) => {
+      assert.equal(error.name, 'BlockedError');
+      assert.match(error.message, /START_POSITION_MISMATCH/);
+      assert.match(error.message, /requested 90s.*actual 10s/i);
+      assert.match(error.message, new RegExp(`tolerance ${START_POSITION_TOLERANCE_SECONDS}s`));
+      return true;
+    },
+  );
+});
 
 test('extension arms toggle the profile-installed extension through Playwright defaults', () => {
   const extensionOn = launchOptionsForArm('extension-on');
@@ -184,6 +221,44 @@ test('stall score sums multiple waiting-to-playing intervals', async () => {
 test('stall score reports efficiency below one when rate-2 playback advances too slowly', async () => {
   const score = computeStallScore(await readProbeFixture('stall-probe-rate2.jsonl'), 100);
   assert.equal(score.playbackEfficiency, 0.5);
+});
+
+test('a backward currentTime step is an end-of-media wrap and invalidates the arm', async () => {
+  const records = await readProbeFixture('stall-probe-end-wrap.jsonl');
+  const position = computePositionMetrics(records, 100);
+  assert.equal(position.startCurrentTime, 95);
+  assert.equal(position.endCurrentTime, 5);
+  assert.equal(position.mediaDuration, 100);
+  assert.equal(position.reachedEndOfMedia, true);
+  assert.equal(position.valid, false);
+});
+
+test('an invalid end-of-media metric cannot build a comparison', async () => {
+  const metric = computeArmMetric(await readProbeFixture('stall-probe-end-wrap.jsonl'), 20, 100);
+  assert.equal(metric.valid, false);
+  assert.throws(
+    () => buildComparison({ 'extension-on': metric, 'extension-off': metric }),
+    /MEDIA_END_REACHED.*invalid arm/i,
+  );
+});
+
+test('metric and comparison JSON expose the measured positions for both arms', async () => {
+  const records = await readProbeFixture('stall-probe-zero.jsonl');
+  const metric = computeArmMetric(records, 100, 100);
+  const comparison = JSON.parse(JSON.stringify(buildComparison({
+    'extension-on': metric,
+    'extension-off': metric,
+  })));
+  for (const arm of ['extension-on', 'extension-off']) {
+    assert.equal(metric.startCurrentTime, 0);
+    assert.equal(metric.endCurrentTime, 4);
+    assert.equal(metric.mediaDuration, 100);
+    assert.equal(metric.reachedEndOfMedia, false);
+    assert.equal(comparison[arm].startCurrentTime, 0);
+    assert.equal(comparison[arm].endCurrentTime, 4);
+    assert.equal(comparison[arm].mediaDuration, 100);
+    assert.equal(comparison[arm].reachedEndOfMedia, false);
+  }
 });
 
 test('both arms expose the exact same injected probe source', () => {

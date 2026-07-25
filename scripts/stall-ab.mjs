@@ -6,7 +6,7 @@
  * Login:
  *   node scripts/stall-ab.mjs --login --profile "<persistent-signed-in-profile-dir>"
  * Measurement:
- *   node scripts/stall-ab.mjs --bv BV1syga6fEL7 --seconds 180 --rate 2 \
+ *   node scripts/stall-ab.mjs --bv BV1syga6fEL7 --start-seconds 90 --seconds 180 --rate 2 \
  *     --arms extension-on,extension-off --profile "<persistent-signed-in-profile-dir>" \
  *     --out artifacts/stall-ab-20260724T000000Z
  */
@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { VOD_CONFIG } from '../src/constants.js';
 import { readMaxEventId, readStoredEvents } from './extension-log-pull.mjs';
-import { computeStallScore } from './stall-score.mjs';
+import { computeArmMetric } from './stall-score.mjs';
 import { STALL_PROBE_SOURCE } from './stall-probe.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -40,6 +40,9 @@ const profileLockFileNames = Object.freeze(['lockfile', 'SingletonLock']);
 // Two minutes leaves headroom for cold persistent-profile Chrome startup while bounding the
 // multi-minute wait observed when another Chrome instance owns the profile.
 export const PROFILE_LAUNCH_TIMEOUT_MILLISECONDS = 120_000;
+// One media second accommodates play() scheduling and probe timestamp timing while remaining
+// much smaller than the measured span.
+export const START_POSITION_TOLERANCE_SECONDS = 1;
 const extensionInjectionWaitMilliseconds = 5000;
 
 async function playwrightChromium() {
@@ -102,6 +105,12 @@ function parsePositiveNumber(value, flag) {
   return parsed;
 }
 
+function parseNonNegativeNumber(value, flag) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) usageError(`${flag} must be a non-negative number`);
+  return parsed;
+}
+
 function parseArms(value) {
   const arms = value.split(',');
   if (arms.length !== 2 || new Set(arms).size !== 2
@@ -112,7 +121,7 @@ function parseArms(value) {
 }
 
 export function parseArguments(argv) {
-  const options = { selfCheck: false, login: false };
+  const options = { selfCheck: false, login: false, startSeconds: 0 };
   const assigned = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -130,6 +139,7 @@ export function parseArguments(argv) {
       '--bv': 'bv',
       '--seconds': 'seconds',
       '--rate': 'rate',
+      '--start-seconds': 'startSeconds',
       '--arms': 'arms',
       '--profile': 'profile',
       '--out': 'out',
@@ -154,6 +164,7 @@ export function parseArguments(argv) {
   if (!/^BV[0-9A-Za-z]+$/.test(options.bv)) usageError('--bv must be a Bilibili BV identifier');
   options.seconds = parsePositiveInteger(options.seconds, '--seconds');
   options.rate = parsePositiveNumber(options.rate, '--rate');
+  options.startSeconds = parseNonNegativeNumber(options.startSeconds, '--start-seconds');
   options.arms = parseArms(options.arms);
   return options;
 }
@@ -503,8 +514,61 @@ async function assertSignedInAndReachable(page, response) {
   }
 }
 
-async function loadPlaybackPage(page, bvid, arm) {
-  const url = `https://www.bilibili.com/video/${bvid}`;
+export function buildPlaybackUrl(bvid, startSeconds) {
+  const url = new URL(`https://www.bilibili.com/video/${bvid}`);
+  url.searchParams.set('t', String(startSeconds));
+  return url.toString();
+}
+
+function pagePlaybackState() {
+  const videos = [...document.querySelectorAll('video')];
+  for (const iframe of document.querySelectorAll('iframe')) {
+    try {
+      if (iframe.contentDocument !== null) videos.push(...iframe.contentDocument.querySelectorAll('video'));
+    } catch (error) {
+      console.error('[stall-ab] same-origin playback state scan failed', error);
+    }
+  }
+  const video = videos.sort((left, right) =>
+    (right.clientWidth * right.clientHeight) - (left.clientWidth * left.clientHeight))[0];
+  if (video === undefined) return null;
+  return {
+    paused: video.paused,
+    playbackRate: video.playbackRate,
+    currentTime: video.currentTime,
+    duration: video.duration,
+  };
+}
+
+function pageHasMediaDuration() {
+  const videos = [...document.querySelectorAll('video')];
+  for (const iframe of document.querySelectorAll('iframe')) {
+    try {
+      if (iframe.contentDocument !== null) videos.push(...iframe.contentDocument.querySelectorAll('video'));
+    } catch (error) {
+      console.error('[stall-ab] same-origin duration scan failed', error);
+    }
+  }
+  const video = videos.sort((left, right) =>
+    (right.clientWidth * right.clientHeight) - (left.clientWidth * left.clientHeight))[0];
+  return video !== undefined && Number.isFinite(video.duration) && video.duration > 0;
+}
+
+async function readMediaDuration(page) {
+  try {
+    await page.waitForFunction(pageHasMediaDuration, undefined, { timeout: 15000 });
+  } catch (error) {
+    throw new BlockedError(`BILIBILI_MEDIA_DURATION_MISSING: native video duration did not load (${error.message})`);
+  }
+  const state = await page.evaluate(pagePlaybackState);
+  if (state === null || !Number.isFinite(state.duration) || state.duration <= 0) {
+    throw new BlockedError('BILIBILI_MEDIA_DURATION_MISSING: native video duration is not finite and positive');
+  }
+  return state.duration;
+}
+
+async function loadPlaybackPage(page, bvid, arm, startSeconds) {
+  const url = buildPlaybackUrl(bvid, startSeconds);
   let response;
   try {
     response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -535,7 +599,12 @@ async function startPlayback(page, rate) {
     video.muted = true;
     video.volume = 0;
     video.playbackRate = playbackRate;
-    return video.play().then(() => ({ paused: video.paused, playbackRate: video.playbackRate }));
+    return video.play().then(() => ({
+      paused: video.paused,
+      playbackRate: video.playbackRate,
+      currentTime: video.currentTime,
+      duration: video.duration,
+    }));
   }, rate).catch((error) => {
     throw new BlockedError(`BILIBILI_PLAY_FAILED: ${error.message}`);
   });
@@ -552,11 +621,19 @@ async function startPlayback(page, rate) {
           console.error('[stall-ab] same-origin rate scan failed', error);
         }
       }
-      return videos.some((video) => video.paused === false && video.playbackRate === playbackRate);
+      return videos.some((video) => video.paused === false
+        && video.playbackRate === playbackRate
+        && Number.isFinite(video.duration)
+        && video.duration > 0);
     }, rate, { timeout: 15000 });
   } catch (error) {
     throw new BlockedError(`BILIBILI_PLAY_NOT_RUNNING: ${error.message}`);
   }
+  const stableState = await page.evaluate(pagePlaybackState);
+  if (stableState === null || !Number.isFinite(stableState.duration) || stableState.duration <= 0) {
+    throw new BlockedError('BILIBILI_MEDIA_DURATION_MISSING: native video duration is not finite and positive');
+  }
+  return stableState;
 }
 
 async function collectProbeRecords(page) {
@@ -573,12 +650,62 @@ async function collectProbeRecords(page) {
 }
 
 async function resetStallProbes(page) {
-  const reset = await Promise.all(page.frames().map((frame) => frame.evaluate(() => {
-    if (window.__stallProbe?.info().hasVideo !== true) return false;
-    window.__stallProbe.reset();
-    return true;
+  const frames = page.frames();
+  const reset = await Promise.all(frames.map((frame) => frame.evaluate(() => {
+    if (window.__stallProbe?.info().hasVideo !== true) return null;
+    return {
+      info: window.__stallProbe.info(),
+      records: window.__stallProbe.reset(),
+    };
   })));
-  if (!reset.some(Boolean)) throw new BlockedError('STALL_PROBE_EMPTY: no instrumented native video to reset');
+  const candidates = reset
+    .filter((value) => value !== null && value.records.length > 0)
+    .sort((left, right) => (right.info.area - left.info.area) || (right.records.length - left.records.length));
+  if (candidates.length === 0) throw new BlockedError('STALL_PROBE_EMPTY: no instrumented native video to reset');
+  return candidates[0].records;
+}
+
+export function assertStartPosition(
+  actualCurrentTime,
+  requestedStartSeconds,
+  tolerance = START_POSITION_TOLERANCE_SECONDS,
+) {
+  if (!Number.isFinite(actualCurrentTime)) {
+    throw new BlockedError(
+      `START_POSITION_MISMATCH: requested ${requestedStartSeconds}s, actual position is not finite`,
+    );
+  }
+  if (Math.abs(actualCurrentTime - requestedStartSeconds) > tolerance) {
+    throw new BlockedError(
+      `START_POSITION_MISMATCH: requested ${requestedStartSeconds}s, actual ${actualCurrentTime}s, `
+      + `tolerance ${tolerance}s`,
+    );
+  }
+  return actualCurrentTime;
+}
+
+export function assertProbeStartPosition(records, requestedStartSeconds, tolerance = START_POSITION_TOLERANCE_SECONDS) {
+  if (!Array.isArray(records) || records.length === 0) {
+    throw new BlockedError(
+      `START_POSITION_MISMATCH: requested ${requestedStartSeconds}s, actual position is missing`,
+    );
+  }
+  return assertStartPosition(records[0].currentTime, requestedStartSeconds, tolerance);
+}
+
+export function assertMeasurementSpan({ startSeconds, seconds, rate, duration }) {
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new BlockedError(`MEDIA_DURATION_INVALID: duration ${duration}s is not positive and finite`);
+  }
+  const requestedSpanSeconds = startSeconds + seconds * rate;
+  if (requestedSpanSeconds > duration) {
+    const largestFittingSeconds = Math.floor(Math.max(0, duration - startSeconds) / rate);
+    throw new BlockedError(
+      `MEDIA_SPAN_EXCEEDS_DURATION: duration ${duration}s, requested span ${requestedSpanSeconds}s; `
+      + `largest --seconds that fits is ${largestFittingSeconds}`,
+    );
+  }
+  return { requestedSpanSeconds, largestFittingSeconds: Math.floor((duration - startSeconds) / rate) };
 }
 
 function assertSafePayload(payload, pathName = 'payload') {
@@ -617,24 +744,46 @@ async function runArm({ arm, options, chromeExecutable, outputDirectory }) {
     let extensionId;
     let initialAfterEventId = 0;
     page = await context.newPage();
-    await loadPlaybackPage(page, options.bv, arm);
+    await loadPlaybackPage(page, options.bv, arm, options.startSeconds);
     if (arm === 'extension-on') {
       extensionId = await extensionIdFor(context);
       initialAfterEventId = await readExtensionMaxEventId(context, extensionId);
     }
-    await startPlayback(page, options.rate);
-    await resetStallProbes(page);
+    const mediaDuration = await readMediaDuration(page);
+    assertMeasurementSpan({
+      startSeconds: options.startSeconds,
+      seconds: options.seconds,
+      rate: options.rate,
+      duration: mediaDuration,
+    });
+    const playbackState = await startPlayback(page, options.rate);
+    assertStartPosition(playbackState.currentTime, options.startSeconds);
+    assertMeasurementSpan({
+      startSeconds: options.startSeconds,
+      seconds: options.seconds,
+      rate: options.rate,
+      duration: playbackState.duration,
+    });
+    const initialRecords = await resetStallProbes(page);
+    assertProbeStartPosition(initialRecords, options.startSeconds);
     await page.waitForTimeout(options.seconds * 1000);
     const records = await collectProbeRecords(page);
     assertSafePayload(records);
-    const metric = computeStallScore(records, VOD_CONFIG.stableBufferSeconds);
+    const metric = computeArmMetric(records, VOD_CONFIG.stableBufferSeconds, playbackState.duration);
+    assertSafePayload(metric);
+    await writeJsonLines(path.join(outputDirectory, `${arm}.probe.jsonl`), records);
+    await writeJson(path.join(outputDirectory, `${arm}.metric.json`), metric);
+    if (!metric.valid) {
+      throw new BlockedError(
+        `MEDIA_END_REACHED: ${arm} reached the end of media during recording `
+        + `(duration ${metric.mediaDuration}s, start ${metric.startCurrentTime}s, `
+        + `end ${metric.endCurrentTime}s); metric is invalid`,
+      );
+    }
     const extensionEvents = arm === 'extension-on'
       ? (await readStoredEvents(context, extensionId, initialAfterEventId)).events
       : undefined;
-    assertSafePayload(metric);
     if (extensionEvents !== undefined) assertSafePayload(extensionEvents);
-    await writeJsonLines(path.join(outputDirectory, `${arm}.probe.jsonl`), records);
-    await writeJson(path.join(outputDirectory, `${arm}.metric.json`), metric);
     if (extensionEvents !== undefined) {
       await writeJsonLines(
         path.join(outputDirectory, `${arm}.extlog.jsonl`),
@@ -657,8 +806,19 @@ function randomizeArms(arms) {
 function gateFor(metrics) {
   const extensionOn = metrics['extension-on'];
   const extensionOff = metrics['extension-off'];
+  if (extensionOn.valid !== true || extensionOff.valid !== true) {
+    throw new BlockedError('MEDIA_END_REACHED: an invalid arm cannot contribute to the comparison');
+  }
   return extensionOn.reproduced
     && extensionOn.stalledWallMs >= extensionOff.stalledWallMs * 2;
+}
+
+export function buildComparison(metrics) {
+  return {
+    'extension-on': metrics['extension-on'],
+    'extension-off': metrics['extension-off'],
+    gate: gateFor(metrics),
+  };
 }
 
 async function runMeasurement(options) {
@@ -675,11 +835,7 @@ async function runMeasurement(options) {
   for (const arm of armOrder) {
     metrics[arm] = await runArm({ arm, options, chromeExecutable, outputDirectory });
   }
-  const comparison = {
-    'extension-on': metrics['extension-on'],
-    'extension-off': metrics['extension-off'],
-    gate: gateFor(metrics),
-  };
+  const comparison = buildComparison(metrics);
   await writeJson(path.join(outputDirectory, 'compare.json'), comparison);
   console.log(`stall A/B complete: gate=${comparison.gate}`);
 }

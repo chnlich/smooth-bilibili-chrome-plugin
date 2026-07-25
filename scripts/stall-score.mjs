@@ -88,3 +88,36 @@ export function computeStallScore(records, targetSeconds) {
     reproduced: waitingRecords.length > 0,
   };
 }
+
+export function computePositionMetrics(records, mediaDuration) {
+  if (!Array.isArray(records) || records.length === 0) {
+    throw new Error('position metrics require at least one probe record');
+  }
+  if (!Number.isFinite(mediaDuration) || mediaDuration <= 0) {
+    throw new Error('position metrics mediaDuration must be positive and finite');
+  }
+  records.forEach((record, index) => {
+    if (record === null || typeof record !== 'object' || !Number.isFinite(record.currentTime)) {
+      throw new Error(`stall probe record ${index} has an invalid currentTime`);
+    }
+  });
+
+  const hasBackwardPosition = records.slice(1).some((record, index) =>
+    record.currentTime < records[index].currentTime);
+  const reachesDuration = records.some((record) => record.currentTime >= mediaDuration);
+  const reachedEndOfMedia = hasBackwardPosition || reachesDuration;
+  return {
+    startCurrentTime: records[0].currentTime,
+    endCurrentTime: records.at(-1).currentTime,
+    mediaDuration,
+    reachedEndOfMedia,
+    valid: !reachedEndOfMedia,
+  };
+}
+
+export function computeArmMetric(records, targetSeconds, mediaDuration) {
+  return {
+    ...computeStallScore(records, targetSeconds),
+    ...computePositionMetrics(records, mediaDuration),
+  };
+}
