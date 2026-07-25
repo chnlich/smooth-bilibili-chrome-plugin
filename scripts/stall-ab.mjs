@@ -767,9 +767,18 @@ async function runArm({ arm, options, chromeExecutable, outputDirectory }) {
     const initialRecords = await resetStallProbes(page);
     assertProbeStartPosition(initialRecords, options.startSeconds);
     await page.waitForTimeout(options.seconds * 1000);
+    const finalPlaybackState = await page.evaluate(pagePlaybackState);
+    if (finalPlaybackState === null || !Number.isFinite(finalPlaybackState.currentTime)) {
+      throw new BlockedError('BILIBILI_END_POSITION_MISSING: native video currentTime is not finite');
+    }
     const records = await collectProbeRecords(page);
     assertSafePayload(records);
-    const metric = computeArmMetric(records, VOD_CONFIG.stableBufferSeconds, playbackState.duration);
+    const metric = computeArmMetric(
+      records,
+      VOD_CONFIG.stableBufferSeconds,
+      playbackState.duration,
+      finalPlaybackState.currentTime,
+    );
     assertSafePayload(metric);
     await writeJsonLines(path.join(outputDirectory, `${arm}.probe.jsonl`), records);
     await writeJson(path.join(outputDirectory, `${arm}.metric.json`), metric);

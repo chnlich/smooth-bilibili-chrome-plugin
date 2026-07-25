@@ -233,6 +233,14 @@ test('a backward currentTime step is an end-of-media wrap and invalidates the ar
   assert.equal(position.valid, false);
 });
 
+test('the final playback snapshot detects an end after the last probe sample', async () => {
+  const records = await readProbeFixture('stall-probe-zero.jsonl');
+  const metric = computeArmMetric(records, 100, 5, 5);
+  assert.equal(metric.endCurrentTime, 5);
+  assert.equal(metric.reachedEndOfMedia, true);
+  assert.equal(metric.valid, false);
+});
+
 test('an invalid end-of-media metric cannot build a comparison', async () => {
   const metric = computeArmMetric(await readProbeFixture('stall-probe-end-wrap.jsonl'), 20, 100);
   assert.equal(metric.valid, false);

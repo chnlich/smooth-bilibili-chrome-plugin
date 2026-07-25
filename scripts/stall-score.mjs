@@ -89,7 +89,7 @@ export function computeStallScore(records, targetSeconds) {
   };
 }
 
-export function computePositionMetrics(records, mediaDuration) {
+export function computePositionMetrics(records, mediaDuration, finalCurrentTime) {
   if (!Array.isArray(records) || records.length === 0) {
     throw new Error('position metrics require at least one probe record');
   }
@@ -102,22 +102,27 @@ export function computePositionMetrics(records, mediaDuration) {
     }
   });
 
+  const endCurrentTime = finalCurrentTime === undefined ? records.at(-1).currentTime : finalCurrentTime;
+  if (!Number.isFinite(endCurrentTime)) {
+    throw new Error('position metrics final currentTime must be finite');
+  }
   const hasBackwardPosition = records.slice(1).some((record, index) =>
     record.currentTime < records[index].currentTime);
-  const reachesDuration = records.some((record) => record.currentTime >= mediaDuration);
+  const reachesDuration = endCurrentTime >= mediaDuration
+    || records.some((record) => record.currentTime >= mediaDuration);
   const reachedEndOfMedia = hasBackwardPosition || reachesDuration;
   return {
     startCurrentTime: records[0].currentTime,
-    endCurrentTime: records.at(-1).currentTime,
+    endCurrentTime,
     mediaDuration,
     reachedEndOfMedia,
     valid: !reachedEndOfMedia,
   };
 }
 
-export function computeArmMetric(records, targetSeconds, mediaDuration) {
+export function computeArmMetric(records, targetSeconds, mediaDuration, finalCurrentTime) {
   return {
     ...computeStallScore(records, targetSeconds),
-    ...computePositionMetrics(records, mediaDuration),
+    ...computePositionMetrics(records, mediaDuration, finalCurrentTime),
   };
 }
