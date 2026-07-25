@@ -36,7 +36,10 @@ const knownChromeRelativePath = path.win32.join('Google', 'Chrome', 'Application
 const knownProfileDirectoryPattern = /^(Default|Profile \d+)$/;
 const forbiddenPayloadField = /cookie|token|account/i;
 const selfCheckUrl = 'https://www.bilibili.com/video/BV1syga6fEL7';
-const profileLockFileName = 'SingletonLock';
+const profileLockFileNames = Object.freeze(['lockfile', 'SingletonLock']);
+// Two minutes leaves headroom for cold persistent-profile Chrome startup while bounding the
+// multi-minute wait observed when another Chrome instance owns the profile.
+export const PROFILE_LAUNCH_TIMEOUT_MILLISECONDS = 120_000;
 const extensionInjectionWaitMilliseconds = 5000;
 
 async function playwrightChromium() {
@@ -265,6 +268,7 @@ export function launchOptionsForArm(arm) {
   const options = {
     headless: false,
     args: launchArguments(arm),
+    timeout: PROFILE_LAUNCH_TIMEOUT_MILLISECONDS,
   };
   if (arm === 'extension-on') options.ignoreDefaultArgs = ['--disable-extensions'];
   return options;
@@ -323,36 +327,79 @@ function profileInUseError(profileDirectory) {
   );
 }
 
-export async function assertProfileNotInUse(profileDirectory) {
+async function isProfileLockHeld(lockPath, open) {
+  let handle;
   try {
-    await fs.lstat(path.join(profileDirectory, profileLockFileName));
+    handle = await open(lockPath, 'r');
   } catch (error) {
-    if (error?.code === 'ENOENT') return;
+    if (error?.code === 'ENOENT') return false;
+    if (error?.code === 'EBUSY') return true;
     throw error;
   }
-  throw profileInUseError(profileDirectory);
+  await handle.close();
+  return false;
+}
+
+async function profileLockIsHeld(profileDirectory, { lstat = fs.lstat, open = fs.open } = {}) {
+  for (const lockFileName of profileLockFileNames) {
+    const lockPath = path.join(profileDirectory, lockFileName);
+    try {
+      await lstat(lockPath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (await isProfileLockHeld(lockPath, open)) return true;
+  }
+  return false;
+}
+
+export async function assertProfileNotInUse(profileDirectory, fileSystem = {}) {
+  if (await profileLockIsHeld(profileDirectory, fileSystem)) {
+    throw profileInUseError(profileDirectory);
+  }
 }
 
 function isProfileInUseLaunchFailure(error) {
   const message = String(error?.message || error);
   return message.includes('Target page, context or browser has been closed')
     || /(?:profile|user data directory).*(?:in use|already running|locked)/i.test(message)
-    || /Singleton(?:Lock|Cookie|Socket)/i.test(message);
+    || /(?:lockfile|Singleton(?:Lock|Cookie|Socket))/i.test(message);
 }
 
-export function translateProfileInUseError(error, profileDirectory) {
-  return isProfileInUseLaunchFailure(error) ? profileInUseError(profileDirectory) : error;
+export function translateProfileInUseError(error, profileDirectory, profileLockHeld = false) {
+  return profileLockHeld || isProfileInUseLaunchFailure(error)
+    ? profileInUseError(profileDirectory)
+    : error;
 }
 
-async function launchContext(chromeExecutable, profileDirectory, arm) {
-  const chromium = await playwrightChromium();
+function isLaunchTimeout(error) {
+  const message = String(error?.message || error);
+  return error?.name === 'TimeoutError'
+    || error?.code === 'ETIMEDOUT'
+    || /launchPersistentContext.*(?:timeout|timed out)/i.test(message);
+}
+
+export async function launchContext(chromeExecutable, profileDirectory, arm, {
+  chromium,
+  lstat = fs.lstat,
+  open = fs.open,
+} = {}) {
+  const browserType = chromium ?? await playwrightChromium();
   try {
-    return await chromium.launchPersistentContext(profileDirectory, {
+    return await browserType.launchPersistentContext(profileDirectory, {
       executablePath: chromeExecutable,
       ...launchOptionsForArm(arm),
     });
   } catch (error) {
-    throw translateProfileInUseError(error, profileDirectory);
+    const translated = translateProfileInUseError(error, profileDirectory);
+    if (translated !== error) throw translated;
+    if (!isLaunchTimeout(error)) throw error;
+    throw translateProfileInUseError(
+      error,
+      profileDirectory,
+      await profileLockIsHeld(profileDirectory, { lstat, open }),
+    );
   }
 }
 

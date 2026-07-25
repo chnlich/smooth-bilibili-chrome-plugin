@@ -62,6 +62,8 @@ E:\tools\node\node.exe scripts\stall-ab.mjs --bv BV1syga6fEL7 --seconds 180 --ra
 
 成功的输出目录包含两个 arm 的 `probe.jsonl` 与 `metric.json`、extension-on 的 `extlog.jsonl` 和 `compare.json`。`compare.json` 只报告 Phase 1 gate，不自动改变播放行为。登录失效、页面不可达、没有原生 video、profile 被其他 Chrome 实例占用，或扩展 arm 没有处于预期状态时，命令以非零状态报告 `BLOCKED`，不会伪造比较结果。
 
+如果 profile 已被另一个 Chrome 窗口打开，命令会快速以 `PROFILE_IN_USE` 和非零状态失败；关闭那个窗口后再运行。
+
 ## 构建与验证
 
 ```sh
