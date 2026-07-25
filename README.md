@@ -25,7 +25,7 @@ cd /d E:\workspace\smooth-bilibili-chrome-plugin
 set "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1"
 E:\tools\node\npm.cmd install
 E:\tools\node\npm.cmd run build
-E:\tools\node\node.exe scripts\stall-ab.mjs --self-check --profile E:\profiles\bilibili
+E:\tools\node\node.exe scripts\stall-ab.mjs --self-check --profile "<persistent-signed-in-profile-dir>"
 ```
 
 在 `chrome://extensions` 开启开发者模式，选择 `dist/extension` 加载未打包扩展。源代码或构建产物更新后，在扩展页手动点击“重新加载”，再刷新已经打开的 Bilibili 页面。本仓库已提交可直接加载的 `dist/extension`，包括 MV3 service worker、页面桥接、控制器、popup、开发日志页和外部 source map。
@@ -47,13 +47,13 @@ popup 的“直播增强”和“视频增强”是刷新后的默认开关；�
 先用持久化 profile 完成一次人工登录：
 
 ```bat
-E:\tools\node\node.exe scripts\stall-ab.mjs --login --profile E:\profiles\bilibili
+E:\tools\node\node.exe scripts\stall-ab.mjs --login --profile "<persistent-signed-in-profile-dir>"
 ```
 
 后续运行使用同一个 profile：
 
 ```bat
-E:\tools\node\node.exe scripts\stall-ab.mjs --bv BV1syga6fEL7 --seconds 180 --rate 2 --arms extension-on,extension-off --profile E:\profiles\bilibili --out artifacts\stall-ab-20260724T000000Z
+E:\tools\node\node.exe scripts\stall-ab.mjs --bv BV1syga6fEL7 --seconds 180 --rate 2 --arms extension-on,extension-off --profile "<persistent-signed-in-profile-dir>" --out artifacts\stall-ab-20260724T000000Z
 ```
 
 输出目录包含两个 arm 的 `probe.jsonl` 与 `metric.json`、extension-on 的 `extlog.jsonl` 和 `compare.json`。`compare.json` 只报告 Phase 1 gate，不自动改变播放行为。profile 必须保持在仓库外；登录失效、页面不可达或没有原生 video 时命令以非零状态报告 `BLOCKED`。

@@ -2,12 +2,12 @@
  * One-command playback-stall A/B harness.
  *
  * Self-check:
- *   node scripts/stall-ab.mjs --self-check --profile E:\\profiles\\bilibili
+ *   node scripts/stall-ab.mjs --self-check --profile "<persistent-signed-in-profile-dir>"
  * Login:
- *   node scripts/stall-ab.mjs --login --profile E:\\profiles\\bilibili
+ *   node scripts/stall-ab.mjs --login --profile "<persistent-signed-in-profile-dir>"
  * Measurement:
  *   node scripts/stall-ab.mjs --bv BV1syga6fEL7 --seconds 180 --rate 2 \
- *     --arms extension-on,extension-off --profile E:\\profiles\\bilibili \
+ *     --arms extension-on,extension-off --profile "<persistent-signed-in-profile-dir>" \
  *     --out artifacts/stall-ab-20260724T000000Z
  */
 
@@ -26,6 +26,7 @@ const extensionDirectory = path.join(root, 'dist', 'extension');
 const extensionBuildFiles = Object.freeze([
   'manifest.json',
   'controller.js',
+  'main-bridge.js',
   'source-buffer-shim.js',
   'worker.js',
   'logs.html',
@@ -404,6 +405,15 @@ async function collectProbeRecords(page) {
   return candidates[0].frame.evaluate(() => window.__stallProbe.stop());
 }
 
+async function resetStallProbes(page) {
+  const reset = await Promise.all(page.frames().map((frame) => frame.evaluate(() => {
+    if (window.__stallProbe?.info().hasVideo !== true) return false;
+    window.__stallProbe.reset();
+    return true;
+  })));
+  if (!reset.some(Boolean)) throw new BlockedError('STALL_PROBE_EMPTY: no instrumented native video to reset');
+}
+
 function assertSafePayload(payload, pathName = 'payload') {
   if (payload === null || typeof payload !== 'object') return;
   if (Array.isArray(payload)) {
@@ -448,6 +458,7 @@ async function runArm({ arm, options, chromeExecutable, outputDirectory }) {
     }
     page = await context.newPage();
     await preparePlayback(page, options.bv, options.rate);
+    await resetStallProbes(page);
     await page.waitForTimeout(options.seconds * 1000);
     const records = await collectProbeRecords(page);
     assertSafePayload(records);
@@ -486,6 +497,7 @@ function gateFor(metrics) {
 }
 
 async function runMeasurement(options) {
+  requireWindowsNode();
   const chromeExecutable = await resolveChromeExecutable();
   await assertExtensionBuild();
   await assertProfileDirectory(options.profile);
@@ -506,18 +518,16 @@ async function runMeasurement(options) {
     await writeJson(path.join(outputDirectory, 'compare.json'), comparison);
     console.log(`stall A/B complete: gate=${comparison.gate}`);
   } catch (error) {
-    const blocked = error instanceof BlockedError
-      ? error
-      : new BlockedError(error.message || String(error));
+    const status = error instanceof BlockedError ? 'BLOCKED' : 'ERROR';
     const comparison = {
-      status: 'BLOCKED',
-      reason: redactProfilePath(blocked.message, options.profile),
+      status,
+      reason: redactProfilePath(error.message || String(error), options.profile),
       'extension-on': metrics['extension-on'] || null,
       'extension-off': metrics['extension-off'] || null,
       gate: null,
     };
     await writeJson(path.join(outputDirectory, 'compare.json'), comparison);
-    throw blocked;
+    throw error;
   }
 }
 

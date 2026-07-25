@@ -1,15 +1,14 @@
-const PROBE_EVENT_TYPES = Object.freeze([
-  'playing',
-  'waiting',
-  'stalled',
-  'ratechange',
-  'seeked',
-  'error',
-  'timeupdate',
-  'progress',
-]);
-
 export const stallProbeInit = () => {
+  const probeEventTypes = new Set([
+    'playing',
+    'waiting',
+    'stalled',
+    'ratechange',
+    'seeked',
+    'error',
+    'timeupdate',
+    'progress',
+  ]);
   if (window.__stallProbe !== undefined) return;
 
   const records = [];
@@ -66,7 +65,7 @@ export const stallProbeInit = () => {
   };
 
   const record = (type, video, timestamp = performance.now()) => {
-    if (stopped || !PROBE_EVENT_TYPES.includes(type)) return;
+    if (stopped || !probeEventTypes.has(type)) return;
     if (video === undefined || video.isConnected === false) return;
     const currentTime = video.currentTime;
     const readyState = video.readyState;
@@ -98,7 +97,7 @@ export const stallProbeInit = () => {
     if (selectedVideo !== undefined) detachVideo();
     selectedVideo = video;
     if (selectedVideo === undefined) return;
-    for (const type of PROBE_EVENT_TYPES) {
+    for (const type of probeEventTypes) {
       const listener = () => {
         if (type === 'timeupdate') {
           const elapsed = performance.now();
@@ -131,6 +130,19 @@ export const stallProbeInit = () => {
     videoQuality: item.videoQuality === null ? null : { ...item.videoQuality },
   }));
 
+  const reset = () => {
+    if (stopped) return copyRecords();
+    records.length = 0;
+    lastTimeupdateElapsed = -Infinity;
+    lastProgressElapsed = -Infinity;
+    if (selectedVideo !== undefined && selectedVideo.isConnected !== false) {
+      const elapsed = performance.now();
+      record('timeupdate', selectedVideo, elapsed);
+      lastTimeupdateElapsed = elapsed;
+    }
+    return copyRecords();
+  };
+
   mutationObserver = new MutationObserver(reconcileVideo);
   mutationObserver.observe(document, { childList: true, subtree: true });
   sampleTimer = setInterval(() => {
@@ -150,6 +162,7 @@ export const stallProbeInit = () => {
       area: selectedVideo === undefined ? 0 : selectedVideo.clientWidth * selectedVideo.clientHeight,
       recordCount: records.length,
     }),
+    reset,
     stop: () => {
       if (stopped) return copyRecords();
       stopped = true;
