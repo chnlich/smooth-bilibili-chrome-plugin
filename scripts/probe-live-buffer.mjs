@@ -1,13 +1,9 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
-
-const execFileAsync = promisify(execFile);
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
@@ -143,30 +139,20 @@ const report = {
 };
 
 const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-probe-live-'));
-const debugPort = 9222;
 let context;
 try {
   const chromeExe = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-  const chromeArgs = [
-    `--remote-debugging-port=${debugPort}`,
-    `--user-data-dir=${profileDirectory}`,
-    '--enable-unsafe-extension-debugging',
-    '--mute-audio',
-    '--no-first-run',
-  ];
-  execFileAsync(chromeExe, chromeArgs, { windowsHide: false, timeout: 0 }).catch(() => {});
-  let connected = false;
-  for (let attempt = 0; attempt < 15 && !connected; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    try {
-      context = await chromium.connectOverCDP(`http://127.0.0.1:${debugPort}`);
-      connected = true;
-    } catch (error) {
-      console.log(`probe: CDP connect attempt ${attempt + 1} failed: ${error.message}`);
-    }
-  }
-  if (!connected) throw new Error('无法通过 CDP 连接到 Chrome (15 次重试后放弃)');
-  await installUnpackedExtension(context, extensionDirectory);
+  context = await chromium.launchPersistentContext(profileDirectory, {
+    executablePath: chromeExe,
+    headless: false,
+    ignoreDefaultArgs: ['--disable-extensions'],
+    args: [
+      '--enable-unsafe-extension-debugging',
+      '--mute-audio',
+      '--no-first-run',
+    ],
+  });
+  await installUnpackedExtension(context.browser(), extensionDirectory);
   report.browserStarted = true;
 
   const browser = context;
