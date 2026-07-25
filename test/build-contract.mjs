@@ -202,6 +202,23 @@ for (const { relativePath, content } of sourceFiles) {
     assert.doesNotMatch(content, /\bSourceBuffer\b/, `${relativePath} 不得直接使用 SourceBuffer`);
   }
 }
+const mediaSourceReference = /\bMediaSource\b/;
+const mediaSourceSourceAllowlist = new Set([
+  'extension/source-buffer-shim.js',
+]);
+for (const { relativePath, content } of sourceFiles) {
+  if (!mediaSourceSourceAllowlist.has(relativePath)) {
+    assert.doesNotMatch(content, mediaSourceReference, `${relativePath} 不得直接使用 MediaSource`);
+  }
+}
+const guardedIdentifierFragmentReference = /(?:\[[^\]]*\b(?:MediaSource|SourceBuffer|XMLHttpRequest|Media|Source|Buffer|XMLHttp|Request)\b[^\]]*\])|(?:['"`](?:Media|Source|Buffer|XMLHttp)['"`]\s*\+\s*['"`](?:Source|Buffer|Request)['"`])/;
+for (const { relativePath, content } of sourceFiles) {
+  assert.doesNotMatch(
+    content,
+    guardedIdentifierFragmentReference,
+    `${relativePath} 不得通过拼接或计算访问受保护标识符`,
+  );
+}
 assert.match(shim, /SourceBuffer\.prototype\.remove/);
 const indexedDbReference = /\bindexedDB\b|['"]indexedDB['"]/;
 const indexedDbSourceAllowlist = new Set([
@@ -233,7 +250,14 @@ assert.doesNotMatch(passiveMediaSource, /\b(?:play|pause)\s*\(/);
 assert.doesNotMatch(passiveMediaSource, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
 assert.doesNotMatch(passiveMediaSource, /\b(?:fetch|MediaSource|SourceBuffer)\b/);
 assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /document\.cookie|localStorage|sessionStorage|sendBeacon/);
-assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /fetch\s*\(|XMLHttpRequest|MediaSource/);
+const sourceWithoutAllowedMediaSource = sourceFiles
+  .filter(({ relativePath }) => !mediaSourceSourceAllowlist.has(relativePath))
+  .map(({ content }) => content)
+  .join('\n');
+assert.doesNotMatch(
+  `${sourceWithoutAllowedMediaSource}\n${controller}\n${bridge}\n${worker}\n${logs}`,
+  /fetch\s*\(|XMLHttpRequest|MediaSource/,
+);
 assert.doesNotMatch(source, /window\.onerror|window\.onunhandledrejection/);
 const diagnosticStorageSource = `${await fs.readFile(path.join(root, 'src/diagnostics/idb.js'), 'utf8')}\n${await fs.readFile(path.join(root, 'src/diagnostics/worker.js'), 'utf8')}`;
 assert.doesNotMatch(diagnosticStorageSource, /\.put\s*\(|\.delete\s*\(|\.clear\s*\(/);

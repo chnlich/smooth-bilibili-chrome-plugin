@@ -68,7 +68,7 @@ function readSourceBufferRanges(sourceBuffer) {
   return ranges;
 }
 
-function dispatchDiagnostics() {
+function publishDiagnostics() {
   try {
     const sourceBufferRanges = [];
     if (activeSource !== undefined) {
@@ -94,14 +94,42 @@ function dispatchDiagnostics() {
   }
 }
 
-const mediaSourceConstructor = globalThis['Media' + 'Source'];
-if (mediaSourceConstructor !== undefined && typeof mediaSourceConstructor.prototype?.addSourceBuffer === 'function') {
-  const originalAddSourceBuffer = mediaSourceConstructor.prototype.addSourceBuffer;
-  mediaSourceConstructor.prototype.addSourceBuffer = function smoothAddSourceBuffer(mimeType) {
+const DIAGNOSTIC_SAMPLE_INTERVAL_MILLISECONDS = 1000;
+let lastDiagnosticDispatchAt = Number.NEGATIVE_INFINITY;
+let diagnosticTimer;
+
+function dispatchDiagnostics() {
+  if (diagnosticTimer !== undefined) {
+    window.clearTimeout(diagnosticTimer);
+    diagnosticTimer = undefined;
+  }
+  lastDiagnosticDispatchAt = window.performance.now();
+  publishDiagnostics();
+}
+
+function dispatchUpdateEndDiagnostics() {
+  const now = window.performance.now();
+  const elapsed = now - lastDiagnosticDispatchAt;
+  if (elapsed >= DIAGNOSTIC_SAMPLE_INTERVAL_MILLISECONDS) {
+    dispatchDiagnostics();
+    return;
+  }
+  if (diagnosticTimer === undefined) {
+    diagnosticTimer = window.setTimeout(() => {
+      diagnosticTimer = undefined;
+      lastDiagnosticDispatchAt = window.performance.now();
+      publishDiagnostics();
+    }, DIAGNOSTIC_SAMPLE_INTERVAL_MILLISECONDS - elapsed);
+  }
+}
+
+if (typeof MediaSource !== 'undefined' && typeof MediaSource.prototype?.addSourceBuffer === 'function') {
+  const originalAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
+  MediaSource.prototype.addSourceBuffer = function smoothAddSourceBuffer(mimeType) {
     const sourceBuffer = originalAddSourceBuffer.call(this, mimeType);
     activeSource = this;
     sourceBufferTracks.set(sourceBuffer, String(mimeType).split(';', 1)[0]);
-    sourceBuffer.addEventListener('updateend', dispatchDiagnostics);
+    sourceBuffer.addEventListener('updateend', dispatchUpdateEndDiagnostics);
     for (const eventName of ['sourceopen', 'sourceended', 'sourceclose']) {
       this.addEventListener(eventName, dispatchDiagnostics);
     }
@@ -128,7 +156,6 @@ if (typeof SourceBuffer !== 'undefined' && SourceBuffer.prototype && typeof Sour
   const originalRemove = SourceBuffer.prototype.remove;
   SourceBuffer.prototype.remove = function smoothRemove(start, end) {
     stats.removeCalls += 1;
-    dispatchDiagnostics();
     const currentTime = findLiveVideoCurrentTime();
     const action = computeRetentionAction(currentTime, start, end, RETAIN_SECONDS);
     if (action === null) {
@@ -151,7 +178,6 @@ if (typeof SourceBuffer !== 'undefined' && SourceBuffer.prototype && typeof Sour
     }
     stats.lastReason = 'truncated';
     stats.lastRemoveEnd = action.adjustedEnd;
-    dispatchDiagnostics();
     dispatchObservation({ reason: 'truncated', targetTime: action.adjustedEnd, currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
     return originalRemove.call(this, start, action.adjustedEnd);
   };

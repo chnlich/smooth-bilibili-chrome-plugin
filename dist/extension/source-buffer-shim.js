@@ -114,7 +114,7 @@
     }
     return ranges;
   }
-  function dispatchDiagnostics() {
+  function publishDiagnostics() {
     try {
       const sourceBufferRanges = [];
       if (activeSource !== void 0) {
@@ -139,14 +139,39 @@
       console.error("[BilibiliBuffer] source buffer diagnostic dispatch failed", error);
     }
   }
-  var mediaSourceConstructor = globalThis["MediaSource"];
-  if (mediaSourceConstructor !== void 0 && typeof mediaSourceConstructor.prototype?.addSourceBuffer === "function") {
-    const originalAddSourceBuffer = mediaSourceConstructor.prototype.addSourceBuffer;
-    mediaSourceConstructor.prototype.addSourceBuffer = function smoothAddSourceBuffer(mimeType) {
+  var DIAGNOSTIC_SAMPLE_INTERVAL_MILLISECONDS = 1e3;
+  var lastDiagnosticDispatchAt = Number.NEGATIVE_INFINITY;
+  var diagnosticTimer;
+  function dispatchDiagnostics() {
+    if (diagnosticTimer !== void 0) {
+      window.clearTimeout(diagnosticTimer);
+      diagnosticTimer = void 0;
+    }
+    lastDiagnosticDispatchAt = window.performance.now();
+    publishDiagnostics();
+  }
+  function dispatchUpdateEndDiagnostics() {
+    const now = window.performance.now();
+    const elapsed = now - lastDiagnosticDispatchAt;
+    if (elapsed >= DIAGNOSTIC_SAMPLE_INTERVAL_MILLISECONDS) {
+      dispatchDiagnostics();
+      return;
+    }
+    if (diagnosticTimer === void 0) {
+      diagnosticTimer = window.setTimeout(() => {
+        diagnosticTimer = void 0;
+        lastDiagnosticDispatchAt = window.performance.now();
+        publishDiagnostics();
+      }, DIAGNOSTIC_SAMPLE_INTERVAL_MILLISECONDS - elapsed);
+    }
+  }
+  if (typeof MediaSource !== "undefined" && typeof MediaSource.prototype?.addSourceBuffer === "function") {
+    const originalAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
+    MediaSource.prototype.addSourceBuffer = function smoothAddSourceBuffer(mimeType) {
       const sourceBuffer = originalAddSourceBuffer.call(this, mimeType);
       activeSource = this;
       sourceBufferTracks.set(sourceBuffer, String(mimeType).split(";", 1)[0]);
-      sourceBuffer.addEventListener("updateend", dispatchDiagnostics);
+      sourceBuffer.addEventListener("updateend", dispatchUpdateEndDiagnostics);
       for (const eventName of ["sourceopen", "sourceended", "sourceclose"]) {
         this.addEventListener(eventName, dispatchDiagnostics);
       }
@@ -171,7 +196,6 @@
     const originalRemove = SourceBuffer.prototype.remove;
     SourceBuffer.prototype.remove = function smoothRemove(start, end) {
       stats.removeCalls += 1;
-      dispatchDiagnostics();
       const currentTime = findLiveVideoCurrentTime();
       const action = computeRetentionAction(currentTime, start, end, RETAIN_SECONDS);
       if (action === null) {
@@ -197,7 +221,6 @@
       }
       stats.lastReason = "truncated";
       stats.lastRemoveEnd = action.adjustedEnd;
-      dispatchDiagnostics();
       dispatchObservation({ reason: "truncated", targetTime: action.adjustedEnd, currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
       return originalRemove.call(this, start, action.adjustedEnd);
     };
