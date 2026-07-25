@@ -66,6 +66,7 @@ test('profile-in-use launch failures name the profile that must be closed', () =
 test('profile-in-use guard detects the Windows lockfile when its handle is busy', async () => {
   const profileDirectory = '/tmp/stall-ab-windows-lockfile';
   const checked = [];
+  let openFlags;
   await assert.rejects(
     () => assertProfileNotInUse(profileDirectory, {
       lstat: async (lockPath) => {
@@ -75,7 +76,8 @@ test('profile-in-use guard detects the Windows lockfile when its handle is busy'
         error.code = 'ENOENT';
         throw error;
       },
-      open: async () => {
+      open: async (_lockPath, flags) => {
+        openFlags = flags;
         const error = new Error('resource busy');
         error.code = 'EBUSY';
         throw error;
@@ -88,6 +90,7 @@ test('profile-in-use guard detects the Windows lockfile when its handle is busy'
     },
   );
   assert.deepEqual(checked, ['lockfile']);
+  assert.equal(openFlags, 'r+');
 });
 
 test('a stale lockfile without a live owner does not block the profile', async () => {

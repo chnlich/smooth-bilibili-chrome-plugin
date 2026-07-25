@@ -330,7 +330,9 @@ function profileInUseError(profileDirectory) {
 async function isProfileLockHeld(lockPath, open) {
   let handle;
   try {
-    handle = await open(lockPath, 'r');
+    // Chrome's Windows lockfile shares reads but not writes. This open does not modify it,
+    // and succeeds only after a stale lock has been released.
+    handle = await open(lockPath, 'r+');
   } catch (error) {
     if (error?.code === 'ENOENT') return false;
     if (error?.code === 'EBUSY') return true;
