@@ -7,9 +7,56 @@ import { test } from 'node:test';
 import { computeStallScore } from '../scripts/stall-score.mjs';
 import { readStoredEvents } from '../scripts/extension-log-pull.mjs';
 import { STALL_PROBE_SOURCE } from '../scripts/stall-probe.mjs';
-import { assertSafePayload, probeSourceForArm } from '../scripts/stall-ab.mjs';
+import {
+  assertExtensionInjection,
+  assertSafePayload,
+  launchOptionsForArm,
+  probeSourceForArm,
+  translateProfileInUseError,
+} from '../scripts/stall-ab.mjs';
 
 const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
+
+test('extension arms toggle the profile-installed extension through Playwright defaults', () => {
+  const extensionOn = launchOptionsForArm('extension-on');
+  const extensionOff = launchOptionsForArm('extension-off');
+  assert.deepEqual(extensionOn.ignoreDefaultArgs, ['--disable-extensions']);
+  assert.equal(extensionOff.ignoreDefaultArgs, undefined);
+  for (const options of [extensionOn, extensionOff]) {
+    assert.equal(options.args.some((argument) => argument.startsWith('--load-extension=')), false);
+    assert.equal(options.args.some((argument) => argument.startsWith('--disable-extensions-except=')), false);
+  }
+});
+
+test('injection assertion rejects an unarmed extension-on page state', () => {
+  assert.throws(
+    () => assertExtensionInjection('extension-on', {
+      shimMarker: undefined,
+      removeSource: 'function remove() { [native code] }',
+    }),
+    /profile-installed unpacked extension/i,
+  );
+});
+
+test('injection assertion rejects an armed extension-off page state', () => {
+  assert.throws(
+    () => assertExtensionInjection('extension-off', {
+      shimMarker: {},
+      removeSource: 'function remove() { [native code] }',
+    }),
+    /extension-off.*inactive/i,
+  );
+});
+
+test('profile-in-use launch failures name the profile that must be closed', () => {
+  const profileDirectory = '/tmp/stall-ab-profile-in-use';
+  const translated = translateProfileInUseError(
+    new Error('browserType.launchPersistentContext: Target page, context or browser has been closed'),
+    profileDirectory,
+  );
+  assert.match(translated.message, new RegExp(profileDirectory));
+  assert.match(translated.message, /Chrome instance.*holding profile.*must be closed/i);
+});
 
 async function readProbeFixture(name) {
   const content = await fs.readFile(path.join(fixtureDirectory, name), 'utf8');

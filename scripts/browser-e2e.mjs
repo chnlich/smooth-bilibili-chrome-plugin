@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { readStoredEvents } from './extension-log-pull.mjs';
+import { installUnpackedExtension } from './install-unpacked-extension.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
@@ -621,13 +622,6 @@ async function openFixture(context, url, html) {
   return page;
 }
 
-async function extensionIdFor(context) {
-  const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
-  const match = worker.url().match(/^chrome-extension:\/\/([^/]+)/);
-  assert.notEqual(match, null);
-  return match[1];
-}
-
 async function extensionSend(page, message) {
   return page.evaluate((request) => new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(request, (response) => {
@@ -728,16 +722,16 @@ let livePage;
 try {
   const launch = (profile) => chromium.launchPersistentContext(profile, {
     headless: false,
+    ignoreDefaultArgs: ['--disable-extensions'],
     args: [
       '--mute-audio',
-      `--disable-extensions-except=${extensionDirectory}`,
-      `--load-extension=${extensionDirectory}`,
+      '--enable-unsafe-extension-debugging',
     ],
   });
   context = await launch(profileDirectory);
+  extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
   await context.addInitScript({ content: `(${silentAndAuditInit.toString()})()` });
   await context.addInitScript({ content: `(${autoOpenPopupLogs.toString()})()` });
-  extensionId = await extensionIdFor(context);
 
   const videoPage = await openFixture(context, 'https://www.bilibili.com/video/BVfixture', videoFixture);
   await videoPage.evaluate(() => window.__fixture.start());
@@ -1218,7 +1212,6 @@ try {
   await context.close();
   context = await launch(profileDirectory);
   await context.addInitScript({ content: `(${silentAndAuditInit.toString()})()` });
-  extensionId = await extensionIdFor(context);
   stored = await readStoredEvents(context, extensionId);
   assert.ok(stored.events.some((event) => event.code === 'route.session_started'));
   assert.ok(stored.events.some((event) => event.code === 'live.stall.recovered'));

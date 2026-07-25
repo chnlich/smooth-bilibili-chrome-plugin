@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { installUnpackedExtension } from './install-unpacked-extension.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -149,8 +150,7 @@ try {
   const chromeArgs = [
     `--remote-debugging-port=${debugPort}`,
     `--user-data-dir=${profileDirectory}`,
-    `--disable-extensions-except=${extensionDirectory}`,
-    `--load-extension=${extensionDirectory}`,
+    '--enable-unsafe-extension-debugging',
     '--mute-audio',
     '--no-first-run',
   ];
@@ -166,6 +166,7 @@ try {
     }
   }
   if (!connected) throw new Error('无法通过 CDP 连接到 Chrome (15 次重试后放弃)');
+  await installUnpackedExtension(context, extensionDirectory);
   report.browserStarted = true;
 
   const browser = context;

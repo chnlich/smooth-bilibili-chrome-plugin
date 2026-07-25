@@ -35,6 +35,9 @@ const extensionBuildFiles = Object.freeze([
 const knownChromeRelativePath = path.win32.join('Google', 'Chrome', 'Application', 'chrome.exe');
 const knownProfileDirectoryPattern = /^(Default|Profile \d+)$/;
 const forbiddenPayloadField = /cookie|token|account/i;
+const selfCheckUrl = 'https://www.bilibili.com/video/BV1syga6fEL7';
+const profileLockFileName = 'SingletonLock';
+const extensionInjectionWaitMilliseconds = 5000;
 
 async function playwrightChromium() {
   return (await import('playwright')).chromium;
@@ -251,15 +254,61 @@ async function clearBrowserCache(context) {
   }
 }
 
-function launchArguments(arm, extensionDirectory) {
+export function launchArguments(arm) {
   const args = ['--mute-audio', '--no-first-run', '--no-default-browser-check'];
-  if (arm === 'extension-on') {
-    args.push(`--disable-extensions-except=${extensionDirectory}`);
-    args.push(`--load-extension=${extensionDirectory}`);
-    return args;
-  }
   if (arm === 'extension-off') return args;
+  if (arm === 'extension-on') return args;
   throw new Error(`ARM_INVALID: ${arm}`);
+}
+
+export function launchOptionsForArm(arm) {
+  const options = {
+    headless: false,
+    args: launchArguments(arm),
+  };
+  if (arm === 'extension-on') options.ignoreDefaultArgs = ['--disable-extensions'];
+  return options;
+}
+
+export function extensionInjectionState() {
+  const removeSource = typeof SourceBuffer === 'undefined'
+    ? undefined
+    : SourceBuffer.prototype?.remove?.toString();
+  return {
+    shimMarker: window.__smoothBufferShim,
+    removeSource,
+  };
+}
+
+function extensionSignals(state) {
+  const shimMarkerIsObject = state.shimMarker !== null
+    && typeof state.shimMarker === 'object'
+    && Array.isArray(state.shimMarker) === false;
+  const removeIsPatched = typeof state.removeSource === 'string'
+    && state.removeSource.includes('[native code]') === false;
+  return { shimMarkerIsObject, removeIsPatched };
+}
+
+export function assertExtensionInjection(arm, state) {
+  if (arm !== 'extension-on' && arm !== 'extension-off') throw new Error(`ARM_INVALID: ${arm}`);
+  const { shimMarkerIsObject, removeIsPatched } = extensionSignals(state);
+  const extensionSignalsPresent = shimMarkerIsObject || removeIsPatched;
+  const observed = `shim marker object=${shimMarkerIsObject}, `
+    + `SourceBuffer.prototype.remove patched=${removeIsPatched}`;
+  if (arm === 'extension-on' && (!shimMarkerIsObject || !removeIsPatched)) {
+    throw new BlockedError(
+      'EXTENSION_INJECTION_MISSING: extension-on requires the profile-installed unpacked extension '
+      + 'installed through chrome://extensions developer mode; '
+      + `the verified extension signals were not both observed (${observed})`,
+    );
+  }
+  if (arm === 'extension-off' && extensionSignalsPresent) {
+    throw new BlockedError(
+      'EXTENSION_INJECTION_UNEXPECTED: extension-off requires the profile-installed unpacked extension '
+      + `to be inactive, but an extension signal was observed (${observed})`,
+    );
+  }
+  return state;
 }
 
 export function probeSourceForArm(arm) {
@@ -267,13 +316,48 @@ export function probeSourceForArm(arm) {
   return STALL_PROBE_SOURCE;
 }
 
-async function launchMeasurementContext(chromeExecutable, profileDirectory, arm) {
+function profileInUseError(profileDirectory) {
+  return new BlockedError(
+    `PROFILE_IN_USE: a Chrome instance is holding profile ${path.resolve(profileDirectory)} `
+    + 'and must be closed before running stall A/B',
+  );
+}
+
+export async function assertProfileNotInUse(profileDirectory) {
+  try {
+    await fs.lstat(path.join(profileDirectory, profileLockFileName));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  throw profileInUseError(profileDirectory);
+}
+
+function isProfileInUseLaunchFailure(error) {
+  const message = String(error?.message || error);
+  return message.includes('Target page, context or browser has been closed')
+    || /(?:profile|user data directory).*(?:in use|already running|locked)/i.test(message)
+    || /Singleton(?:Lock|Cookie|Socket)/i.test(message);
+}
+
+export function translateProfileInUseError(error, profileDirectory) {
+  return isProfileInUseLaunchFailure(error) ? profileInUseError(profileDirectory) : error;
+}
+
+async function launchContext(chromeExecutable, profileDirectory, arm) {
   const chromium = await playwrightChromium();
-  const context = await chromium.launchPersistentContext(profileDirectory, {
-    executablePath: chromeExecutable,
-    headless: false,
-    args: launchArguments(arm, extensionDirectory),
-  });
+  try {
+    return await chromium.launchPersistentContext(profileDirectory, {
+      executablePath: chromeExecutable,
+      ...launchOptionsForArm(arm),
+    });
+  } catch (error) {
+    throw translateProfileInUseError(error, profileDirectory);
+  }
+}
+
+async function launchMeasurementContext(chromeExecutable, profileDirectory, arm) {
+  const context = await launchContext(chromeExecutable, profileDirectory, arm);
   await context.addInitScript({ content: DOCUMENT_START_SILENCE_SOURCE });
   await context.addInitScript({ content: probeSourceForArm(arm) });
   await clearBrowserCache(context);
@@ -281,12 +365,13 @@ async function launchMeasurementContext(chromeExecutable, profileDirectory, arm)
 }
 
 async function launchLoginContext(chromeExecutable, profileDirectory) {
-  const chromium = await playwrightChromium();
-  const context = await chromium.launchPersistentContext(profileDirectory, {
-    executablePath: chromeExecutable,
-    headless: false,
-    args: launchArguments('extension-off', extensionDirectory),
-  });
+  const context = await launchContext(chromeExecutable, profileDirectory, 'extension-off');
+  await context.addInitScript({ content: DOCUMENT_START_SILENCE_SOURCE });
+  return context;
+}
+
+async function launchSelfCheckContext(chromeExecutable, profileDirectory) {
+  const context = await launchContext(chromeExecutable, profileDirectory, 'extension-on');
   await context.addInitScript({ content: DOCUMENT_START_SILENCE_SOURCE });
   return context;
 }
@@ -316,6 +401,35 @@ function pageHasVideo() {
   return videos.length > 0;
 }
 
+function extensionInjectionReady() {
+  const shimMarkerIsObject = window.__smoothBufferShim !== null
+    && typeof window.__smoothBufferShim === 'object'
+    && Array.isArray(window.__smoothBufferShim) === false;
+  const removeSource = typeof SourceBuffer === 'undefined'
+    ? undefined
+    : SourceBuffer.prototype?.remove?.toString();
+  return shimMarkerIsObject
+    && typeof removeSource === 'string'
+    && removeSource.includes('[native code]') === false;
+}
+
+async function assertPageExtensionState(page, arm) {
+  if (arm === 'extension-on') {
+    try {
+      await page.waitForFunction(extensionInjectionReady, undefined, {
+        timeout: extensionInjectionWaitMilliseconds,
+      });
+    } catch (error) {
+      const state = await page.evaluate(extensionInjectionState);
+      assertExtensionInjection(arm, state);
+      throw new BlockedError(
+        `EXTENSION_INJECTION_MISSING: extension-on injection probe timed out (${error.message})`,
+      );
+    }
+  }
+  return assertExtensionInjection(arm, await page.evaluate(extensionInjectionState));
+}
+
 async function assertPageReachable(response) {
   if (response === null || response.status() >= 400) {
     throw new BlockedError(`BILIBILI_UNREACHABLE: page response status ${response?.status() ?? 'missing'}`);
@@ -340,7 +454,7 @@ async function assertSignedInAndReachable(page, response) {
   }
 }
 
-async function preparePlayback(page, bvid, rate) {
+async function loadPlaybackPage(page, bvid, arm) {
   const url = `https://www.bilibili.com/video/${bvid}`;
   let response;
   try {
@@ -349,11 +463,15 @@ async function preparePlayback(page, bvid, rate) {
     throw new BlockedError(`BILIBILI_UNREACHABLE: ${error.message}`);
   }
   await assertSignedInAndReachable(page, response);
+  await assertPageExtensionState(page, arm);
   try {
     await page.waitForFunction(pageHasVideo, undefined, { timeout: 45000 });
   } catch (error) {
     throw new BlockedError(`BILIBILI_VIDEO_MISSING: no native video became available (${error.message})`);
   }
+}
+
+async function startPlayback(page, rate) {
   const state = await page.evaluate((playbackRate) => {
     const videos = [...document.querySelectorAll('video')];
     for (const iframe of document.querySelectorAll('iframe')) {
@@ -430,10 +548,6 @@ function assertSafePayload(payload, pathName = 'payload') {
 
 export { assertSafePayload };
 
-function redactProfilePath(message, profileDirectory) {
-  return String(message).split(profileDirectory).join('<profile>');
-}
-
 async function writeJsonLines(filePath, values) {
   assertSafePayload(values);
   const content = values.map((value) => `${JSON.stringify(value)}\n`).join('');
@@ -446,18 +560,20 @@ async function writeJson(filePath, value) {
 }
 
 async function runArm({ arm, options, chromeExecutable, outputDirectory }) {
+  await assertProfileNotInUse(options.profile);
   await clearProfileMediaCache(options.profile);
   const context = await launchMeasurementContext(chromeExecutable, options.profile, arm);
   let page;
   try {
     let extensionId;
     let initialAfterEventId = 0;
+    page = await context.newPage();
+    await loadPlaybackPage(page, options.bv, arm);
     if (arm === 'extension-on') {
       extensionId = await extensionIdFor(context);
       initialAfterEventId = await readExtensionMaxEventId(context, extensionId);
     }
-    page = await context.newPage();
-    await preparePlayback(page, options.bv, options.rate);
+    await startPlayback(page, options.rate);
     await resetStallProbes(page);
     await page.waitForTimeout(options.seconds * 1000);
     const records = await collectProbeRecords(page);
@@ -501,40 +617,29 @@ async function runMeasurement(options) {
   const chromeExecutable = await resolveChromeExecutable();
   await assertExtensionBuild();
   await assertProfileDirectory(options.profile);
+  await assertProfileNotInUse(options.profile);
   const outputDirectory = path.resolve(options.out);
   await assertOutputDirectoryDoesNotExist(outputDirectory);
   await fs.mkdir(outputDirectory, { recursive: true });
   const metrics = {};
   const armOrder = randomizeArms(options.arms);
-  try {
-    for (const arm of armOrder) {
-      metrics[arm] = await runArm({ arm, options, chromeExecutable, outputDirectory });
-    }
-    const comparison = {
-      'extension-on': metrics['extension-on'],
-      'extension-off': metrics['extension-off'],
-      gate: gateFor(metrics),
-    };
-    await writeJson(path.join(outputDirectory, 'compare.json'), comparison);
-    console.log(`stall A/B complete: gate=${comparison.gate}`);
-  } catch (error) {
-    const status = error instanceof BlockedError ? 'BLOCKED' : 'ERROR';
-    const comparison = {
-      status,
-      reason: redactProfilePath(error.message || String(error), options.profile),
-      'extension-on': metrics['extension-on'] || null,
-      'extension-off': metrics['extension-off'] || null,
-      gate: null,
-    };
-    await writeJson(path.join(outputDirectory, 'compare.json'), comparison);
-    throw error;
+  for (const arm of armOrder) {
+    metrics[arm] = await runArm({ arm, options, chromeExecutable, outputDirectory });
   }
+  const comparison = {
+    'extension-on': metrics['extension-on'],
+    'extension-off': metrics['extension-off'],
+    gate: gateFor(metrics),
+  };
+  await writeJson(path.join(outputDirectory, 'compare.json'), comparison);
+  console.log(`stall A/B complete: gate=${comparison.gate}`);
 }
 
 async function runLogin(options) {
   requireWindowsNode();
   const chromeExecutable = await resolveChromeExecutable();
   await fs.mkdir(options.profile, { recursive: true });
+  await assertProfileNotInUse(options.profile);
   const context = await launchLoginContext(chromeExecutable, options.profile);
   const page = await context.newPage();
   try {
@@ -567,9 +672,26 @@ async function runSelfCheck(options) {
     throw new Error('ENV_PROFILE_MISSING: --profile is required for self-check');
   }
   await assertProfileDirectory(options.profile);
+  await assertProfileNotInUse(options.profile);
+  const context = await launchSelfCheckContext(chromeExecutable, options.profile);
+  let page;
+  try {
+    page = await context.newPage();
+    let response;
+    try {
+      response = await page.goto(selfCheckUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (error) {
+      throw new BlockedError(`BILIBILI_UNREACHABLE: ${error.message}`);
+    }
+    await assertPageReachable(response);
+    await assertPageExtensionState(page, 'extension-on');
+  } finally {
+    await page?.close();
+    await context.close();
+  }
   console.log(
     `self-check passed: Windows Node, Chrome ${path.win32.basename(chromeExecutable)}, `
-    + 'profile directory, extension build',
+    + 'profile directory, extension build, profile-installed extension injection',
   );
 }
 

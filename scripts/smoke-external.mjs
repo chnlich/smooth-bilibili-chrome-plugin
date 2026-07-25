@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { installUnpackedExtension } from './install-unpacked-extension.mjs';
 import { readMaxEventId, readStoredEvents } from './extension-log-pull.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -588,15 +589,14 @@ const report = {
 try {
   context = await chromium.launchPersistentContext(profileDirectory, {
     headless: false,
+    ignoreDefaultArgs: ['--disable-extensions'],
     args: [
       '--mute-audio',
-      `--disable-extensions-except=${extensionDirectory}`,
-      `--load-extension=${extensionDirectory}`,
+      '--enable-unsafe-extension-debugging',
     ],
   });
   report.browser.browserStarted = true;
-  const serviceWorker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
-  const extensionId = new URL(serviceWorker.url()).hostname;
+  const extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
   await context.addInitScript({ content: `(${mutedInit.toString()})()` });
   const video = await runPage(context, extensionId, 'video', 'https://www.bilibili.com/video/BV1ohQVBFEsh');
   report.results.push(video.result);
