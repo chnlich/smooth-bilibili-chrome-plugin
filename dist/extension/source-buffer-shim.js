@@ -28,6 +28,7 @@
   // src/extension/bridge-contract.js
   var SHIM_OBSERVATION_ATTRIBUTE = "data-bilibili-buffer-shim-observation";
   var SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = "data-bilibili-buffer-shim-seq";
+  var SHIM_DIAGNOSTIC_ATTRIBUTE = "data-bilibili-buffer-shim-diagnostics";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
     "callCoreSync",
@@ -67,6 +68,9 @@
     lastRemoveEnd: null,
     lastOriginalEnd: null
   };
+  var sourceBufferTracks = /* @__PURE__ */ new WeakMap();
+  var appendErrors = /* @__PURE__ */ Object.create(null);
+  var activeSource;
   function findLiveVideoCurrentTime() {
     const videos = [...document.querySelectorAll("video")];
     for (const iframe of document.querySelectorAll("iframe")) {
@@ -99,10 +103,75 @@
     } catch {
     }
   }
+  function readSourceBufferRanges(sourceBuffer) {
+    const ranges = [];
+    try {
+      for (let index = 0; index < sourceBuffer.buffered.length; index += 1) {
+        ranges.push({ start: sourceBuffer.buffered.start(index), end: sourceBuffer.buffered.end(index) });
+      }
+    } catch (error) {
+      console.error("[BilibiliBuffer] source buffer diagnostic read failed", error);
+    }
+    return ranges;
+  }
+  function dispatchDiagnostics() {
+    try {
+      const sourceBufferRanges = [];
+      if (activeSource !== void 0) {
+        for (let index = 0; index < activeSource.sourceBuffers.length; index += 1) {
+          const sourceBuffer = activeSource.sourceBuffers[index];
+          sourceBufferRanges.push({
+            track: sourceBufferTracks.get(sourceBuffer) || "unknown",
+            ranges: readSourceBufferRanges(sourceBuffer)
+          });
+        }
+      }
+      document.documentElement.setAttribute(SHIM_DIAGNOSTIC_ATTRIBUTE, JSON.stringify({
+        sourceBufferRanges,
+        mediaSourceState: activeSource?.readyState || null,
+        appendErrors: { ...appendErrors },
+        removeStats: {
+          removeCalls: stats.removeCalls,
+          intercepted: stats.intercepted
+        }
+      }));
+    } catch (error) {
+      console.error("[BilibiliBuffer] source buffer diagnostic dispatch failed", error);
+    }
+  }
+  var mediaSourceConstructor = globalThis["MediaSource"];
+  if (mediaSourceConstructor !== void 0 && typeof mediaSourceConstructor.prototype?.addSourceBuffer === "function") {
+    const originalAddSourceBuffer = mediaSourceConstructor.prototype.addSourceBuffer;
+    mediaSourceConstructor.prototype.addSourceBuffer = function smoothAddSourceBuffer(mimeType) {
+      const sourceBuffer = originalAddSourceBuffer.call(this, mimeType);
+      activeSource = this;
+      sourceBufferTracks.set(sourceBuffer, String(mimeType).split(";", 1)[0]);
+      sourceBuffer.addEventListener("updateend", dispatchDiagnostics);
+      for (const eventName of ["sourceopen", "sourceended", "sourceclose"]) {
+        this.addEventListener(eventName, dispatchDiagnostics);
+      }
+      dispatchDiagnostics();
+      return sourceBuffer;
+    };
+  }
+  if (typeof SourceBuffer !== "undefined" && typeof SourceBuffer.prototype?.appendBuffer === "function") {
+    const originalAppendBuffer = SourceBuffer.prototype.appendBuffer;
+    SourceBuffer.prototype.appendBuffer = function smoothAppendBuffer(...args) {
+      try {
+        return originalAppendBuffer.call(this, ...args);
+      } catch (error) {
+        const name = typeof error?.name === "string" && error.name.length > 0 ? error.name : "UnknownError";
+        appendErrors[name] = (appendErrors[name] || 0) + 1;
+        dispatchDiagnostics();
+        throw error;
+      }
+    };
+  }
   if (typeof SourceBuffer !== "undefined" && SourceBuffer.prototype && typeof SourceBuffer.prototype.remove === "function") {
     const originalRemove = SourceBuffer.prototype.remove;
     SourceBuffer.prototype.remove = function smoothRemove(start, end) {
       stats.removeCalls += 1;
+      dispatchDiagnostics();
       const currentTime = findLiveVideoCurrentTime();
       const action = computeRetentionAction(currentTime, start, end, RETAIN_SECONDS);
       if (action === null) {
@@ -112,6 +181,7 @@
       stats.lastCurrentTime = currentTime;
       stats.lastRemoveStart = start;
       stats.lastOriginalEnd = end;
+      dispatchDiagnostics();
       if (action.action === "skipped") {
         stats.lastReason = "skipped";
         stats.lastRemoveEnd = end;
@@ -127,11 +197,13 @@
       }
       stats.lastReason = "truncated";
       stats.lastRemoveEnd = action.adjustedEnd;
+      dispatchDiagnostics();
       dispatchObservation({ reason: "truncated", targetTime: action.adjustedEnd, currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
       return originalRemove.call(this, start, action.adjustedEnd);
     };
     installed = true;
   }
   window.__smoothBufferShim = { retainSeconds: RETAIN_SECONDS, installed, stats };
+  dispatchDiagnostics();
 })();
 //# sourceMappingURL=source-buffer-shim.js.map

@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { readMaxEventId, readStoredEvents } from './extension-log-pull.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
@@ -120,63 +121,6 @@ function bridgeAuditRecord(request) {
   const mode = request?.mode === 'sync' || request?.mode === 'async' ? request.mode : 'invalid';
   if (!Number.isSafeInteger(request?.id) || request.id <= 0) return { operation, mode };
   return { operation, mode, id: request.id };
-}
-
-async function readStoredEvents(context, extensionId, startAfterEventId = 0) {
-  const page = await context.newPage();
-  try {
-    await page.goto(`chrome-extension://${extensionId}/logs.html`, { waitUntil: 'domcontentloaded' });
-    return await page.evaluate((initialAfterEventId) => new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ version: 1, type: 'logs:max-event-id' }, (snapshot) => {
-        if (chrome.runtime.lastError !== undefined) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        const events = [];
-        let afterEventId = initialAfterEventId;
-        const readPage = () => chrome.runtime.sendMessage({
-          version: 1,
-          type: 'logs:events-page',
-          limit: 250,
-          afterEventId,
-          maxEventId: snapshot.maxEventId,
-        }, (response) => {
-          if (chrome.runtime.lastError !== undefined) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
-          }
-          events.push(...response.events);
-          if (!response.hasMore) {
-            resolve({ maxEventId: snapshot.maxEventId, events });
-            return;
-          }
-          afterEventId = response.nextAfterEventId;
-          readPage();
-        });
-        readPage();
-      });
-    }), startAfterEventId);
-  } finally {
-    await page.close();
-  }
-}
-
-async function readMaxEventId(context, extensionId) {
-  const page = await context.newPage();
-  try {
-    await page.goto(`chrome-extension://${extensionId}/logs.html`, { waitUntil: 'domcontentloaded' });
-    return await page.evaluate(() => new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ version: 1, type: 'logs:max-event-id' }, (snapshot) => {
-        if (chrome.runtime.lastError !== undefined) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        resolve(snapshot.maxEventId);
-      });
-    }));
-  } finally {
-    await page.close();
-  }
 }
 
 async function waitForVideoHint(context, extensionId, pathname, startAfterEventId, timeout = 10000) {

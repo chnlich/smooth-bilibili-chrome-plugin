@@ -1,4 +1,5 @@
 import { MEDIA_EVENT_NAMES } from './catalog.js';
+import { SHIM_DIAGNOSTIC_ATTRIBUTE } from '../extension/bridge-contract.js';
 import { UNKNOWN_VALUE } from './privacy.js';
 
 function readRanges(timeRanges) {
@@ -14,10 +15,55 @@ function readNumber(value) {
   return Number.isFinite(value) ? value : UNKNOWN_VALUE;
 }
 
+function readVideoQuality(video) {
+  if (typeof video.getVideoPlaybackQuality !== 'function') return null;
+  try {
+    const quality = video.getVideoPlaybackQuality();
+    return {
+      total: readNumber(quality.totalVideoFrames),
+      dropped: readNumber(quality.droppedVideoFrames),
+      corrupted: readNumber(quality.corruptedVideoFrames),
+    };
+  } catch (error) {
+    console.error('[BilibiliBuffer] video playback quality read failed', error);
+    return UNKNOWN_VALUE;
+  }
+}
+
+function readShimDiagnostics(video) {
+  const attribute = video.ownerDocument?.documentElement?.getAttribute(SHIM_DIAGNOSTIC_ATTRIBUTE);
+  if (attribute === null || attribute === undefined) {
+    return {
+      sourceBufferRanges: UNKNOWN_VALUE,
+      mediaSourceState: UNKNOWN_VALUE,
+      appendErrors: UNKNOWN_VALUE,
+      removeStats: UNKNOWN_VALUE,
+    };
+  }
+  try {
+    const value = JSON.parse(attribute);
+    return {
+      sourceBufferRanges: value.sourceBufferRanges,
+      mediaSourceState: value.mediaSourceState,
+      appendErrors: value.appendErrors,
+      removeStats: value.removeStats,
+    };
+  } catch (error) {
+    console.error('[BilibiliBuffer] shim diagnostic read failed', error);
+    return {
+      sourceBufferRanges: UNKNOWN_VALUE,
+      mediaSourceState: UNKNOWN_VALUE,
+      appendErrors: UNKNOWN_VALUE,
+      removeStats: UNKNOWN_VALUE,
+    };
+  }
+}
+
 export function readMediaFacts(video, eventType = 'sample') {
   if (video === undefined || video === null) return UNKNOWN_VALUE;
   const bufferedRanges = readRanges(video.buffered);
   const seekableRanges = readRanges(video.seekable);
+  const shimDiagnostics = readShimDiagnostics(video);
   let estimatedDelay = UNKNOWN_VALUE;
   if (Array.isArray(seekableRanges) && seekableRanges.length > 0 && Number.isFinite(video.currentTime)) {
     const end = seekableRanges[seekableRanges.length - 1].end;
@@ -40,6 +86,11 @@ export function readMediaFacts(video, eventType = 'sample') {
     playbackRate: readNumber(video.playbackRate),
     estimatedDelay,
     source: video.currentSrc || video.src || UNKNOWN_VALUE,
+    videoQuality: readVideoQuality(video),
+    sourceBufferRanges: shimDiagnostics.sourceBufferRanges,
+    mediaSourceState: shimDiagnostics.mediaSourceState,
+    appendErrors: shimDiagnostics.appendErrors,
+    removeStats: shimDiagnostics.removeStats,
   };
 }
 
@@ -110,6 +161,11 @@ export class MediaEventRecorder {
         playbackRate: UNKNOWN_VALUE,
         estimatedDelay: UNKNOWN_VALUE,
         source: UNKNOWN_VALUE,
+        videoQuality: UNKNOWN_VALUE,
+        sourceBufferRanges: UNKNOWN_VALUE,
+        mediaSourceState: UNKNOWN_VALUE,
+        appendErrors: UNKNOWN_VALUE,
+        removeStats: UNKNOWN_VALUE,
       };
     }
     this.writeLog(`media.${name}`, facts, error);
@@ -124,7 +180,8 @@ export class MediaEventRecorder {
   }
 
   scheduleFrameCallback() {
-    if (this.destroyed || this.frameCallbackActive || typeof this.video.requestVideoFrameCallback !== 'function') return;
+    if (this.destroyed || this.frameCallbackActive
+      || typeof this.video.requestVideoFrameCallback !== 'function') return;
     this.frameCallbackActive = true;
     try {
       this.video.requestVideoFrameCallback((_now, metadata) => {

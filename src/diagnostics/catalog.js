@@ -127,6 +127,11 @@ export const DATA_ALLOWLIST = Object.freeze({
     'playbackRate',
     'estimatedDelay',
     'source',
+    'videoQuality',
+    'sourceBufferRanges',
+    'mediaSourceState',
+    'appendErrors',
+    'removeStats',
   ]),
   resource: Object.freeze([
     'name',

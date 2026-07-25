@@ -1,0 +1,7 @@
+{"type":"timeupdate","elapsedMs":0,"currentTime":0,"readyState":4,"paused":false,"playbackRate":1,"bufferedRanges":[{"start":0,"end":30}],"videoQuality":null}
+{"type":"waiting","elapsedMs":1000,"currentTime":1,"readyState":2,"paused":false,"playbackRate":1,"bufferedRanges":[{"start":0,"end":1}],"videoQuality":null}
+{"type":"playing","elapsedMs":2500,"currentTime":1,"readyState":4,"paused":false,"playbackRate":1,"bufferedRanges":[{"start":0,"end":30}],"videoQuality":null}
+{"type":"timeupdate","elapsedMs":3000,"currentTime":1.5,"readyState":2,"paused":false,"playbackRate":1,"bufferedRanges":[{"start":0,"end":1}],"videoQuality":null}
+{"type":"waiting","elapsedMs":3000,"currentTime":1.5,"readyState":2,"paused":false,"playbackRate":1,"bufferedRanges":[{"start":0,"end":1}],"videoQuality":null}
+{"type":"playing","elapsedMs":4500,"currentTime":1.5,"readyState":4,"paused":false,"playbackRate":1,"bufferedRanges":[{"start":0,"end":30}],"videoQuality":null}
+{"type":"timeupdate","elapsedMs":5000,"currentTime":2.5,"readyState":4,"paused":false,"playbackRate":1,"bufferedRanges":[{"start":0,"end":30}],"videoQuality":null}

@@ -18,6 +18,16 @@ npm ci
 npm run build
 ```
 
+Windows 上运行真实 Chrome 的 A/B harness 时，从 Windows checkout 执行以下安装和构建命令。它使用系统 Chrome，不下载 Playwright Chromium：
+
+```bat
+cd /d E:\workspace\smooth-bilibili-chrome-plugin
+set "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1"
+E:\tools\node\npm.cmd install
+E:\tools\node\npm.cmd run build
+E:\tools\node\node.exe scripts\stall-ab.mjs --self-check --profile E:\profiles\bilibili
+```
+
 在 `chrome://extensions` 开启开发者模式，选择 `dist/extension` 加载未打包扩展。源代码或构建产物更新后，在扩展页手动点击“重新加载”，再刷新已经打开的 Bilibili 页面。本仓库已提交可直接加载的 `dist/extension`，包括 MV3 service worker、页面桥接、控制器、popup、开发日志页和外部 source map。
 
 扩展只申请 `storage` 与 `unlimitedStorage`，没有 `tabs`、`downloads` 或宽泛 host permission。内容脚本会覆盖 `www.bilibili.com` 以便记录无关路由诊断，但视频增强只在批准的两个视频路由启动。
@@ -30,6 +40,24 @@ popup 的“直播增强”和“视频增强”是刷新后的默认开关；�
 
 日志记录包括独立记录身份、连续编号、播放器和媒体来源的更换记录、所有实际触发的标准媒体事件（包括 `volumechange`）、每秒完整 buffered/seekable ranges、资源 timing 与字节字段、120 秒提示、真实直播卡顿/延迟/换源/保护、桥接、生命周期和保存结果。日志不上传，不保存 Cookie、账号、页面文字、聊天、API body、签名 query、媒体字节、帧或截图。
 
+## Stall A/B harness
+
+`stall-ab` 用同一个 document-start probe 在真实 Bilibili 视频页上测量 extension-on 和 extension-off 两个 arm。它随机化 arm 顺序，在每个 arm 前清理 profile 的 media cache，并把 extension-on 的 `logs:events-page` 全量分页结果自动写出，不需要点击日志页的导出按钮。
+
+先用持久化 profile 完成一次人工登录：
+
+```bat
+E:\tools\node\node.exe scripts\stall-ab.mjs --login --profile E:\profiles\bilibili
+```
+
+后续运行使用同一个 profile：
+
+```bat
+E:\tools\node\node.exe scripts\stall-ab.mjs --bv BV1syga6fEL7 --seconds 180 --rate 2 --arms extension-on,extension-off --profile E:\profiles\bilibili --out artifacts\stall-ab-20260724T000000Z
+```
+
+输出目录包含两个 arm 的 `probe.jsonl` 与 `metric.json`、extension-on 的 `extlog.jsonl` 和 `compare.json`。`compare.json` 只报告 Phase 1 gate，不自动改变播放行为。profile 必须保持在仓库外；登录失效、页面不可达或没有原生 video 时命令以非零状态报告 `BLOCKED`。
+
 ## 构建与验证
 
 ```sh
@@ -39,4 +67,4 @@ npm audit --json
 npm audit --omit=dev --json
 ```
 
-构建保持未压缩并为每个 JavaScript bundle 生成外部 source map。`buildId` 由 `src` 内容确定性生成；源码不变时连续构建的文件内容、文件列表和 build id 相同。自动化浏览器始终使用 fresh temporary profile、`--mute-audio` 和 document-start 静音 guard；真实 Bilibili 页面受环境阻挡时只报告 `BLOCKED`，不伪造通过。
+构建保持未压缩并为每个 JavaScript bundle 生成外部 source map。`buildId` 由 `src` 内容确定性生成；源码不变时连续构建的文件内容、文件列表和 build id 相同。stall A/B automation 使用 `--profile` 指定的 persistent signed-in profile；现有 deterministic browser tests 仍使用 fresh temporary profile。所有自动化浏览器都保持 `--mute-audio` 和 document-start 静音 guard；真实 Bilibili 页面受环境阻挡时只报告 `BLOCKED`，不伪造通过。

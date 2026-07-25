@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { readStoredEvents } from './extension-log-pull.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
@@ -637,40 +638,6 @@ async function extensionSend(page, message) {
       resolve(response);
     });
   }), message);
-}
-
-async function readStoredEvents(context, extensionId) {
-  const page = await context.newPage();
-  await page.goto(`chrome-extension://${extensionId}/logs.html`, { waitUntil: 'domcontentloaded' });
-  const result = await page.evaluate(async () => {
-    const send = (message) => new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(message, (response) => {
-        if (chrome.runtime.lastError !== undefined) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        resolve(response);
-      });
-    });
-    const snapshot = await send({ version: 1, type: 'logs:max-event-id' });
-    const events = [];
-    let afterEventId = 0;
-    for (;;) {
-      const response = await send({
-        version: 1,
-        type: 'logs:events-page',
-        limit: 250,
-        afterEventId,
-        maxEventId: snapshot.maxEventId,
-      });
-      events.push(...response.events);
-      if (!response.hasMore) break;
-      afterEventId = response.nextAfterEventId;
-    }
-    return { maxEventId: snapshot.maxEventId, events };
-  });
-  await page.close();
-  return result;
 }
 
 async function waitForStoredEvents(context, extensionId, predicate, timeout = 10000) {

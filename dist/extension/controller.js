@@ -144,7 +144,12 @@
       "resolution",
       "playbackRate",
       "estimatedDelay",
-      "source"
+      "source",
+      "videoQuality",
+      "sourceBufferRanges",
+      "mediaSourceState",
+      "appendErrors",
+      "removeStats"
     ]),
     resource: Object.freeze([
       "name",
@@ -262,6 +267,43 @@
       };
     });
   }
+  function safeSourceBufferRanges(value) {
+    if (!Array.isArray(value)) return UNKNOWN_VALUE;
+    return value.map((track) => {
+      if (track === null || typeof track !== "object" || Array.isArray(track)) {
+        throw new Error("track buffer range structure is invalid");
+      }
+      return {
+        track: safeScalar(track.track),
+        ranges: safeRangeList(track.ranges)
+      };
+    });
+  }
+  function safeAppendErrors(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
+    const result = {};
+    for (const [name, count] of Object.entries(value)) {
+      result[safeScalar(name)] = Number.isInteger(count) && count >= 0 ? count : UNKNOWN_VALUE;
+    }
+    return result;
+  }
+  function safeVideoQuality(value) {
+    if (value === null) return null;
+    if (value === UNKNOWN_VALUE) return value;
+    if (typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
+    return {
+      total: finiteOrUnknown(value.total),
+      dropped: finiteOrUnknown(value.dropped),
+      corrupted: finiteOrUnknown(value.corrupted)
+    };
+  }
+  function safeRemoveStats(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
+    return {
+      removeCalls: Number.isInteger(value.removeCalls) && value.removeCalls >= 0 ? value.removeCalls : UNKNOWN_VALUE,
+      intercepted: Number.isInteger(value.intercepted) && value.intercepted >= 0 ? value.intercepted : UNKNOWN_VALUE
+    };
+  }
   function safeResolution(value) {
     if (value === UNKNOWN_VALUE) return value;
     if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
@@ -279,6 +321,10 @@
     if (["roomId", "bvid", "part", "watchLaterItem"].includes(field)) return scrubIdentifier(value);
     if (field === "source" || field === "previousSource" || field === "name") return scrubUrl(value);
     if (field === "bufferedRanges" || field === "seekableRanges") return safeRangeList(value);
+    if (field === "sourceBufferRanges") return safeSourceBufferRanges(value);
+    if (field === "videoQuality") return safeVideoQuality(value);
+    if (field === "appendErrors") return safeAppendErrors(value);
+    if (field === "removeStats") return safeRemoveStats(value);
     if (field === "resolution") return safeResolution(value);
     if (field === "transferSize" || field === "encodedBodySize" || field === "decodedBodySize" || field === "startTime" || field === "duration" || field === "responseStart" || field === "responseEnd") {
       return browserMetric(value);
@@ -422,7 +468,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-e40479f47956bf1e2baf5b0a" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-569255ec6972d1f09ba7f373" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -491,6 +537,7 @@
   var BRIDGE_RESPONSE_ATTRIBUTE = "data-bilibili-buffer-bridge-response-v1";
   var SHIM_OBSERVATION_ATTRIBUTE = "data-bilibili-buffer-shim-observation";
   var SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = "data-bilibili-buffer-shim-seq";
+  var SHIM_DIAGNOSTIC_ATTRIBUTE = "data-bilibili-buffer-shim-diagnostics";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
     "callCoreSync",
@@ -879,10 +926,53 @@
   function readNumber(value) {
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }
+  function readVideoQuality(video) {
+    if (typeof video.getVideoPlaybackQuality !== "function") return null;
+    try {
+      const quality = video.getVideoPlaybackQuality();
+      return {
+        total: readNumber(quality.totalVideoFrames),
+        dropped: readNumber(quality.droppedVideoFrames),
+        corrupted: readNumber(quality.corruptedVideoFrames)
+      };
+    } catch (error) {
+      console.error("[BilibiliBuffer] video playback quality read failed", error);
+      return UNKNOWN_VALUE;
+    }
+  }
+  function readShimDiagnostics(video) {
+    const attribute = video.ownerDocument?.documentElement?.getAttribute(SHIM_DIAGNOSTIC_ATTRIBUTE);
+    if (attribute === null || attribute === void 0) {
+      return {
+        sourceBufferRanges: UNKNOWN_VALUE,
+        mediaSourceState: UNKNOWN_VALUE,
+        appendErrors: UNKNOWN_VALUE,
+        removeStats: UNKNOWN_VALUE
+      };
+    }
+    try {
+      const value = JSON.parse(attribute);
+      return {
+        sourceBufferRanges: value.sourceBufferRanges,
+        mediaSourceState: value.mediaSourceState,
+        appendErrors: value.appendErrors,
+        removeStats: value.removeStats
+      };
+    } catch (error) {
+      console.error("[BilibiliBuffer] shim diagnostic read failed", error);
+      return {
+        sourceBufferRanges: UNKNOWN_VALUE,
+        mediaSourceState: UNKNOWN_VALUE,
+        appendErrors: UNKNOWN_VALUE,
+        removeStats: UNKNOWN_VALUE
+      };
+    }
+  }
   function readMediaFacts(video, eventType = "sample") {
     if (video === void 0 || video === null) return UNKNOWN_VALUE;
     const bufferedRanges = readRanges(video.buffered);
     const seekableRanges = readRanges(video.seekable);
+    const shimDiagnostics = readShimDiagnostics(video);
     let estimatedDelay = UNKNOWN_VALUE;
     if (Array.isArray(seekableRanges) && seekableRanges.length > 0 && Number.isFinite(video.currentTime)) {
       const end = seekableRanges[seekableRanges.length - 1].end;
@@ -904,7 +994,12 @@
       },
       playbackRate: readNumber(video.playbackRate),
       estimatedDelay,
-      source: video.currentSrc || video.src || UNKNOWN_VALUE
+      source: video.currentSrc || video.src || UNKNOWN_VALUE,
+      videoQuality: readVideoQuality(video),
+      sourceBufferRanges: shimDiagnostics.sourceBufferRanges,
+      mediaSourceState: shimDiagnostics.mediaSourceState,
+      appendErrors: shimDiagnostics.appendErrors,
+      removeStats: shimDiagnostics.removeStats
     };
   }
   var MediaEventRecorder = class {
@@ -973,7 +1068,12 @@
           resolution: { width: UNKNOWN_VALUE, height: UNKNOWN_VALUE },
           playbackRate: UNKNOWN_VALUE,
           estimatedDelay: UNKNOWN_VALUE,
-          source: UNKNOWN_VALUE
+          source: UNKNOWN_VALUE,
+          videoQuality: UNKNOWN_VALUE,
+          sourceBufferRanges: UNKNOWN_VALUE,
+          mediaSourceState: UNKNOWN_VALUE,
+          appendErrors: UNKNOWN_VALUE,
+          removeStats: UNKNOWN_VALUE
         };
       }
       this.writeLog(`media.${name}`, facts, error);

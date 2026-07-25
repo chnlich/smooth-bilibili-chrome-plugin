@@ -79,6 +79,47 @@ function safeRangeList(value) {
   });
 }
 
+function safeSourceBufferRanges(value) {
+  if (!Array.isArray(value)) return UNKNOWN_VALUE;
+  return value.map((track) => {
+    if (track === null || typeof track !== 'object' || Array.isArray(track)) {
+      throw new Error('track buffer range structure is invalid');
+    }
+    return {
+      track: safeScalar(track.track),
+      ranges: safeRangeList(track.ranges),
+    };
+  });
+}
+
+function safeAppendErrors(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return UNKNOWN_VALUE;
+  const result = {};
+  for (const [name, count] of Object.entries(value)) {
+    result[safeScalar(name)] = Number.isInteger(count) && count >= 0 ? count : UNKNOWN_VALUE;
+  }
+  return result;
+}
+
+function safeVideoQuality(value) {
+  if (value === null) return null;
+  if (value === UNKNOWN_VALUE) return value;
+  if (typeof value !== 'object' || Array.isArray(value)) return UNKNOWN_VALUE;
+  return {
+    total: finiteOrUnknown(value.total),
+    dropped: finiteOrUnknown(value.dropped),
+    corrupted: finiteOrUnknown(value.corrupted),
+  };
+}
+
+function safeRemoveStats(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return UNKNOWN_VALUE;
+  return {
+    removeCalls: Number.isInteger(value.removeCalls) && value.removeCalls >= 0 ? value.removeCalls : UNKNOWN_VALUE,
+    intercepted: Number.isInteger(value.intercepted) && value.intercepted >= 0 ? value.intercepted : UNKNOWN_VALUE,
+  };
+}
+
 function safeResolution(value) {
   if (value === UNKNOWN_VALUE) return value;
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return UNKNOWN_VALUE;
@@ -97,6 +138,10 @@ function sanitizeField(field, value) {
   if (['roomId', 'bvid', 'part', 'watchLaterItem'].includes(field)) return scrubIdentifier(value);
   if (field === 'source' || field === 'previousSource' || field === 'name') return scrubUrl(value);
   if (field === 'bufferedRanges' || field === 'seekableRanges') return safeRangeList(value);
+  if (field === 'sourceBufferRanges') return safeSourceBufferRanges(value);
+  if (field === 'videoQuality') return safeVideoQuality(value);
+  if (field === 'appendErrors') return safeAppendErrors(value);
+  if (field === 'removeStats') return safeRemoveStats(value);
   if (field === 'resolution') return safeResolution(value);
   if (
     field === 'transferSize' ||

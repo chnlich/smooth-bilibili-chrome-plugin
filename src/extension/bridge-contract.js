@@ -4,6 +4,7 @@ export const BRIDGE_RESPONSE_EVENT = 'bilibili-buffer:bridge-response-v1';
 export const BRIDGE_RESPONSE_ATTRIBUTE = 'data-bilibili-buffer-bridge-response-v1';
 export const SHIM_OBSERVATION_ATTRIBUTE = 'data-bilibili-buffer-shim-observation';
 export const SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = 'data-bilibili-buffer-shim-seq';
+export const SHIM_DIAGNOSTIC_ATTRIBUTE = 'data-bilibili-buffer-shim-diagnostics';
 
 export const BRIDGE_OPERATIONS = Object.freeze([
   'getCoreSnapshot',

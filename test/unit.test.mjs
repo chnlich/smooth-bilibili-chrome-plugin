@@ -1119,6 +1119,35 @@ test('diagnostic catalog covers all required media events and preserves browser-
   });
 });
 
+test('media attribution fields pass through the existing privacy path', () => {
+  const video = mediaVideo('https://media.example/attribution');
+  video.getVideoPlaybackQuality = () => ({
+    totalVideoFrames: 100,
+    droppedVideoFrames: 4,
+    corruptedVideoFrames: 1,
+  });
+  video.ownerDocument = {
+    documentElement: {
+      getAttribute(name) {
+        assert.equal(name, 'data-bilibili-buffer-shim-diagnostics');
+        return JSON.stringify({
+          sourceBufferRanges: [{ track: 'video', ranges: [{ start: 0, end: 80 }] }],
+          mediaSourceState: 'open',
+          appendErrors: { QuotaExceededError: 2 },
+          removeStats: { removeCalls: 7, intercepted: 3 },
+        });
+      },
+    },
+  };
+  const facts = readMediaFacts(video, 'waiting');
+  const sanitized = sanitizeEventData('media.waiting', facts);
+  assert.deepEqual(sanitized.videoQuality, { total: 100, dropped: 4, corrupted: 1 });
+  assert.deepEqual(sanitized.sourceBufferRanges, [{ track: 'video', ranges: [{ start: 0, end: 80 }] }]);
+  assert.equal(sanitized.mediaSourceState, 'open');
+  assert.deepEqual(sanitized.appendErrors, { QuotaExceededError: 2 });
+  assert.deepEqual(sanitized.removeStats, { removeCalls: 7, intercepted: 3 });
+});
+
 test('watch-later route identity preserves the real item and omits an absent item', () => {
   const item = createRouteIdentity({
     hostname: 'www.bilibili.com',
