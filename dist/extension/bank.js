@@ -1399,7 +1399,6 @@
         task.abortReason = "deadline";
         task.controller.abort();
         this.emitDeadlineDiagnostic(task);
-        if (task.kind === "foreground") this.noteForegroundFallback();
       }, deadlineMs);
       void this.runTask(task).then((result) => {
         task.settled = true;
@@ -1474,14 +1473,13 @@
           this.noteForegroundFallback();
           throw error;
         }
-        if (kind === "foreground" && isAbortError(error) && task.abortReason === "deadline") {
-          if (task.kind !== "foreground") this.noteForegroundFallback();
-          throw new BankFallbackError("媒体分片网络取数超过死线", error);
+        if (kind === "foreground" && task.abortReason === "deadline") {
+          this.noteForegroundFallback();
+          if (isAbortError(error)) {
+            throw new BankFallbackError("媒体分片网络取数超过死线", error);
+          }
         }
         throw error;
-      }).then((result) => {
-        if (kind === "foreground" && result.response === void 0) this.noteForegroundSuccess();
-        return result;
       }).finally(() => {
         task.waiters -= 1;
         if (signal !== void 0 && signal.aborted && task.waiters === 0 && task.kind === "foreground" && !task.settled) {
