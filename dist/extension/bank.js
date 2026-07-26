@@ -1410,7 +1410,6 @@
       });
       this.inflight.set(plan.cacheKey, task);
       insertQueueTask(this.queue, task);
-      if (kind === "foreground" && this.activeTasks.size >= this.maxConcurrency) this.abortOnePrefetch();
       this.pump();
       return this.waitForTask(task, signal);
     }
@@ -1422,10 +1421,6 @@
           task.controller.abort();
         }
       });
-    }
-    abortOnePrefetch() {
-      const task = [...this.activeTasks].find((candidate) => candidate.kind === "prefetch");
-      task?.controller.abort();
     }
     pump() {
       while (this.activeTasks.size < this.maxConcurrency && this.queue.length > 0) {

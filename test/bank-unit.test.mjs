@@ -405,6 +405,57 @@ test('foreground promotion reuses an in-flight prefetch at foreground priority',
   assert.equal(bank.chunks.has(plan.cacheKey), true);
 });
 
+test('a foreground task keeps an unrelated in-flight prefetch and stays first in the queue', async () => {
+  const config = configFor();
+  const pending = new Map();
+  const { bank } = createBank({
+    config,
+    maxConcurrency: 1,
+    nativeFetch: async (_url, init) => {
+      const range = rangeFromInit(init);
+      return new Promise((resolve, reject) => {
+        pending.set(`${range.start}-${range.end}`, { resolve, reject });
+        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      });
+    },
+  });
+  const prefetchPlan = {
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+    cacheable: true,
+  };
+  const foregroundPlan = {
+    start: 16,
+    end: 31,
+    chunkIndex: 1,
+    cacheKey: `${MEDIA_KEY}#1`,
+    cacheable: true,
+  };
+  const prefetch = bank.getTask(prefetchPlan, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const foreground = bank.getTask(foregroundPlan, {
+    kind: 'foreground',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  assert.equal(bank.activeTasks.has(bank.inflight.get(prefetchPlan.cacheKey)), true);
+  assert.equal(bank.inflight.get(prefetchPlan.cacheKey).controller.signal.aborted, false);
+  assert.equal(bank.queue[0].cacheKey, foregroundPlan.cacheKey);
+  pending.get('0-15').resolve(responseFor(0, 15, 32, bytesFor(0, 15)));
+  await prefetch;
+  await new Promise((resolve) => setImmediate(resolve));
+  pending.get('16-31').resolve(responseFor(16, 31, 32, bytesFor(16, 31)));
+  await foreground;
+});
+
 test('the fetched hard gate blocks speculative work even when the chunk table is empty', async () => {
   const config = configFor();
   const { bank, calls } = createBank({ config });
@@ -605,6 +656,34 @@ test('leaving the video route releases chunks and the fetched hard gate', async 
   await bank.prefetch();
   assert.equal(bank.chunks.size, 0);
   assert.equal(bank.fetchedChunks.size, 0);
+});
+
+test('prefetch uses the playback sample and stores aligned future chunks', async () => {
+  const config = configFor({ prefetchAheadSeconds: 4 });
+  const { bank, windowObject, calls } = createBank({ config });
+  windowObject.document.querySelectorAll = () => [{
+    clientWidth: 100,
+    clientHeight: 100,
+    currentTime: 1,
+    webkitVideoDecodedByteCount: 100,
+  }];
+  bank.playbackSamples = [{ time: 0, bytes: 0 }];
+  const state = bank.stateFor(MEDIA_KEY);
+  state.latestUrl = MEDIA_URL;
+  state.totalSize = 64;
+  state.lastForegroundEnd = 3;
+  bank.touchResource(MEDIA_KEY);
+
+  await bank.prefetch();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.deepEqual(calls.map(({ range }) => range), [
+    { start: 16, end: 31 },
+    { start: 32, end: 47 },
+    { start: 48, end: 63 },
+  ]);
+  assert.equal(bank.chunks.size, 3);
+  assert.equal(bank.fetchedChunks.size, 3);
 });
 
 test('queue priority always sorts foreground before prefetch', () => {
