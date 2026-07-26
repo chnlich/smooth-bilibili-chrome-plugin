@@ -291,6 +291,34 @@ test('miss fetches aligned chunks, serves the requested crop and stores a comple
   assert.equal(totalMemoryBytes(bank.chunks, config.chunkBytes), 16);
 });
 
+test('an aligned request at an unknown resource tail accepts the complete clipped final chunk', async () => {
+  const config = configFor();
+  const { bank, calls } = createBank({
+    config,
+    nativeFetch: async (_url, init) => {
+      const range = rangeFromInit(init);
+      const end = Math.min(range.end, 59);
+      calls.push({ range });
+      return responseFor(range.start, end, 60, bytesFor(range.start, end));
+    },
+  });
+  let fallbackCalls = 0;
+  const response = await fetchThrough(
+    bank,
+    MEDIA_URL,
+    { headers: { Range: 'bytes=44-59' } },
+    async () => {
+      fallbackCalls += 1;
+      return responseFor(44, 59, 60, bytesFor(44, 59));
+    },
+  );
+  assert.deepEqual(calls.map(({ range }) => range), [{ start: 32, end: 47 }, { start: 48, end: 63 }]);
+  assert.equal(fallbackCalls, 0);
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytesFor(44, 59)]);
+  assert.equal(bank.chunks.get(`${MEDIA_KEY}#2`).bytes.byteLength, 16);
+  assert.equal(bank.chunks.get(`${MEDIA_KEY}#3`).bytes.byteLength, 12);
+});
+
 test('a request spanning stored and missing chunks fetches only the missing chunk', async () => {
   const config = configFor();
   const { bank, calls } = createBank({ config });

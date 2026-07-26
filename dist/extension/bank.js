@@ -1470,12 +1470,24 @@
         throw new BankNetworkError("媒体分片响应读取失败", error);
       }
       const contentRange = parseContentRange(headerValue(response.headers, "Content-Range"));
-      if (contentRange === void 0 || contentRange.start !== task.start || contentRange.end !== task.end) {
-        this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, "invalid_response");
+      const isCompleteTailChunk = contentRange !== void 0 && task.cacheable !== false && contentRange.start === task.start && contentRange.end < task.end && contentRange.end === contentRange.totalSize - 1;
+      if (contentRange === void 0 || contentRange.start !== task.start || contentRange.end !== task.end && !isCompleteTailChunk) {
+        this.emitChunkDiagnostic(
+          task,
+          bytes.byteLength,
+          performanceNow(this.windowObject) - startedAt,
+          "invalid_response"
+        );
         throw new BankFallbackError("媒体分片网络 Content-Range 不匹配");
       }
-      if (bytes.byteLength !== rangeLength(task)) {
-        this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, "invalid_response");
+      const resultRange = { start: contentRange.start, end: contentRange.end };
+      if (bytes.byteLength !== rangeLength(resultRange)) {
+        this.emitChunkDiagnostic(
+          task,
+          bytes.byteLength,
+          performanceNow(this.windowObject) - startedAt,
+          "invalid_response"
+        );
         throw new BankFallbackError("媒体分片网络字节长度不匹配");
       }
       if (task.controller.signal.aborted) {
@@ -1483,8 +1495,7 @@
         throw abortError();
       }
       const result = {
-        start: task.start,
-        end: task.end,
+        ...resultRange,
         bytes,
         totalSize: contentRange.totalSize
       };
@@ -1504,15 +1515,21 @@
           this.disable("store_write_failed");
         }
       }
-      this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, "fetched");
+      this.emitChunkDiagnostic(
+        task,
+        bytes.byteLength,
+        performanceNow(this.windowObject) - startedAt,
+        "fetched",
+        resultRange
+      );
       return result;
     }
-    emitChunkDiagnostic(task, bytes, durationMs, result) {
+    emitChunkDiagnostic(task, bytes, durationMs, result, range = task) {
       this.emitDiagnostic("bank.fetch.chunk", {
         source: scrubUrl(task.url),
         chunkIndex: task.chunkIndex,
-        start: task.start,
-        end: task.end,
+        start: range.start,
+        end: range.end,
         bytes,
         durationMs,
         priority: task.kind,
