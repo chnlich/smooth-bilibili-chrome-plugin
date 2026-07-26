@@ -545,9 +545,6 @@ export class SegmentBank {
   getTask(plan, { kind, url, credentials, signal, videoKey }) {
     const existing = this.inflight.get(plan.cacheKey);
     if (existing !== undefined) {
-      if (existing.start <= plan.start && existing.end >= plan.end) {
-        return this.waitForTask(existing, signal, kind, kind === 'foreground');
-      }
       return this.waitForTask(existing, signal, kind, kind === 'foreground');
     }
     if (kind === 'prefetch' && plan.cacheable !== false

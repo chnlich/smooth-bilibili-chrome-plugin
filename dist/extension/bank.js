@@ -1416,9 +1416,6 @@
     getTask(plan, { kind, url, credentials, signal, videoKey }) {
       const existing = this.inflight.get(plan.cacheKey);
       if (existing !== void 0) {
-        if (existing.start <= plan.start && existing.end >= plan.end) {
-          return this.waitForTask(existing, signal, kind, kind === "foreground");
-        }
         return this.waitForTask(existing, signal, kind, kind === "foreground");
       }
       if (kind === "prefetch" && plan.cacheable !== false && (this.fetchedChunks.has(plan.cacheKey) || this.chunks.has(plan.cacheKey))) {
