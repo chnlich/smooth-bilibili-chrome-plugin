@@ -19,9 +19,8 @@
   var BANK_CONFIG = Object.freeze({
     chunkBytes: 4 * 1024 ** 2,
     prefetchAheadSeconds: 900,
-    maxBankBytes: 2 * 1024 ** 3,
-    maxBankBytesPerVideo: 512 * 1024 ** 2,
-    storeReadTimeoutMs: 50
+    maxBankBytes: 512 * 1024 ** 2,
+    refetchAlarmCount: 3
   });
   var LIVE_CONFIG = Object.freeze({
     noDecodedFrameStallMilliseconds: 2e3,
@@ -99,6 +98,8 @@
     "bank.fetch.chunk",
     "bank.serve",
     "bank.evict",
+    "bank.store",
+    "bank.disabled",
     "extension.started",
     "extension.boot_error",
     "extension.observer_error",
@@ -186,6 +187,7 @@
     bridge: Object.freeze(["operation", "direction", "status"]),
     bank: Object.freeze([
       "source",
+      "operation",
       "chunkIndex",
       "start",
       "end",
@@ -247,14 +249,7 @@
   // src/bank/contract.js
   var BANK_ENABLED_ATTRIBUTE = "data-bilibili-buffer-bank-enabled";
   var BANK_MESSAGE_NAMESPACE = "bilibili-buffer:segment-bank-v1";
-  var BANK_MESSAGE_TYPES = Object.freeze([
-    "read-range",
-    "write-chunk",
-    "diagnostic"
-  ]);
-  function isBankMessage(message) {
-    return message !== null && typeof message === "object" && !Array.isArray(message) && message.namespace === BANK_MESSAGE_NAMESPACE && BANK_MESSAGE_TYPES.includes(message.type);
-  }
+  var BANK_DIAGNOSTIC_MESSAGE_TYPE = "diagnostic";
 
   // src/bank/logic.js
   function requireNonNegativeInteger(value, field) {
@@ -359,24 +354,26 @@
   } = {}) {
     const request = { start, end };
     const length = rangeLength(request);
-    if (aligned !== true || length < chunkBytes / 2 || totalSize === void 0) {
+    if (aligned !== true || length < chunkBytes / 2) {
       return [{
         ...request,
         chunkIndex: chunkIndex(start, chunkBytes),
-        cacheKey: cacheKey(bankKeyValue, chunkIndex(start, chunkBytes))
+        cacheKey: cacheKey(bankKeyValue, chunkIndex(start, chunkBytes)),
+        cacheable: false
       }];
     }
     const result = [];
     let current = Math.floor(start / chunkBytes) * chunkBytes;
     while (current <= end) {
-      const chunkEnd = Math.min(end, current + chunkBytes - 1, totalSize - 1);
+      const chunkEnd = totalSize === void 0 ? current + chunkBytes - 1 : Math.min(current + chunkBytes - 1, totalSize - 1);
       if (chunkEnd >= current) {
         const index = chunkIndex(current, chunkBytes);
         result.push({
           start: current,
           end: chunkEnd,
           chunkIndex: index,
-          cacheKey: cacheKey(bankKeyValue, index)
+          cacheKey: cacheKey(bankKeyValue, index),
+          cacheable: chunkEnd - current + 1 >= chunkBytes / 2
         });
       }
       current += chunkBytes;
@@ -418,6 +415,208 @@
     const end = totalSize === void 0 ? rawEnd : Math.min(rawEnd, totalSize - 1);
     if (end < start) return void 0;
     return { start, end };
+  }
+  function entryBytes(entry) {
+    if (Number.isSafeInteger(entry.byteLength) && entry.byteLength >= 0) return entry.byteLength;
+    if (entry.bytes instanceof ArrayBuffer) return entry.bytes.byteLength;
+    throw new Error("淘汰条目缺少字节数");
+  }
+  function evictionRank(entry, currentByte) {
+    const played = Number.isFinite(currentByte) && Number.isFinite(entry.end) && entry.end < currentByte;
+    if (played) return [0, 0, entry.storedAt || 0];
+    const distance = Number.isFinite(currentByte) && Number.isFinite(entry.start) ? Math.max(0, entry.start - currentByte) : Number.MAX_SAFE_INTEGER;
+    return [1, -distance, entry.storedAt || 0];
+  }
+  function currentByteForEntry(entry, currentByteByBank) {
+    return currentByteByBank[entry.bankKey];
+  }
+  function compareEvictionEntries(left, right, currentByteByBank) {
+    const leftRank = evictionRank(left, currentByteForEntry(left, currentByteByBank));
+    const rightRank = evictionRank(right, currentByteForEntry(right, currentByteByBank));
+    for (let index = 0; index < leftRank.length; index += 1) {
+      if (leftRank[index] !== rightRank[index]) return leftRank[index] - rightRank[index];
+    }
+    return left.cacheKey.localeCompare(right.cacheKey);
+  }
+  function selectEvictions({
+    entries,
+    maxBankBytes,
+    currentByteByBank = {}
+  }) {
+    if (!Array.isArray(entries)) throw new Error("淘汰条目必须是数组");
+    const total = entries.reduce((sum, entry) => sum + entryBytes(entry), 0);
+    const selected = [];
+    const remaining = [...entries];
+    let currentTotal = total;
+    while (currentTotal > maxBankBytes) {
+      const candidates = remaining;
+      if (candidates.length === 0) throw new Error("存储超限但没有可淘汰分片");
+      candidates.sort((left, right) => compareEvictionEntries(left, right, currentByteByBank));
+      const victim = candidates[0];
+      selected.push(victim);
+      remaining.splice(remaining.indexOf(victim), 1);
+      const bytes = entryBytes(victim);
+      currentTotal -= bytes;
+    }
+    return { entries: selected, bytes: selected.reduce((sum, entry) => sum + entryBytes(entry), 0) };
+  }
+
+  // src/bank/storage.js
+  function requireArrayBuffer(value) {
+    if (!(value instanceof ArrayBuffer)) throw new Error("分片字节必须是 ArrayBuffer");
+    return value;
+  }
+  function requireRange(start, end) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start > end) {
+      throw new Error("分片区间无效");
+    }
+    return { start, end };
+  }
+  function requireChunks(chunks) {
+    if (!(chunks instanceof Map)) throw new Error("媒体分片表必须是 Map");
+    return chunks;
+  }
+  function requireStoredRecord(record, chunkBytes, cacheKeyValue) {
+    if (record === void 0 || record === null || typeof record !== "object") {
+      throw new Error(`媒体分片记录 ${cacheKeyValue} 无效`);
+    }
+    requireArrayBuffer(record.bytes);
+    if (record.bytes.byteLength <= 0 || record.bytes.byteLength > chunkBytes) {
+      throw new Error(`媒体分片记录 ${cacheKeyValue} 长度无效`);
+    }
+    if (!Number.isSafeInteger(record.totalSize) || record.totalSize < record.bytes.byteLength) {
+      throw new Error(`媒体分片记录 ${cacheKeyValue} 总长度无效`);
+    }
+    if (!Number.isFinite(record.storedAt)) throw new Error(`媒体分片记录 ${cacheKeyValue} 时间无效`);
+    return record;
+  }
+  function requireCompleteRecord(record, chunkBytes, chunkStart, cacheKeyValue) {
+    requireStoredRecord(record, chunkBytes, cacheKeyValue);
+    const expectedLength = Math.min(chunkBytes, record.totalSize - chunkStart);
+    if (expectedLength <= 0 || record.bytes.byteLength !== expectedLength) {
+      throw new Error(`媒体分片记录 ${cacheKeyValue} 不是完整分片`);
+    }
+    return record;
+  }
+  function cacheKeyParts(cacheKeyValue) {
+    const separator = cacheKeyValue.lastIndexOf("#");
+    if (separator <= 0) throw new Error(`媒体分片 cacheKey 无效: ${cacheKeyValue}`);
+    const bankKeyValue = cacheKeyValue.slice(0, separator);
+    const index = Number(cacheKeyValue.slice(separator + 1));
+    chunkIndex(index);
+    return { bankKey: bankKeyValue, chunkIndex: index };
+  }
+  function entriesFor(chunks, chunkBytes) {
+    requireChunks(chunks);
+    const entries = [];
+    for (const [cacheKeyValue, record] of chunks) {
+      const { bankKey: bankKeyValue, chunkIndex: index } = cacheKeyParts(cacheKeyValue);
+      const start = index * chunkBytes;
+      const stored = requireCompleteRecord(record, chunkBytes, start, cacheKeyValue);
+      const end = start + stored.bytes.byteLength - 1;
+      if (stored.totalSize <= end) throw new Error(`媒体分片记录 ${cacheKeyValue} 超出总长度`);
+      entries.push({
+        cacheKey: cacheKeyValue,
+        bankKey: bankKeyValue,
+        chunkIndex: index,
+        start,
+        end,
+        byteLength: stored.bytes.byteLength,
+        storedAt: stored.storedAt
+      });
+    }
+    return entries;
+  }
+  function readMemoryRange(chunks, bankKeyValue, start, end, chunkBytes = BANK_CONFIG.chunkBytes) {
+    requireChunks(chunks);
+    requireRange(start, end);
+    const bytes = new Uint8Array(rangeLength({ start, end }));
+    let cursor = start;
+    let totalSize;
+    const firstIndex = chunkIndex(start, chunkBytes);
+    const lastIndex = chunkIndex(end, chunkBytes);
+    for (let index = firstIndex; index <= lastIndex; index += 1) {
+      const key = cacheKey(bankKeyValue, index);
+      const record = chunks.get(key);
+      if (record === void 0) return { hit: false, totalSize };
+      const chunkStart = index * chunkBytes;
+      requireCompleteRecord(record, chunkBytes, chunkStart, key);
+      const chunkEnd = chunkStart + record.bytes.byteLength - 1;
+      if (chunkStart > cursor || chunkEnd < cursor) return { hit: false, totalSize: record.totalSize };
+      const copyStart = Math.max(cursor, chunkStart);
+      const copyEnd = Math.min(end, chunkEnd);
+      bytes.set(
+        new Uint8Array(record.bytes).subarray(copyStart - chunkStart, copyEnd - chunkStart + 1),
+        copyStart - start
+      );
+      cursor = copyEnd + 1;
+      totalSize = record.totalSize;
+    }
+    if (cursor <= end) return { hit: false, totalSize };
+    return { hit: true, bytes: bytes.buffer, totalSize };
+  }
+  function writeMemoryChunk({
+    chunks,
+    bankKey: bankKeyValue,
+    start,
+    end,
+    totalSize,
+    bytes,
+    chunkBytes = BANK_CONFIG.chunkBytes,
+    storedAt = Date.now()
+  }) {
+    requireChunks(chunks);
+    requireRange(start, end);
+    requireArrayBuffer(bytes);
+    if (bytes.byteLength !== end - start + 1) throw new Error("媒体分片字节长度与区间不符");
+    if (!Number.isSafeInteger(totalSize) || totalSize <= end) throw new Error("媒体分片总长度无效");
+    const index = chunkIndex(start, chunkBytes);
+    const expectedEnd = Math.min(totalSize - 1, (index + 1) * chunkBytes - 1);
+    if (start !== index * chunkBytes || end !== expectedEnd) {
+      throw new Error("媒体分片写入区间未按分片边界对齐");
+    }
+    if (bytes.byteLength < chunkBytes / 2) throw new Error("媒体分片写入区间过小");
+    const key = cacheKey(bankKeyValue, index);
+    const previous = chunks.get(key);
+    const storedBytes = bytes.slice(0);
+    const record = { bytes: storedBytes, totalSize, storedAt };
+    requireCompleteRecord(record, chunkBytes, index * chunkBytes, key);
+    chunks.set(key, record);
+    return {
+      cacheKey: key,
+      bankKey: bankKeyValue,
+      chunkIndex: index,
+      bytes: storedBytes.byteLength,
+      storedAt,
+      previous
+    };
+  }
+  function enforceMemoryLimit({
+    chunks,
+    maxBankBytes = BANK_CONFIG.maxBankBytes,
+    chunkBytes = BANK_CONFIG.chunkBytes,
+    currentByteByBank = {}
+  }) {
+    requireChunks(chunks);
+    if (!Number.isSafeInteger(maxBankBytes) || maxBankBytes < 0) throw new Error("内存上限无效");
+    const candidates = entriesFor(chunks, chunkBytes);
+    const selected = selectEvictions({
+      entries: candidates,
+      maxBankBytes,
+      currentByteByBank
+    });
+    for (const entry of selected.entries) {
+      if (!chunks.delete(entry.cacheKey)) throw new Error(`媒体分片淘汰失败: ${entry.cacheKey}`);
+    }
+    return {
+      entries: selected.entries,
+      bytes: selected.bytes,
+      reason: selected.entries.length === 0 ? void 0 : "limit"
+    };
+  }
+  function clearMemory(chunks) {
+    requireChunks(chunks);
+    chunks.clear();
   }
 
   // src/bank/xhr.js
@@ -758,24 +957,11 @@
 
   // src/bank/main.js
   var MAX_CONCURRENCY = 3;
-  var StoreReadTimeoutError = class extends Error {
-    constructor() {
-      super("媒体分片存储读取超时");
-      this.name = "StoreReadTimeoutError";
-      this.code = "BANK_STORE_READ_TIMEOUT";
-    }
-  };
   function abortError() {
     return new DOMException("The operation was aborted", "AbortError");
   }
   function isAbortError(error) {
     return error?.name === "AbortError";
-  }
-  function messageError(error) {
-    const result = new Error(error?.message || String(error));
-    result.name = error?.name || "Error";
-    result.code = error?.code || "BANK_RELAY_FAILED";
-    return result;
   }
   function performanceNow(windowObject) {
     return typeof windowObject.performance?.now === "function" ? windowObject.performance.now() : Date.now();
@@ -806,14 +992,12 @@
       signal: initField(init, "signal", inherited?.signal)
     };
   }
-  function waitWithSignal(promise, signal, windowObject, timeoutMs) {
+  function waitWithSignal(promise, signal) {
     if (signal?.aborted) return Promise.reject(abortError());
     return new Promise((resolve, reject) => {
-      let timer;
       let settled = false;
       const cleanup = () => {
         signal?.removeEventListener("abort", onAbort);
-        if (timer !== void 0) windowObject.clearTimeout(timer);
       };
       const finish = (callback, value) => {
         if (settled) return;
@@ -823,109 +1007,36 @@
       };
       const onAbort = () => finish(reject, abortError());
       signal?.addEventListener("abort", onAbort, { once: true });
-      if (timeoutMs !== void 0) {
-        timer = windowObject.setTimeout(() => finish(reject, new StoreReadTimeoutError()), timeoutMs);
-      }
       promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
     });
   }
-  var BankStoreClient = class {
-    constructor(windowObject) {
-      this.windowObject = windowObject;
-      this.nextRequestId = 1;
-      this.pending = /* @__PURE__ */ new Map();
-      this.onMessage = (event) => {
-        if (event.source !== this.windowObject || !isBankMessage(event.data)) return;
-        const message = event.data;
-        if (message.direction !== "response") return;
-        const pending = this.pending.get(message.requestId);
-        if (pending === void 0) return;
-        this.pending.delete(message.requestId);
-        if (message.ok !== true) {
-          pending.reject(messageError(message.error));
-          return;
-        }
-        pending.resolve(message.value);
-      };
-      windowObject.addEventListener("message", this.onMessage);
-    }
-    request(type, payload, transfer = []) {
-      const requestId = this.nextRequestId;
-      this.nextRequestId += 1;
-      const message = {
-        namespace: BANK_MESSAGE_NAMESPACE,
-        direction: "request",
-        type,
-        requestId,
-        ...payload
-      };
-      return new Promise((resolve, reject) => {
-        this.pending.set(requestId, { resolve, reject });
-        try {
-          this.windowObject.postMessage(message, "*", transfer);
-        } catch (error) {
-          this.pending.delete(requestId);
-          reject(error);
-        }
-      });
-    }
-    readRange(bankKeyValue, start, end) {
-      return this.request("read-range", { bankKey: bankKeyValue, start, end });
-    }
-    writeChunk({
-      bankKey: bankKeyValue,
-      videoKey,
-      start,
-      end,
-      totalSize,
-      bytes,
-      currentByteByBank,
-      currentByteByVideo
-    }) {
-      return this.request(
-        "write-chunk",
-        {
-          bankKey: bankKeyValue,
-          videoKey,
-          start,
-          end,
-          totalSize,
-          bytes,
-          currentByteByBank,
-          currentByteByVideo
-        },
-        [bytes]
-      );
-    }
-    destroy() {
-      this.windowObject.removeEventListener("message", this.onMessage);
-      for (const pending of this.pending.values()) pending.reject(new Error("媒体分片存储客户端已经销毁"));
-      this.pending.clear();
-    }
-  };
   var SegmentBank = class {
     constructor({
       windowObject = window,
       nativeFetch = windowObject.fetch,
-      storeClient = new BankStoreClient(windowObject),
       maxConcurrency = MAX_CONCURRENCY,
-      config = BANK_CONFIG
+      config = BANK_CONFIG,
+      chunks = /* @__PURE__ */ new Map(),
+      now = Date.now
     } = {}) {
       this.windowObject = windowObject;
       this.nativeFetch = nativeFetch;
-      this.storeClient = storeClient;
       this.config = config;
       this.maxConcurrency = maxConcurrency;
+      this.now = now;
       this.enabled = true;
+      this.disabled = false;
       this.queue = [];
       this.inflight = /* @__PURE__ */ new Map();
       this.activeTasks = /* @__PURE__ */ new Set();
       this.sequence = 0;
+      this.sessionGeneration = 0;
       this.resourceState = /* @__PURE__ */ new Map();
       this.recentResourceKeys = [];
-      this.knownStoredRanges = /* @__PURE__ */ new Map();
-      this.pendingStoreRanges = /* @__PURE__ */ new Map();
-      this.memoryRanges = /* @__PURE__ */ new Map();
+      this.chunks = chunks;
+      this.fetchedChunks = /* @__PURE__ */ new Map();
+      this.refetchCounts = /* @__PURE__ */ new Map();
+      this.lastRouteWasVideo = this.windowObject.location === void 0 || isVideoLocation(this.windowObject.location);
       this.prefetchTimer = this.windowObject.setInterval?.(() => {
         void this.prefetch().catch((error) => {
           console.error("[BilibiliBuffer] 媒体分片预取失败", error);
@@ -933,6 +1044,7 @@
       }, 1e3);
     }
     isEnabled() {
+      if (this.disabled) return false;
       const root = this.windowObject.document?.documentElement;
       const configured = root?.getAttribute?.(BANK_ENABLED_ATTRIBUTE);
       if (configured === "true") return true;
@@ -943,7 +1055,7 @@
       const message = {
         namespace: BANK_MESSAGE_NAMESPACE,
         direction: "event",
-        type: "diagnostic",
+        type: BANK_DIAGNOSTIC_MESSAGE_TYPE,
         code,
         data
       };
@@ -970,58 +1082,41 @@
       }
       return state;
     }
-    rangeIsCovered(rangeMap, key, start, end) {
-      return (rangeMap.get(key) || []).some((range) => range.start <= start && range.end >= end);
-    }
-    rememberRange(rangeMap, key, start, end) {
-      const ranges = rangeMap.get(key) || [];
-      ranges.push({ start, end });
-      rangeMap.set(key, ranges);
-    }
-    forgetRange(rangeMap, key, start, end) {
-      const ranges = rangeMap.get(key) || [];
-      const remaining = ranges.filter((range) => range.start !== start || range.end !== end);
-      if (remaining.length === 0) rangeMap.delete(key);
-      else rangeMap.set(key, remaining);
-    }
-    rememberMemoryRange(bankKeyValue, result) {
-      const ranges = this.memoryRanges.get(bankKeyValue) || [];
-      ranges.push({
-        start: result.start,
-        end: result.end,
-        totalSize: result.totalSize,
-        bytes: result.bytes
-      });
-      this.memoryRanges.set(bankKeyValue, ranges);
-    }
-    forgetMemoryRange(bankKeyValue, start, end) {
-      const ranges = this.memoryRanges.get(bankKeyValue) || [];
-      const remaining = ranges.filter((range) => range.start !== start || range.end !== end);
-      if (remaining.length === 0) this.memoryRanges.delete(bankKeyValue);
-      else this.memoryRanges.set(bankKeyValue, remaining);
-    }
-    readMemoryRange(bankKeyValue, start, end) {
-      const segments = [...this.memoryRanges.get(bankKeyValue) || []].sort((left, right) => left.start - right.start);
-      const bytes = new Uint8Array(rangeLength({ start, end }));
-      let cursor = start;
-      let totalSize;
-      for (const segment of segments) {
-        if (segment.end < cursor) continue;
-        if (segment.start > cursor) return void 0;
-        const copyStart = Math.max(cursor, segment.start);
-        const copyEnd = Math.min(end, segment.end);
-        bytes.set(
-          new Uint8Array(segment.bytes).subarray(copyStart - segment.start, copyEnd - segment.start + 1),
-          copyStart - start
-        );
-        cursor = copyEnd + 1;
-        totalSize = segment.totalSize;
-        if (cursor > end) return { hit: true, bytes: bytes.buffer, totalSize };
-      }
-      return void 0;
-    }
     cacheKeyForRange(resourceKey, start) {
       return cacheKey(resourceKey, chunkIndex(start, this.config.chunkBytes));
+    }
+    currentByteByBank() {
+      return Object.fromEntries(
+        [...this.resourceState.entries()].filter(([, state]) => Number.isSafeInteger(state.lastForegroundEnd)).map(([key, state]) => [key, state.lastForegroundEnd])
+      );
+    }
+    releaseSession() {
+      this.sessionGeneration += 1;
+      this.abortPrefetchTasks();
+      for (const task of this.queue) {
+        if (task.kind !== "prefetch") continue;
+        task.controller.abort();
+        task.reject(abortError());
+        if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+      }
+      this.queue = this.queue.filter((task) => task.kind !== "prefetch");
+      clearMemory(this.chunks);
+      this.fetchedChunks.clear();
+      this.refetchCounts.clear();
+      this.resourceState.clear();
+      this.recentResourceKeys = [];
+      this.playbackSamples = [];
+    }
+    syncRouteLifecycle() {
+      if (this.windowObject.location === void 0) return true;
+      const currentIsVideo = isVideoLocation(this.windowObject.location);
+      if (!currentIsVideo) {
+        if (this.lastRouteWasVideo) this.releaseSession();
+        this.lastRouteWasVideo = false;
+        return false;
+      }
+      this.lastRouteWasVideo = true;
+      return true;
     }
     touchResource(resourceKey) {
       const nextKeys = [
@@ -1059,7 +1154,7 @@
       });
     }
     async handleFetch(thisArg, args, originalFetch) {
-      if (this.windowObject.location !== void 0 && !isVideoLocation(this.windowObject.location)) {
+      if (!this.syncRouteLifecycle()) {
         return originalFetch.apply(thisArg, args);
       }
       let request;
@@ -1114,27 +1209,8 @@
         return originalFetch.apply(thisArg, args);
       }
     }
-    async readStoredRange(bankKeyValue, start, end, signal) {
-      const memory = this.readMemoryRange(bankKeyValue, start, end);
-      if (memory?.hit === true) return memory;
-      let read;
-      try {
-        read = this.storeClient.readRange(bankKeyValue, start, end);
-      } catch (error) {
-        throw new BankFallbackError("媒体分片存储读取失败", error);
-      }
-      try {
-        return await waitWithSignal(read, signal, this.windowObject, this.config.storeReadTimeoutMs);
-      } catch (error) {
-        if (error instanceof StoreReadTimeoutError) {
-          void read.catch((readError) => {
-            console.error("[BilibiliBuffer] 媒体分片存储读取超时后的错误", readError);
-          });
-          return void 0;
-        }
-        if (isAbortError(error)) throw error;
-        throw new BankFallbackError("媒体分片存储读取失败", error);
-      }
+    readStoredRange(bankKeyValue, start, end) {
+      return readMemoryRange(this.chunks, bankKeyValue, start, end, this.config.chunkBytes);
     }
     createResponse(bytes, start, end, totalSize, url) {
       const ResponseConstructor = responseTypeConstructor(this.windowObject, "Response");
@@ -1147,7 +1223,7 @@
       Object.defineProperty(response, "type", { configurable: true, value: "basic" });
       return response;
     }
-    async serveRequest({ url, method, headers, credentials, signal }) {
+    serveRequest({ url, method, headers, credentials, signal }) {
       const classification = this.requestClassification(url, headers);
       if (!classification.intercepted) return { intercepted: false };
       if (signal?.aborted) throw abortError();
@@ -1160,7 +1236,7 @@
       state.credentials = credentials || "same-origin";
       if (state.lastForegroundEnd !== end) state.prefetchEnd = void 0;
       state.lastForegroundEnd = end;
-      const stored = await this.readStoredRange(resourceKey, start, end, signal);
+      const stored = this.readStoredRange(resourceKey, start, end);
       if (signal?.aborted) throw abortError();
       if (stored?.hit === true) {
         if (!(stored.bytes instanceof ArrayBuffer) || stored.bytes.byteLength !== rangeLength({ start, end })) {
@@ -1170,12 +1246,6 @@
           throw new BankFallbackError("媒体分片存储命中总长度无效");
         }
         state.totalSize = stored.totalSize;
-        this.rememberRange(
-          this.knownStoredRanges,
-          this.cacheKeyForRange(resourceKey, start),
-          start,
-          end
-        );
         this.emitDiagnostic("bank.serve", {
           source: scrubUrl(url),
           start,
@@ -1195,9 +1265,9 @@
         start,
         end,
         result: "fetch",
-        reason: stored === void 0 ? "store_read_timeout" : stored?.hit === false ? "stored_range_missing" : "store_unavailable"
+        reason: "stored_range_missing"
       });
-      const fetched = await this.fetchForeground({
+      return this.fetchForeground({
         resourceKey,
         url,
         credentials: state.credentials,
@@ -1206,31 +1276,49 @@
         totalSize: state.totalSize || stored?.totalSize,
         signal,
         videoKey: state.videoKey
+      }).then((fetched) => {
+        if (signal?.aborted) throw abortError();
+        if (fetched.response !== void 0) return { intercepted: true, response: fetched.response };
+        state.totalSize = fetched.totalSize;
+        return {
+          intercepted: true,
+          response: this.createResponse(fetched.bytes, start, end, fetched.totalSize, url),
+          bytes: fetched.bytes,
+          totalSize: fetched.totalSize
+        };
       });
-      if (signal?.aborted) throw abortError();
-      if (fetched.response !== void 0) return { intercepted: true, response: fetched.response };
-      state.totalSize = fetched.totalSize;
-      return {
-        intercepted: true,
-        response: this.createResponse(fetched.bytes, start, end, fetched.totalSize, url),
-        bytes: fetched.bytes,
-        totalSize: fetched.totalSize
-      };
     }
     async fetchForeground({ resourceKey, url, credentials, start, end, totalSize, signal, videoKey }) {
       const plans = planFetchRanges(start, end, {
         chunkBytes: this.config.chunkBytes,
         totalSize,
         bankKeyValue: resourceKey,
-        aligned: false
+        aligned: true
       });
-      const results = await Promise.all(plans.map((plan) => this.getTask(plan, {
-        kind: "foreground",
-        url,
-        credentials,
-        signal,
-        videoKey
-      })));
+      const results = await Promise.all(plans.map((plan) => {
+        const stored = readMemoryRange(
+          this.chunks,
+          resourceKey,
+          plan.start,
+          plan.end,
+          this.config.chunkBytes
+        );
+        if (stored.hit === true) {
+          return {
+            start: plan.start,
+            end: plan.end,
+            bytes: stored.bytes,
+            totalSize: stored.totalSize
+          };
+        }
+        return this.getTask(plan, {
+          kind: "foreground",
+          url,
+          credentials,
+          signal,
+          videoKey
+        });
+      }));
       const httpError = results.find((result) => result.response !== void 0);
       if (httpError !== void 0) return httpError;
       const total = results.find((result) => Number.isSafeInteger(result.totalSize))?.totalSize;
@@ -1253,6 +1341,30 @@
       if (covered.some((value) => value !== 1)) throw new BankFallbackError("媒体网络响应没有覆盖请求区间");
       return { bytes: bytes.buffer, start, end, totalSize: total };
     }
+    disable(reason) {
+      if (this.disabled) return;
+      this.disabled = true;
+      this.enabled = false;
+      this.abortPrefetchTasks();
+      const retained = [];
+      for (const task of this.queue) {
+        if (task.kind !== "prefetch") {
+          retained.push(task);
+          continue;
+        }
+        task.controller.abort();
+        task.reject(abortError());
+        if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+      }
+      this.queue = retained;
+      this.emitDiagnostic("bank.disabled", { reason });
+    }
+    noteRefetch(plan) {
+      if (plan.cacheable === false || !this.fetchedChunks.has(plan.cacheKey)) return;
+      const count = (this.refetchCounts.get(plan.cacheKey) || 0) + 1;
+      this.refetchCounts.set(plan.cacheKey, count);
+      if (count >= this.config.refetchAlarmCount) this.disable("refetch_alarm");
+    }
     getTask(plan, { kind, url, credentials, signal, videoKey }) {
       const existing = this.inflight.get(plan.cacheKey);
       if (existing !== void 0) {
@@ -1269,6 +1381,10 @@
           throw error;
         }).then(() => this.getTask(plan, { kind, url, credentials, signal, videoKey }));
       }
+      if (kind === "prefetch" && plan.cacheable !== false && (this.fetchedChunks.has(plan.cacheKey) || this.chunks.has(plan.cacheKey))) {
+        return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
+      }
+      if (kind === "foreground") this.noteRefetch(plan);
       const controller = new AbortController();
       const task = {
         ...plan,
@@ -1277,6 +1393,7 @@
         credentials,
         videoKey,
         kind,
+        sessionGeneration: this.sessionGeneration,
         priority: priorityFor(kind),
         sequence: this.sequence,
         controller,
@@ -1299,7 +1416,7 @@
     }
     waitForTask(task, signal) {
       task.waiters += 1;
-      return waitWithSignal(task.promise, signal, this.windowObject).finally(() => {
+      return waitWithSignal(task.promise, signal).finally(() => {
         task.waiters -= 1;
         if (signal !== void 0 && signal.aborted && task.waiters === 0 && task.kind === "foreground") {
           task.controller.abort();
@@ -1366,14 +1483,32 @@
         this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, "invalid_response");
         throw new BankFallbackError("媒体分片网络字节长度不匹配");
       }
+      if (task.controller.signal.aborted) {
+        this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, "aborted");
+        throw abortError();
+      }
       const result = {
         start: task.start,
         end: task.end,
         bytes,
         totalSize: contentRange.totalSize
       };
-      this.rememberMemoryRange(task.bankKey, result);
-      this.persistTask(task, result);
+      if (task.cacheable !== false && task.sessionGeneration === this.sessionGeneration && this.enabled === true && this.disabled === false) {
+        this.fetchedChunks.set(task.cacheKey, { fetchedAt: this.now() });
+        try {
+          this.storeTask(task, result);
+        } catch (error) {
+          this.emitDiagnostic("bank.store", {
+            operation: "write",
+            chunkIndex: task.chunkIndex,
+            bytes: bytes.byteLength,
+            result: "failed",
+            reason: "write_error"
+          });
+          console.error("[BilibiliBuffer] 媒体分片内存写入失败", error);
+          this.disable("store_write_failed");
+        }
+      }
       this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, "fetched");
       return result;
     }
@@ -1381,65 +1516,70 @@
       this.emitDiagnostic("bank.fetch.chunk", {
         source: scrubUrl(task.url),
         chunkIndex: task.chunkIndex,
+        start: task.start,
+        end: task.end,
         bytes,
         durationMs,
         priority: task.kind,
         result
       });
     }
-    persistTask(task, result) {
-      if (this.rangeIsCovered(this.knownStoredRanges, task.cacheKey, result.start, result.end) || this.rangeIsCovered(this.pendingStoreRanges, task.cacheKey, result.start, result.end)) return;
-      this.rememberRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
-      const storedBytes = result.bytes.slice(0);
-      const currentByteByBank = Object.fromEntries(
-        [...this.resourceState.entries()].filter(([, state]) => Number.isFinite(state.lastForegroundEnd)).map(([key, state]) => [key, state.lastForegroundEnd])
-      );
-      const currentByteByVideo = Object.fromEntries(
-        [...this.resourceState.values()].filter((state) => Number.isFinite(state.lastForegroundEnd)).map((state) => [state.videoKey, state.lastForegroundEnd])
-      );
-      let write;
+    storeTask(task, result) {
+      const previous = this.chunks.get(task.cacheKey);
       try {
-        write = this.storeClient.writeChunk({
+        const written = writeMemoryChunk({
+          chunks: this.chunks,
           bankKey: task.bankKey,
-          videoKey: task.videoKey,
           start: result.start,
           end: result.end,
           totalSize: result.totalSize,
-          bytes: storedBytes,
-          currentByteByBank,
-          currentByteByVideo
+          bytes: result.bytes,
+          chunkBytes: this.config.chunkBytes,
+          storedAt: this.now()
         });
-      } catch (error) {
-        this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
-        this.forgetMemoryRange(task.bankKey, result.start, result.end);
-        console.error("[BilibiliBuffer] 媒体分片异步落盘失败", error);
-        return;
-      }
-      void Promise.resolve(write).then((writeResult) => {
-        this.rememberRange(this.knownStoredRanges, task.cacheKey, result.start, result.end);
-        this.forgetMemoryRange(task.bankKey, result.start, result.end);
-        for (const record of writeResult?.records || []) {
-          this.knownStoredRanges.delete(record.cacheKey);
-        }
-        if (writeResult?.evictedBytes > 0) {
-          this.emitDiagnostic("bank.evict", {
-            bytes: writeResult.evictedBytes,
-            reason: writeResult.reason || "limit"
+        const eviction = enforceMemoryLimit({
+          chunks: this.chunks,
+          maxBankBytes: this.config.maxBankBytes,
+          chunkBytes: this.config.chunkBytes,
+          currentByteByBank: this.currentByteByBank()
+        });
+        this.emitDiagnostic("bank.store", {
+          operation: "write",
+          chunkIndex: written.chunkIndex,
+          bytes: written.bytes,
+          result: "stored",
+          reason: "memory"
+        });
+        for (const entry of eviction.entries) {
+          this.fetchedChunks.delete(entry.cacheKey);
+          this.refetchCounts.delete(entry.cacheKey);
+          this.emitDiagnostic("bank.store", {
+            operation: "evict",
+            chunkIndex: entry.chunkIndex,
+            bytes: entry.byteLength,
+            result: "evicted",
+            reason: eviction.reason
           });
         }
-      }).catch((error) => {
-        this.forgetMemoryRange(task.bankKey, result.start, result.end);
-        console.error("[BilibiliBuffer] 媒体分片异步落盘失败", error);
-      }).finally(() => {
-        this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
-      });
+        if (eviction.bytes > 0) {
+          this.emitDiagnostic("bank.evict", {
+            bytes: eviction.bytes,
+            reason: eviction.reason
+          });
+        }
+        return eviction;
+      } catch (error) {
+        if (previous === void 0) this.chunks.delete(task.cacheKey);
+        else this.chunks.set(task.cacheKey, previous);
+        throw error;
+      }
     }
     async prefetch() {
-      if (!this.isEnabled()) {
+      if (!this.syncRouteLifecycle()) {
         this.abortPrefetchTasks();
         return;
       }
-      if (!isVideoLocation(this.windowObject.location)) {
+      if (!this.isEnabled()) {
         this.abortPrefetchTasks();
         return;
       }
@@ -1469,17 +1609,7 @@
           aligned: true
         });
         for (const plan of plans) {
-          if (this.rangeIsCovered(this.knownStoredRanges, plan.cacheKey, plan.start, plan.end) || this.rangeIsCovered(this.pendingStoreRanges, plan.cacheKey, plan.start, plan.end) || this.inflight.has(plan.cacheKey)) continue;
-          let stored;
-          try {
-            stored = await this.readStoredRange(state.bankKey, plan.start, plan.end);
-          } catch (error) {
-            console.error("[BilibiliBuffer] 媒体分片预取读取存储失败", error);
-          }
-          if (stored?.hit === true) {
-            this.rememberRange(this.knownStoredRanges, plan.cacheKey, plan.start, plan.end);
-            continue;
-          }
+          if (plan.cacheable !== false && (this.chunks.has(plan.cacheKey) || this.fetchedChunks.has(plan.cacheKey))) continue;
           if (this.inflight.has(plan.cacheKey)) continue;
           void this.getTask(plan, {
             kind: "prefetch",
@@ -1496,7 +1626,9 @@
     destroy() {
       if (this.prefetchTimer !== void 0) this.windowObject.clearInterval(this.prefetchTimer);
       for (const task of this.inflight.values()) task.controller.abort();
-      this.storeClient.destroy();
+      for (const task of this.queue) task.reject(abortError());
+      this.queue = [];
+      this.releaseSession();
     }
   };
   function installSegmentBank(windowObject = window) {
@@ -1518,7 +1650,7 @@
       bank,
       installed: true,
       setEnabled(enabled) {
-        bank.enabled = enabled === true;
+        if (!bank.disabled) bank.enabled = enabled === true;
       },
       destroy() {
         windowObject.fetch = originalFetch;

@@ -20,9 +20,8 @@
   var BANK_CONFIG = Object.freeze({
     chunkBytes: 4 * 1024 ** 2,
     prefetchAheadSeconds: 900,
-    maxBankBytes: 2 * 1024 ** 3,
-    maxBankBytesPerVideo: 512 * 1024 ** 2,
-    storeReadTimeoutMs: 50
+    maxBankBytes: 512 * 1024 ** 2,
+    refetchAlarmCount: 3
   });
   var LIVE_CONFIG = Object.freeze({
     noDecodedFrameStallMilliseconds: 2e3,
@@ -101,6 +100,8 @@
     "bank.fetch.chunk",
     "bank.serve",
     "bank.evict",
+    "bank.store",
+    "bank.disabled",
     "extension.started",
     "extension.boot_error",
     "extension.observer_error",
@@ -194,6 +195,7 @@
     bridge: Object.freeze(["operation", "direction", "status"]),
     bank: Object.freeze([
       "source",
+      "operation",
       "chunkIndex",
       "start",
       "end",
@@ -490,7 +492,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-74a4b1d36c0940413e41abc4" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-418554befd24b521a31e56a9" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -2981,111 +2983,14 @@
   // src/bank/contract.js
   var BANK_ENABLED_ATTRIBUTE = "data-bilibili-buffer-bank-enabled";
   var BANK_MESSAGE_NAMESPACE = "bilibili-buffer:segment-bank-v1";
-  var BANK_MESSAGE_TYPES = Object.freeze([
-    "read-range",
-    "write-chunk",
-    "diagnostic"
-  ]);
-  function isBankMessage(message) {
-    return message !== null && typeof message === "object" && !Array.isArray(message) && message.namespace === BANK_MESSAGE_NAMESPACE && BANK_MESSAGE_TYPES.includes(message.type);
-  }
-
-  // src/bank/relay.js
-  function serializeError2(error) {
-    return {
-      name: typeof error?.name === "string" ? error.name : "Error",
-      code: typeof error?.code === "string" ? error.code : "BANK_RELAY_FAILED",
-      message: error?.message || String(error)
-    };
-  }
-  function runtimeRequest(runtimeObject, message) {
-    if (runtimeObject === void 0 || typeof runtimeObject.sendMessage !== "function") {
-      throw new Error("媒体分片 relay runtime.sendMessage 不可用");
-    }
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (callback, value) => {
-        if (settled) return;
-        settled = true;
-        callback(value);
-      };
-      try {
-        const result = runtimeObject.sendMessage(message, (response) => {
-          const lastError = runtimeObject.lastError || globalThis.chrome?.runtime?.lastError;
-          if (lastError !== void 0) {
-            finish(reject, new Error(lastError.message));
-            return;
-          }
-          finish(resolve, response);
-        });
-        if (result !== void 0 && typeof result.then === "function") {
-          result.then((response) => finish(resolve, response), (error) => finish(reject, error));
-        }
-      } catch (error) {
-        finish(reject, error);
-      }
-    });
-  }
-  function postWindowMessage(windowObject, message, transfer = []) {
-    windowObject.postMessage(message, "*", transfer);
+  var BANK_DIAGNOSTIC_MESSAGE_TYPE = "diagnostic";
+  function isBankDiagnosticMessage(message) {
+    return message !== null && typeof message === "object" && !Array.isArray(message) && message.namespace === BANK_MESSAGE_NAMESPACE && message.direction === "event" && message.type === BANK_DIAGNOSTIC_MESSAGE_TYPE && typeof message.code === "string";
   }
   function postBankControl(windowObject, enabled) {
     const root = windowObject?.document?.documentElement;
     if (root === void 0 || root === null || typeof root.setAttribute !== "function") return;
     root.setAttribute(BANK_ENABLED_ATTRIBUTE, enabled === true ? "true" : "false");
-  }
-  function installBankRelay({
-    windowObject = window,
-    runtimeObject = chrome.runtime,
-    diagnostics
-  } = {}) {
-    let currentDiagnostics = diagnostics;
-    const listener = (event) => {
-      if (event.source !== windowObject || !isBankMessage(event.data)) return;
-      const message = event.data;
-      if (message.direction === "event") {
-        if (message.type !== "diagnostic" || typeof message.code !== "string") {
-          throw new Error("媒体分片诊断消息格式无效");
-        }
-        currentDiagnostics?.log(message.code, message.data || {});
-        return;
-      }
-      if (message.direction !== "request") return;
-      const response = async () => {
-        try {
-          const result = await runtimeRequest(runtimeObject, message);
-          const value = result?.value;
-          const transfer = value?.bytes instanceof ArrayBuffer ? [value.bytes] : [];
-          postWindowMessage(windowObject, {
-            namespace: BANK_MESSAGE_NAMESPACE,
-            direction: "response",
-            type: message.type,
-            requestId: message.requestId,
-            ok: result?.ok === true,
-            ...result?.ok === true ? { value } : { error: result?.error || serializeError2(new Error("媒体分片 worker 没有返回结果")) }
-          }, transfer);
-        } catch (error) {
-          postWindowMessage(windowObject, {
-            namespace: BANK_MESSAGE_NAMESPACE,
-            direction: "response",
-            type: message.type,
-            requestId: message.requestId,
-            ok: false,
-            error: serializeError2(error)
-          });
-        }
-      };
-      void response();
-    };
-    windowObject.addEventListener("message", listener);
-    return {
-      setDiagnostics(nextDiagnostics) {
-        currentDiagnostics = nextDiagnostics;
-      },
-      destroy() {
-        windowObject.removeEventListener("message", listener);
-      }
-    };
   }
 
   // src/bank/logic.js
@@ -3135,6 +3040,18 @@
       },
       error(...args) {
         console.error("[BilibiliBuffer]", ...args);
+      }
+    };
+  }
+  function installBankDiagnostics({ windowObject = window, diagnostics } = {}) {
+    const listener = (event) => {
+      if (event.source !== windowObject || !isBankDiagnosticMessage(event.data)) return;
+      diagnostics?.log(event.data.code, event.data.data || {});
+    };
+    windowObject.addEventListener("message", listener);
+    return {
+      destroy() {
+        windowObject.removeEventListener("message", listener);
       }
     };
   }
@@ -3472,7 +3389,7 @@
   };
   if (typeof chrome !== "undefined" && typeof document !== "undefined" && typeof window !== "undefined") {
     const diagnostics = new DiagnosticsClient();
-    if (window.location.hostname === "www.bilibili.com") installBankRelay({ diagnostics });
+    if (window.location.hostname === "www.bilibili.com") installBankDiagnostics({ diagnostics });
     installPopupMessageHandler(chrome.runtime, () => diagnostics.getStatus().sessionId);
     const coordinator = new ExtensionCoordinator({ diagnostics });
     void coordinator.start().catch((error) => {
