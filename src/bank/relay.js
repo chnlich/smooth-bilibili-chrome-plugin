@@ -1,4 +1,4 @@
-import { BANK_MESSAGE_NAMESPACE, isBankMessage } from './contract.js';
+import { BANK_ENABLED_ATTRIBUTE, BANK_MESSAGE_NAMESPACE, isBankMessage } from './contract.js';
 
 function serializeError(error) {
   return {
@@ -42,13 +42,9 @@ function postWindowMessage(windowObject, message, transfer = []) {
 }
 
 export function postBankControl(windowObject, enabled) {
-  if (typeof windowObject?.postMessage !== 'function') return;
-  postWindowMessage(windowObject, {
-    namespace: BANK_MESSAGE_NAMESPACE,
-    direction: 'control',
-    type: 'configure',
-    enabled: enabled === true,
-  });
+  const root = windowObject?.document?.documentElement;
+  if (root === undefined || root === null || typeof root.setAttribute !== 'function') return;
+  root.setAttribute(BANK_ENABLED_ATTRIBUTE, enabled === true ? 'true' : 'false');
 }
 
 export function installBankRelay({

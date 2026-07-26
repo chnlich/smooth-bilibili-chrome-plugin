@@ -2,6 +2,7 @@ import { BANK_CONFIG } from '../constants.js';
 import { scrubUrl } from '../diagnostics/privacy.js';
 import { BankFallbackError, BankNetworkError } from './errors.js';
 import {
+  BANK_ENABLED_ATTRIBUTE,
   BANK_MESSAGE_NAMESPACE,
   isBankMessage,
 } from './contract.js';
@@ -55,6 +56,35 @@ function performanceNow(windowObject) {
 
 function responseTypeConstructor(windowObject, name) {
   return windowObject[name] || globalThis[name];
+}
+
+function isRequestLike(value) {
+  return value !== null
+    && typeof value === 'object'
+    && typeof value.url === 'string'
+    && value.headers !== undefined;
+}
+
+function initField(init, field, inherited) {
+  if (init !== null && (typeof init === 'object' || typeof init === 'function')) {
+    const value = init[field];
+    if (value !== undefined) return value;
+  }
+  return inherited;
+}
+
+function inspectFetchArguments(args, locationObject) {
+  const [input, init] = args;
+  const inherited = isRequestLike(input) ? input : undefined;
+  const rawUrl = inherited === undefined ? String(input) : inherited.url;
+  const url = new URL(rawUrl, locationObject?.href).href;
+  return {
+    url,
+    headers: initField(init, 'headers', inherited?.headers),
+    method: initField(init, 'method', inherited?.method) || 'GET',
+    credentials: initField(init, 'credentials', inherited?.credentials) || 'same-origin',
+    signal: initField(init, 'signal', inherited?.signal),
+  };
 }
 
 function waitWithSignal(promise, signal, windowObject, timeoutMs) {
@@ -188,12 +218,14 @@ export class SegmentBank {
         console.error('[BilibiliBuffer] 媒体分片预取失败', error);
       });
     }, 1000);
-    this.onControlMessage = (event) => {
-      if (event.source !== this.windowObject || !isBankMessage(event.data)) return;
-      if (event.data.direction !== 'control' || event.data.type !== 'configure') return;
-      this.enabled = event.data.enabled === true;
-    };
-    this.windowObject.addEventListener('message', this.onControlMessage);
+  }
+
+  isEnabled() {
+    const root = this.windowObject.document?.documentElement;
+    const configured = root?.getAttribute?.(BANK_ENABLED_ATTRIBUTE);
+    if (configured === 'true') return true;
+    if (configured === 'false') return false;
+    return this.enabled === true;
   }
 
   emitDiagnostic(code, data) {
@@ -325,7 +357,7 @@ export class SegmentBank {
     return classifyRequest({
       url,
       headers,
-      enabled: this.enabled,
+      enabled: this.isEnabled(),
       locationObject: this.windowObject.location,
     });
   }
@@ -336,7 +368,7 @@ export class SegmentBank {
     }
     let request;
     try {
-      request = new Request(...args);
+      request = inspectFetchArguments(args, this.windowObject.location);
     } catch (error) {
       return originalFetch.apply(thisArg, args);
     }
@@ -347,7 +379,7 @@ export class SegmentBank {
       return originalFetch.apply(thisArg, args);
     }
     if (!classification.intercepted) {
-      if (this.enabled === true) {
+      if (this.isEnabled()) {
         this.emitDiagnostic('bank.serve', {
           source: scrubUrl(request.url),
           result: 'pass',
@@ -703,6 +735,7 @@ export class SegmentBank {
       });
     } catch (error) {
       this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
+      this.forgetMemoryRange(task.bankKey, result.start, result.end);
       console.error('[BilibiliBuffer] 媒体分片异步落盘失败', error);
       return;
     }
@@ -719,6 +752,7 @@ export class SegmentBank {
         });
       }
     }).catch((error) => {
+      this.forgetMemoryRange(task.bankKey, result.start, result.end);
       console.error('[BilibiliBuffer] 媒体分片异步落盘失败', error);
     }).finally(() => {
       this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
@@ -726,7 +760,10 @@ export class SegmentBank {
   }
 
   async prefetch() {
-    if (this.enabled !== true) return;
+    if (!this.isEnabled()) {
+      this.abortPrefetchTasks();
+      return;
+    }
     if (!isVideoLocation(this.windowObject.location)) {
       this.abortPrefetchTasks();
       return;
@@ -786,7 +823,6 @@ export class SegmentBank {
 
   destroy() {
     if (this.prefetchTimer !== undefined) this.windowObject.clearInterval(this.prefetchTimer);
-    this.windowObject.removeEventListener('message', this.onControlMessage);
     for (const task of this.inflight.values()) task.controller.abort();
     this.storeClient.destroy();
   }

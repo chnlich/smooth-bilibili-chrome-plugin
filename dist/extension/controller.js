@@ -490,7 +490,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-470bc644b05d25270f8a35e8" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-74a4b1d36c0940413e41abc4" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -2979,12 +2979,12 @@
   }
 
   // src/bank/contract.js
+  var BANK_ENABLED_ATTRIBUTE = "data-bilibili-buffer-bank-enabled";
   var BANK_MESSAGE_NAMESPACE = "bilibili-buffer:segment-bank-v1";
   var BANK_MESSAGE_TYPES = Object.freeze([
     "read-range",
     "write-chunk",
-    "diagnostic",
-    "configure"
+    "diagnostic"
   ]);
   function isBankMessage(message) {
     return message !== null && typeof message === "object" && !Array.isArray(message) && message.namespace === BANK_MESSAGE_NAMESPACE && BANK_MESSAGE_TYPES.includes(message.type);
@@ -3030,13 +3030,9 @@
     windowObject.postMessage(message, "*", transfer);
   }
   function postBankControl(windowObject, enabled) {
-    if (typeof windowObject?.postMessage !== "function") return;
-    postWindowMessage(windowObject, {
-      namespace: BANK_MESSAGE_NAMESPACE,
-      direction: "control",
-      type: "configure",
-      enabled: enabled === true
-    });
+    const root = windowObject?.document?.documentElement;
+    if (root === void 0 || root === null || typeof root.setAttribute !== "function") return;
+    root.setAttribute(BANK_ENABLED_ATTRIBUTE, enabled === true ? "true" : "false");
   }
   function installBankRelay({
     windowObject = window,

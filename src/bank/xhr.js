@@ -47,6 +47,10 @@ function responseHeadersText(headers) {
   return rows.length === 0 ? '' : `${rows.join('\r\n')}\r\n`;
 }
 
+function bankEnabled(bank) {
+  return typeof bank.isEnabled === 'function' ? bank.isEnabled() : bank.enabled === true;
+}
+
 export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
   return class SegmentBankXMLHttpRequest {
     static UNSENT = 0;
@@ -76,6 +80,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._aborted = false;
       this._timedOut = false;
       this._suppressNativeLoadstart = false;
+      this._generation = 0;
       for (const eventName of EVENT_NAMES) {
         this._native.addEventListener(eventName, (event) => {
           if (!this._intercepted) {
@@ -125,6 +130,9 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
     set withCredentials(value) { this._native.withCredentials = value; }
 
     open(...args) {
+      this._abortController?.abort();
+      this.clearTimer();
+      this._generation += 1;
       this._openArgs = args;
       this._headers = {};
       this._range = undefined;
@@ -134,7 +142,14 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._aborted = false;
       this._timedOut = false;
       this._suppressNativeLoadstart = false;
-      return this._native.open(...args);
+      this._status = 0;
+      this._statusText = '';
+      this._responseURL = '';
+      this._responseHeaders = undefined;
+      this._response = null;
+      const result = this._native.open(...args);
+      this._responseType = this._native.responseType;
+      return result;
     }
 
     setRequestHeader(name, value) {
@@ -184,7 +199,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       const classification = classifyRequest({
         url,
         headers: this._headers,
-        enabled: bank.enabled,
+        enabled: bankEnabled(bank),
         locationObject: windowObject.location,
       });
       this._range = classification.range;
@@ -194,10 +209,16 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._intercepted = true;
       this._state = 1;
       this._abortController = new AbortController();
+      this._status = 0;
+      this._statusText = '';
+      this._responseURL = '';
+      this._responseHeaders = undefined;
+      this._response = null;
+      const generation = this._generation;
       this.dispatchEvent(eventFor(windowObject, 'loadstart'));
       if (this.timeout > 0) {
         this._timer = windowObject.setTimeout(() => {
-          if (this._done) return;
+          if (this._done || generation !== this._generation) return;
           this._timedOut = true;
           this._abortController.abort();
           this._done = true;
@@ -207,10 +228,10 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
           this.dispatchEvent(eventFor(windowObject, 'loadend'));
         }, this.timeout);
       }
-      void this.serve(url, method, this._headers, body);
+      void this.serve(url, method, this._headers, body, generation);
     }
 
-    async serve(url, method, headers, body) {
+    async serve(url, method, headers, body, generation) {
       try {
         const result = await bank.serveRequest({
           url,
@@ -220,7 +241,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
           signal: this._abortController.signal,
           body,
         });
-        if (this._done) return;
+        if (this._done || generation !== this._generation) return;
         if (!result.intercepted) {
           this.clearTimer();
           this._suppressNativeLoadstart = true;
@@ -228,9 +249,9 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
           this._native.send(body);
           return;
         }
-        await this.finishResponse(result.response, result.bytes, url);
+        await this.finishResponse(result.response, result.bytes, url, generation);
       } catch (error) {
-        if (this._done) return;
+        if (this._done || generation !== this._generation) return;
         if (error instanceof BankFallbackError) {
           bank.emitDiagnostic('bank.serve', {
             source: scrubUrl(url),
@@ -245,11 +266,11 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
           return;
         }
         if (error instanceof BankNetworkError) {
-          this.finishError(error.cause);
+          this.finishError(error.cause, generation);
           return;
         }
         if (error?.name === 'AbortError') {
-          if (!this._aborted && !this._timedOut) this.finishError(error);
+          if (!this._aborted && !this._timedOut) this.finishError(error, generation);
           return;
         }
         bank.emitDiagnostic('bank.serve', {
@@ -265,21 +286,25 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       }
     }
 
-    async finishResponse(response, knownBytes, requestUrl) {
+    async finishResponse(response, knownBytes, requestUrl, generation) {
       const bytes = knownBytes || await responseBytes(response);
+      if (this._done || generation !== this._generation) return;
       this._status = response.status;
       this._statusText = response.statusText;
       this._responseURL = response.url || requestUrl;
       this._responseHeaders = response.headers;
       this._response = responseValue(windowObject, this._responseType, bytes);
+      const contentLength = response.headers.get('Content-Length');
+      const total = contentLength === null ? 0 : Number(contentLength);
+      const lengthComputable = Number.isFinite(total) && total >= 0;
       this._state = 2;
       this.dispatchEvent(eventFor(windowObject, 'readystatechange'));
       this._state = 3;
       this.dispatchEvent(eventFor(windowObject, 'readystatechange'));
       this.dispatchEvent(eventFor(windowObject, 'progress', {
         loaded: bytes.byteLength,
-        total: Number(response.headers.get('Content-Length')) || bytes.byteLength,
-        lengthComputable: true,
+        total: lengthComputable ? total : 0,
+        lengthComputable,
       }));
       this._state = 4;
       this._done = true;
@@ -289,8 +314,8 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this.clearTimer();
     }
 
-    finishError(error) {
-      if (this._done) return;
+    finishError(error, generation) {
+      if (this._done || generation !== this._generation) return;
       this._state = 4;
       this._done = true;
       this.dispatchEvent(eventFor(windowObject, 'readystatechange'));

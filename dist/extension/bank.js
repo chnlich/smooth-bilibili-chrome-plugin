@@ -245,12 +245,12 @@
   };
 
   // src/bank/contract.js
+  var BANK_ENABLED_ATTRIBUTE = "data-bilibili-buffer-bank-enabled";
   var BANK_MESSAGE_NAMESPACE = "bilibili-buffer:segment-bank-v1";
   var BANK_MESSAGE_TYPES = Object.freeze([
     "read-range",
     "write-chunk",
-    "diagnostic",
-    "configure"
+    "diagnostic"
   ]);
   function isBankMessage(message) {
     return message !== null && typeof message === "object" && !Array.isArray(message) && message.namespace === BANK_MESSAGE_NAMESPACE && BANK_MESSAGE_TYPES.includes(message.type);
@@ -284,6 +284,13 @@
   }
   function headerValue(headers, name) {
     if (headers !== null && typeof headers?.get === "function") return headers.get(name);
+    if (Array.isArray(headers)) {
+      const wanted = name.toLowerCase();
+      for (const entry of headers) {
+        if (!Array.isArray(entry) || entry.length < 2) continue;
+        if (String(entry[0]).toLowerCase() === wanted) return String(entry[1]);
+      }
+    }
     if (headers !== null && typeof headers === "object") {
       const wanted = name.toLowerCase();
       for (const [key, value] of Object.entries(headers)) {
@@ -454,6 +461,9 @@
     return rows.length === 0 ? "" : `${rows.join("\r\n")}\r
 `;
   }
+  function bankEnabled(bank) {
+    return typeof bank.isEnabled === "function" ? bank.isEnabled() : bank.enabled === true;
+  }
   function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
     return class SegmentBankXMLHttpRequest {
       static UNSENT = 0;
@@ -482,6 +492,7 @@
         this._aborted = false;
         this._timedOut = false;
         this._suppressNativeLoadstart = false;
+        this._generation = 0;
         for (const eventName of EVENT_NAMES) {
           this._native.addEventListener(eventName, (event) => {
             if (!this._intercepted) {
@@ -538,6 +549,9 @@
         this._native.withCredentials = value;
       }
       open(...args) {
+        this._abortController?.abort();
+        this.clearTimer();
+        this._generation += 1;
         this._openArgs = args;
         this._headers = {};
         this._range = void 0;
@@ -547,7 +561,14 @@
         this._aborted = false;
         this._timedOut = false;
         this._suppressNativeLoadstart = false;
-        return this._native.open(...args);
+        this._status = 0;
+        this._statusText = "";
+        this._responseURL = "";
+        this._responseHeaders = void 0;
+        this._response = null;
+        const result = this._native.open(...args);
+        this._responseType = this._native.responseType;
+        return result;
       }
       setRequestHeader(name, value) {
         const existing = this._headers[name];
@@ -591,7 +612,7 @@
         const classification = classifyRequest({
           url,
           headers: this._headers,
-          enabled: bank.enabled,
+          enabled: bankEnabled(bank),
           locationObject: windowObject.location
         });
         this._range = classification.range;
@@ -601,10 +622,16 @@
         this._intercepted = true;
         this._state = 1;
         this._abortController = new AbortController();
+        this._status = 0;
+        this._statusText = "";
+        this._responseURL = "";
+        this._responseHeaders = void 0;
+        this._response = null;
+        const generation = this._generation;
         this.dispatchEvent(eventFor(windowObject, "loadstart"));
         if (this.timeout > 0) {
           this._timer = windowObject.setTimeout(() => {
-            if (this._done) return;
+            if (this._done || generation !== this._generation) return;
             this._timedOut = true;
             this._abortController.abort();
             this._done = true;
@@ -614,9 +641,9 @@
             this.dispatchEvent(eventFor(windowObject, "loadend"));
           }, this.timeout);
         }
-        void this.serve(url, method, this._headers, body);
+        void this.serve(url, method, this._headers, body, generation);
       }
-      async serve(url, method, headers, body) {
+      async serve(url, method, headers, body, generation) {
         try {
           const result = await bank.serveRequest({
             url,
@@ -626,7 +653,7 @@
             signal: this._abortController.signal,
             body
           });
-          if (this._done) return;
+          if (this._done || generation !== this._generation) return;
           if (!result.intercepted) {
             this.clearTimer();
             this._suppressNativeLoadstart = true;
@@ -634,9 +661,9 @@
             this._native.send(body);
             return;
           }
-          await this.finishResponse(result.response, result.bytes, url);
+          await this.finishResponse(result.response, result.bytes, url, generation);
         } catch (error) {
-          if (this._done) return;
+          if (this._done || generation !== this._generation) return;
           if (error instanceof BankFallbackError) {
             bank.emitDiagnostic("bank.serve", {
               source: scrubUrl(url),
@@ -651,11 +678,11 @@
             return;
           }
           if (error instanceof BankNetworkError) {
-            this.finishError(error.cause);
+            this.finishError(error.cause, generation);
             return;
           }
           if (error?.name === "AbortError") {
-            if (!this._aborted && !this._timedOut) this.finishError(error);
+            if (!this._aborted && !this._timedOut) this.finishError(error, generation);
             return;
           }
           bank.emitDiagnostic("bank.serve", {
@@ -670,21 +697,25 @@
           this._native.send(body);
         }
       }
-      async finishResponse(response, knownBytes, requestUrl) {
+      async finishResponse(response, knownBytes, requestUrl, generation) {
         const bytes = knownBytes || await responseBytes(response);
+        if (this._done || generation !== this._generation) return;
         this._status = response.status;
         this._statusText = response.statusText;
         this._responseURL = response.url || requestUrl;
         this._responseHeaders = response.headers;
         this._response = responseValue(windowObject, this._responseType, bytes);
+        const contentLength = response.headers.get("Content-Length");
+        const total = contentLength === null ? 0 : Number(contentLength);
+        const lengthComputable = Number.isFinite(total) && total >= 0;
         this._state = 2;
         this.dispatchEvent(eventFor(windowObject, "readystatechange"));
         this._state = 3;
         this.dispatchEvent(eventFor(windowObject, "readystatechange"));
         this.dispatchEvent(eventFor(windowObject, "progress", {
           loaded: bytes.byteLength,
-          total: Number(response.headers.get("Content-Length")) || bytes.byteLength,
-          lengthComputable: true
+          total: lengthComputable ? total : 0,
+          lengthComputable
         }));
         this._state = 4;
         this._done = true;
@@ -693,8 +724,8 @@
         this.dispatchEvent(eventFor(windowObject, "loadend"));
         this.clearTimer();
       }
-      finishError(error) {
-        if (this._done) return;
+      finishError(error, generation) {
+        if (this._done || generation !== this._generation) return;
         this._state = 4;
         this._done = true;
         this.dispatchEvent(eventFor(windowObject, "readystatechange"));
@@ -751,6 +782,29 @@
   }
   function responseTypeConstructor(windowObject, name) {
     return windowObject[name] || globalThis[name];
+  }
+  function isRequestLike(value) {
+    return value !== null && typeof value === "object" && typeof value.url === "string" && value.headers !== void 0;
+  }
+  function initField(init, field, inherited) {
+    if (init !== null && (typeof init === "object" || typeof init === "function")) {
+      const value = init[field];
+      if (value !== void 0) return value;
+    }
+    return inherited;
+  }
+  function inspectFetchArguments(args, locationObject) {
+    const [input, init] = args;
+    const inherited = isRequestLike(input) ? input : void 0;
+    const rawUrl = inherited === void 0 ? String(input) : inherited.url;
+    const url = new URL(rawUrl, locationObject?.href).href;
+    return {
+      url,
+      headers: initField(init, "headers", inherited?.headers),
+      method: initField(init, "method", inherited?.method) || "GET",
+      credentials: initField(init, "credentials", inherited?.credentials) || "same-origin",
+      signal: initField(init, "signal", inherited?.signal)
+    };
   }
   function waitWithSignal(promise, signal, windowObject, timeoutMs) {
     if (signal?.aborted) return Promise.reject(abortError());
@@ -877,12 +931,13 @@
           console.error("[BilibiliBuffer] 媒体分片预取失败", error);
         });
       }, 1e3);
-      this.onControlMessage = (event) => {
-        if (event.source !== this.windowObject || !isBankMessage(event.data)) return;
-        if (event.data.direction !== "control" || event.data.type !== "configure") return;
-        this.enabled = event.data.enabled === true;
-      };
-      this.windowObject.addEventListener("message", this.onControlMessage);
+    }
+    isEnabled() {
+      const root = this.windowObject.document?.documentElement;
+      const configured = root?.getAttribute?.(BANK_ENABLED_ATTRIBUTE);
+      if (configured === "true") return true;
+      if (configured === "false") return false;
+      return this.enabled === true;
     }
     emitDiagnostic(code, data) {
       const message = {
@@ -999,7 +1054,7 @@
       return classifyRequest({
         url,
         headers,
-        enabled: this.enabled,
+        enabled: this.isEnabled(),
         locationObject: this.windowObject.location
       });
     }
@@ -1009,7 +1064,7 @@
       }
       let request;
       try {
-        request = new Request(...args);
+        request = inspectFetchArguments(args, this.windowObject.location);
       } catch (error) {
         return originalFetch.apply(thisArg, args);
       }
@@ -1020,7 +1075,7 @@
         return originalFetch.apply(thisArg, args);
       }
       if (!classification.intercepted) {
-        if (this.enabled === true) {
+        if (this.isEnabled()) {
           this.emitDiagnostic("bank.serve", {
             source: scrubUrl(request.url),
             result: "pass",
@@ -1356,6 +1411,7 @@
         });
       } catch (error) {
         this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
+        this.forgetMemoryRange(task.bankKey, result.start, result.end);
         console.error("[BilibiliBuffer] 媒体分片异步落盘失败", error);
         return;
       }
@@ -1372,13 +1428,17 @@
           });
         }
       }).catch((error) => {
+        this.forgetMemoryRange(task.bankKey, result.start, result.end);
         console.error("[BilibiliBuffer] 媒体分片异步落盘失败", error);
       }).finally(() => {
         this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
       });
     }
     async prefetch() {
-      if (this.enabled !== true) return;
+      if (!this.isEnabled()) {
+        this.abortPrefetchTasks();
+        return;
+      }
       if (!isVideoLocation(this.windowObject.location)) {
         this.abortPrefetchTasks();
         return;
@@ -1435,7 +1495,6 @@
     }
     destroy() {
       if (this.prefetchTimer !== void 0) this.windowObject.clearInterval(this.prefetchTimer);
-      this.windowObject.removeEventListener("message", this.onControlMessage);
       for (const task of this.inflight.values()) task.controller.abort();
       this.storeClient.destroy();
     }

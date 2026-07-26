@@ -1005,8 +1005,7 @@
   var BANK_MESSAGE_TYPES = Object.freeze([
     "read-range",
     "write-chunk",
-    "diagnostic",
-    "configure"
+    "diagnostic"
   ]);
   function isBankMessage(message) {
     return message !== null && typeof message === "object" && !Array.isArray(message) && message.namespace === BANK_MESSAGE_NAMESPACE && BANK_MESSAGE_TYPES.includes(message.type);
@@ -1370,7 +1369,7 @@
       });
       return { ...result, ...eviction };
     }
-    if (message.type === "diagnostic" || message.type === "configure") return void 0;
+    if (message.type === "diagnostic") return void 0;
     throw new Error(`未处理的媒体分片消息: ${message.type}`);
   }
   function installBankWorker(runtimeObject = globalThis.chrome?.runtime) {

@@ -36,6 +36,13 @@ export function cacheKey(bankKeyValue, index) {
 
 export function headerValue(headers, name) {
   if (headers !== null && typeof headers?.get === 'function') return headers.get(name);
+  if (Array.isArray(headers)) {
+    const wanted = name.toLowerCase();
+    for (const entry of headers) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      if (String(entry[0]).toLowerCase() === wanted) return String(entry[1]);
+    }
+  }
   if (headers !== null && typeof headers === 'object') {
     const wanted = name.toLowerCase();
     for (const [key, value] of Object.entries(headers)) {

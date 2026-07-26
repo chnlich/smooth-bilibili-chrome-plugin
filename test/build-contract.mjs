@@ -191,7 +191,7 @@ const expectedFiles = [
   'worker.js.map',
 ];
 assert.deepEqual((await fs.readdir(extensionDirectory)).sort(), expectedFiles);
-for (const bundle of ['controller.js', 'main-bridge.js', 'source-buffer-shim.js', 'popup.js', 'worker.js', 'logs.js']) {
+for (const bundle of ['bank.js', 'controller.js', 'main-bridge.js', 'source-buffer-shim.js', 'popup.js', 'worker.js', 'logs.js']) {
   assert.match(await fs.readFile(path.join(extensionDirectory, `${bundle}.map`), 'utf8'), /"sources"/);
   assert.match(await fs.readFile(path.join(extensionDirectory, bundle), 'utf8'), /sourceMappingURL/);
 }

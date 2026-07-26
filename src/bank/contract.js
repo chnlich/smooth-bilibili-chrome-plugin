@@ -1,10 +1,10 @@
+export const BANK_ENABLED_ATTRIBUTE = 'data-bilibili-buffer-bank-enabled';
 export const BANK_MESSAGE_NAMESPACE = 'bilibili-buffer:segment-bank-v1';
 
 export const BANK_MESSAGE_TYPES = Object.freeze([
   'read-range',
   'write-chunk',
   'diagnostic',
-  'configure',
 ]);
 
 export function isBankMessage(message) {

@@ -63,7 +63,7 @@ export async function handleBankMessage(message, indexedDbObject) {
     });
     return { ...result, ...eviction };
   }
-  if (message.type === 'diagnostic' || message.type === 'configure') return undefined;
+  if (message.type === 'diagnostic') return undefined;
   throw new Error(`未处理的媒体分片消息: ${message.type}`);
 }
 
