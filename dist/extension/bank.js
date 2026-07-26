@@ -350,11 +350,12 @@
     chunkBytes = BANK_CONFIG.chunkBytes,
     totalSize,
     bankKeyValue = "resource",
-    aligned = false
+    aligned = false,
+    forceAligned = false
   } = {}) {
     const request = { start, end };
     const length = rangeLength(request);
-    if (aligned !== true || length < chunkBytes / 2) {
+    if (aligned !== true || forceAligned !== true && length < chunkBytes / 2) {
       return [{
         ...request,
         chunkIndex: chunkIndex(start, chunkBytes),
@@ -373,7 +374,7 @@
           end: chunkEnd,
           chunkIndex: index,
           cacheKey: cacheKey(bankKeyValue, index),
-          cacheable: chunkEnd - current + 1 >= chunkBytes / 2
+          cacheable: true
         });
       }
       current += chunkBytes;
@@ -575,7 +576,6 @@
     if (start !== index * chunkBytes || end !== expectedEnd) {
       throw new Error("媒体分片写入区间未按分片边界对齐");
     }
-    if (bytes.byteLength < chunkBytes / 2) throw new Error("媒体分片写入区间过小");
     const key = cacheKey(bankKeyValue, index);
     const previous = chunks.get(key);
     const storedBytes = bytes.slice(0);
@@ -1606,7 +1606,8 @@
           chunkBytes: this.config.chunkBytes,
           totalSize: state.totalSize,
           bankKeyValue: state.bankKey,
-          aligned: true
+          aligned: true,
+          forceAligned: true
         });
         for (const plan of plans) {
           if (plan.cacheable !== false && (this.chunks.has(plan.cacheKey) || this.fetchedChunks.has(plan.cacheKey))) continue;

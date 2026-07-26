@@ -128,7 +128,6 @@ export function writeMemoryChunk({
   if (start !== index * chunkBytes || end !== expectedEnd) {
     throw new Error('媒体分片写入区间未按分片边界对齐');
   }
-  if (bytes.byteLength < chunkBytes / 2) throw new Error('媒体分片写入区间过小');
   const key = cacheKey(bankKeyValue, index);
   const previous = chunks.get(key);
   const storedBytes = bytes.slice(0);

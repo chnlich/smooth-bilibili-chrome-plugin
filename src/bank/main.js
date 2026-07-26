@@ -731,6 +731,7 @@ export class SegmentBank {
         totalSize: state.totalSize,
         bankKeyValue: state.bankKey,
         aligned: true,
+        forceAligned: true,
       });
       for (const plan of plans) {
         if (plan.cacheable !== false && (this.chunks.has(plan.cacheKey) || this.fetchedChunks.has(plan.cacheKey))) continue;

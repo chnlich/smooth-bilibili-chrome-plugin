@@ -220,6 +220,19 @@ test('response headers, content-range parser, aligned plans and bitrate estimate
     cacheKey: `${MEDIA_KEY}#0`,
     cacheable: false,
   }]);
+  assert.deepEqual(planFetchRanges(4, 10, {
+    chunkBytes: 16,
+    totalSize: 100,
+    bankKeyValue: MEDIA_KEY,
+    aligned: true,
+    forceAligned: true,
+  }), [{
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+    cacheable: true,
+  }]);
 });
 
 test('control stays in the DOM boundary and diagnostic messages carry no binary payload', () => {

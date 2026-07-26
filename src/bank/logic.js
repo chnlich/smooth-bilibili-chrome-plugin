@@ -125,10 +125,11 @@ export function planFetchRanges(start, end, {
   totalSize,
   bankKeyValue = 'resource',
   aligned = false,
+  forceAligned = false,
 } = {}) {
   const request = { start, end };
   const length = rangeLength(request);
-  if (aligned !== true || length < chunkBytes / 2) {
+  if (aligned !== true || (forceAligned !== true && length < chunkBytes / 2)) {
     return [{
       ...request,
       chunkIndex: chunkIndex(start, chunkBytes),
@@ -149,7 +150,7 @@ export function planFetchRanges(start, end, {
         end: chunkEnd,
         chunkIndex: index,
         cacheKey: cacheKey(bankKeyValue, index),
-        cacheable: chunkEnd - current + 1 >= chunkBytes / 2,
+        cacheable: true,
       });
     }
     current += chunkBytes;
