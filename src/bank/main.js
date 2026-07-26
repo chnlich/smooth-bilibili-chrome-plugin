@@ -3,8 +3,8 @@ import { scrubUrl } from '../diagnostics/privacy.js';
 import { BankFallbackError, BankNetworkError } from './errors.js';
 import {
   BANK_ENABLED_ATTRIBUTE,
+  BANK_DIAGNOSTIC_MESSAGE_TYPE,
   BANK_MESSAGE_NAMESPACE,
-  isBankMessage,
 } from './contract.js';
 import {
   bankKey,
@@ -23,17 +23,15 @@ import {
   rangeLength,
   isVideoLocation,
 } from './logic.js';
+import {
+  clearMemory,
+  enforceMemoryLimit,
+  readMemoryRange,
+  writeMemoryChunk,
+} from './storage.js';
 import { createBankXMLHttpRequestClass } from './xhr.js';
 
 const MAX_CONCURRENCY = 3;
-
-class StoreReadTimeoutError extends Error {
-  constructor() {
-    super('媒体分片存储读取超时');
-    this.name = 'StoreReadTimeoutError';
-    this.code = 'BANK_STORE_READ_TIMEOUT';
-  }
-}
 
 function abortError() {
   return new DOMException('The operation was aborted', 'AbortError');
@@ -41,13 +39,6 @@ function abortError() {
 
 function isAbortError(error) {
   return error?.name === 'AbortError';
-}
-
-function messageError(error) {
-  const result = new Error(error?.message || String(error));
-  result.name = error?.name || 'Error';
-  result.code = error?.code || 'BANK_RELAY_FAILED';
-  return result;
 }
 
 function performanceNow(windowObject) {
@@ -87,14 +78,12 @@ function inspectFetchArguments(args, locationObject) {
   };
 }
 
-function waitWithSignal(promise, signal, windowObject, timeoutMs) {
+function waitWithSignal(promise, signal) {
   if (signal?.aborted) return Promise.reject(abortError());
   return new Promise((resolve, reject) => {
-    let timer;
     let settled = false;
     const cleanup = () => {
       signal?.removeEventListener('abort', onAbort);
-      if (timer !== undefined) windowObject.clearTimeout(timer);
     };
     const finish = (callback, value) => {
       if (settled) return;
@@ -104,115 +93,38 @@ function waitWithSignal(promise, signal, windowObject, timeoutMs) {
     };
     const onAbort = () => finish(reject, abortError());
     signal?.addEventListener('abort', onAbort, { once: true });
-    if (timeoutMs !== undefined) {
-      timer = windowObject.setTimeout(() => finish(reject, new StoreReadTimeoutError()), timeoutMs);
-    }
     promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
   });
-}
-
-class BankStoreClient {
-  constructor(windowObject) {
-    this.windowObject = windowObject;
-    this.nextRequestId = 1;
-    this.pending = new Map();
-    this.onMessage = (event) => {
-      if (event.source !== this.windowObject || !isBankMessage(event.data)) return;
-      const message = event.data;
-      if (message.direction !== 'response') return;
-      const pending = this.pending.get(message.requestId);
-      if (pending === undefined) return;
-      this.pending.delete(message.requestId);
-      if (message.ok !== true) {
-        pending.reject(messageError(message.error));
-        return;
-      }
-      pending.resolve(message.value);
-    };
-    windowObject.addEventListener('message', this.onMessage);
-  }
-
-  request(type, payload, transfer = []) {
-    const requestId = this.nextRequestId;
-    this.nextRequestId += 1;
-    const message = {
-      namespace: BANK_MESSAGE_NAMESPACE,
-      direction: 'request',
-      type,
-      requestId,
-      ...payload,
-    };
-    return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
-      try {
-        this.windowObject.postMessage(message, '*', transfer);
-      } catch (error) {
-        this.pending.delete(requestId);
-        reject(error);
-      }
-    });
-  }
-
-  readRange(bankKeyValue, start, end) {
-    return this.request('read-range', { bankKey: bankKeyValue, start, end });
-  }
-
-  writeChunk({
-    bankKey: bankKeyValue,
-    videoKey,
-    start,
-    end,
-    totalSize,
-    bytes,
-    currentByteByBank,
-    currentByteByVideo,
-  }) {
-    return this.request(
-      'write-chunk',
-      {
-        bankKey: bankKeyValue,
-        videoKey,
-        start,
-        end,
-        totalSize,
-        bytes,
-        currentByteByBank,
-        currentByteByVideo,
-      },
-      [bytes],
-    );
-  }
-
-  destroy() {
-    this.windowObject.removeEventListener('message', this.onMessage);
-    for (const pending of this.pending.values()) pending.reject(new Error('媒体分片存储客户端已经销毁'));
-    this.pending.clear();
-  }
 }
 
 export class SegmentBank {
   constructor({
     windowObject = window,
     nativeFetch = windowObject.fetch,
-    storeClient = new BankStoreClient(windowObject),
     maxConcurrency = MAX_CONCURRENCY,
     config = BANK_CONFIG,
+    chunks = new Map(),
+    now = Date.now,
   } = {}) {
     this.windowObject = windowObject;
     this.nativeFetch = nativeFetch;
-    this.storeClient = storeClient;
     this.config = config;
     this.maxConcurrency = maxConcurrency;
+    this.now = now;
     this.enabled = true;
+    this.disabled = false;
     this.queue = [];
     this.inflight = new Map();
     this.activeTasks = new Set();
     this.sequence = 0;
+    this.sessionGeneration = 0;
     this.resourceState = new Map();
     this.recentResourceKeys = [];
-    this.knownStoredRanges = new Map();
-    this.pendingStoreRanges = new Map();
-    this.memoryRanges = new Map();
+    this.chunks = chunks;
+    this.fetchedChunks = new Map();
+    this.refetchCounts = new Map();
+    this.lastRouteWasVideo = this.windowObject.location === undefined
+      || isVideoLocation(this.windowObject.location);
     this.prefetchTimer = this.windowObject.setInterval?.(() => {
       void this.prefetch().catch((error) => {
         console.error('[BilibiliBuffer] 媒体分片预取失败', error);
@@ -221,6 +133,7 @@ export class SegmentBank {
   }
 
   isEnabled() {
+    if (this.disabled) return false;
     const root = this.windowObject.document?.documentElement;
     const configured = root?.getAttribute?.(BANK_ENABLED_ATTRIBUTE);
     if (configured === 'true') return true;
@@ -232,7 +145,7 @@ export class SegmentBank {
     const message = {
       namespace: BANK_MESSAGE_NAMESPACE,
       direction: 'event',
-      type: 'diagnostic',
+      type: BANK_DIAGNOSTIC_MESSAGE_TYPE,
       code,
       data,
     };
@@ -261,64 +174,46 @@ export class SegmentBank {
     return state;
   }
 
-  rangeIsCovered(rangeMap, key, start, end) {
-    return (rangeMap.get(key) || []).some((range) => range.start <= start && range.end >= end);
-  }
-
-  rememberRange(rangeMap, key, start, end) {
-    const ranges = rangeMap.get(key) || [];
-    ranges.push({ start, end });
-    rangeMap.set(key, ranges);
-  }
-
-  forgetRange(rangeMap, key, start, end) {
-    const ranges = rangeMap.get(key) || [];
-    const remaining = ranges.filter((range) => range.start !== start || range.end !== end);
-    if (remaining.length === 0) rangeMap.delete(key);
-    else rangeMap.set(key, remaining);
-  }
-
-  rememberMemoryRange(bankKeyValue, result) {
-    const ranges = this.memoryRanges.get(bankKeyValue) || [];
-    ranges.push({
-      start: result.start,
-      end: result.end,
-      totalSize: result.totalSize,
-      bytes: result.bytes,
-    });
-    this.memoryRanges.set(bankKeyValue, ranges);
-  }
-
-  forgetMemoryRange(bankKeyValue, start, end) {
-    const ranges = this.memoryRanges.get(bankKeyValue) || [];
-    const remaining = ranges.filter((range) => range.start !== start || range.end !== end);
-    if (remaining.length === 0) this.memoryRanges.delete(bankKeyValue);
-    else this.memoryRanges.set(bankKeyValue, remaining);
-  }
-
-  readMemoryRange(bankKeyValue, start, end) {
-    const segments = [...this.memoryRanges.get(bankKeyValue) || []].sort((left, right) => left.start - right.start);
-    const bytes = new Uint8Array(rangeLength({ start, end }));
-    let cursor = start;
-    let totalSize;
-    for (const segment of segments) {
-      if (segment.end < cursor) continue;
-      if (segment.start > cursor) return undefined;
-      const copyStart = Math.max(cursor, segment.start);
-      const copyEnd = Math.min(end, segment.end);
-      bytes.set(
-        new Uint8Array(segment.bytes).subarray(copyStart - segment.start, copyEnd - segment.start + 1),
-        copyStart - start,
-      );
-      cursor = copyEnd + 1;
-      totalSize = segment.totalSize;
-      if (cursor > end) return { hit: true, bytes: bytes.buffer, totalSize };
-    }
-    return undefined;
-  }
-
   cacheKeyForRange(resourceKey, start) {
     return cacheKey(resourceKey, chunkIndex(start, this.config.chunkBytes));
+  }
+
+  currentByteByBank() {
+    return Object.fromEntries(
+      [...this.resourceState.entries()]
+        .filter(([, state]) => Number.isSafeInteger(state.lastForegroundEnd))
+        .map(([key, state]) => [key, state.lastForegroundEnd]),
+    );
+  }
+
+  releaseSession() {
+    this.sessionGeneration += 1;
+    this.abortPrefetchTasks();
+    for (const task of this.queue) {
+      if (task.kind !== 'prefetch') continue;
+      task.controller.abort();
+      task.reject(abortError());
+      if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+    }
+    this.queue = this.queue.filter((task) => task.kind !== 'prefetch');
+    clearMemory(this.chunks);
+    this.fetchedChunks.clear();
+    this.refetchCounts.clear();
+    this.resourceState.clear();
+    this.recentResourceKeys = [];
+    this.playbackSamples = [];
+  }
+
+  syncRouteLifecycle() {
+    if (this.windowObject.location === undefined) return true;
+    const currentIsVideo = isVideoLocation(this.windowObject.location);
+    if (!currentIsVideo) {
+      if (this.lastRouteWasVideo) this.releaseSession();
+      this.lastRouteWasVideo = false;
+      return false;
+    }
+    this.lastRouteWasVideo = true;
+    return true;
   }
 
   touchResource(resourceKey) {
@@ -363,7 +258,7 @@ export class SegmentBank {
   }
 
   async handleFetch(thisArg, args, originalFetch) {
-    if (this.windowObject.location !== undefined && !isVideoLocation(this.windowObject.location)) {
+    if (!this.syncRouteLifecycle()) {
       return originalFetch.apply(thisArg, args);
     }
     let request;
@@ -419,27 +314,8 @@ export class SegmentBank {
     }
   }
 
-  async readStoredRange(bankKeyValue, start, end, signal) {
-    const memory = this.readMemoryRange(bankKeyValue, start, end);
-    if (memory?.hit === true) return memory;
-    let read;
-    try {
-      read = this.storeClient.readRange(bankKeyValue, start, end);
-    } catch (error) {
-      throw new BankFallbackError('媒体分片存储读取失败', error);
-    }
-    try {
-      return await waitWithSignal(read, signal, this.windowObject, this.config.storeReadTimeoutMs);
-    } catch (error) {
-      if (error instanceof StoreReadTimeoutError) {
-        void read.catch((readError) => {
-          console.error('[BilibiliBuffer] 媒体分片存储读取超时后的错误', readError);
-        });
-        return undefined;
-      }
-      if (isAbortError(error)) throw error;
-      throw new BankFallbackError('媒体分片存储读取失败', error);
-    }
+  readStoredRange(bankKeyValue, start, end) {
+    return readMemoryRange(this.chunks, bankKeyValue, start, end, this.config.chunkBytes);
   }
 
   createResponse(bytes, start, end, totalSize, url) {
@@ -454,7 +330,7 @@ export class SegmentBank {
     return response;
   }
 
-  async serveRequest({ url, method, headers, credentials, signal }) {
+  serveRequest({ url, method, headers, credentials, signal }) {
     const classification = this.requestClassification(url, headers);
     if (!classification.intercepted) return { intercepted: false };
     if (signal?.aborted) throw abortError();
@@ -467,7 +343,7 @@ export class SegmentBank {
     state.credentials = credentials || 'same-origin';
     if (state.lastForegroundEnd !== end) state.prefetchEnd = undefined;
     state.lastForegroundEnd = end;
-    const stored = await this.readStoredRange(resourceKey, start, end, signal);
+    const stored = this.readStoredRange(resourceKey, start, end);
     if (signal?.aborted) throw abortError();
     if (stored?.hit === true) {
       if (!(stored.bytes instanceof ArrayBuffer) || stored.bytes.byteLength !== rangeLength({ start, end })) {
@@ -477,12 +353,6 @@ export class SegmentBank {
         throw new BankFallbackError('媒体分片存储命中总长度无效');
       }
       state.totalSize = stored.totalSize;
-      this.rememberRange(
-        this.knownStoredRanges,
-        this.cacheKeyForRange(resourceKey, start),
-        start,
-        end,
-      );
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(url),
         start,
@@ -502,9 +372,9 @@ export class SegmentBank {
       start,
       end,
       result: 'fetch',
-      reason: stored === undefined ? 'store_read_timeout' : stored?.hit === false ? 'stored_range_missing' : 'store_unavailable',
+      reason: 'stored_range_missing',
     });
-    const fetched = await this.fetchForeground({
+    return this.fetchForeground({
       resourceKey,
       url,
       credentials: state.credentials,
@@ -513,16 +383,17 @@ export class SegmentBank {
       totalSize: state.totalSize || stored?.totalSize,
       signal,
       videoKey: state.videoKey,
+    }).then((fetched) => {
+      if (signal?.aborted) throw abortError();
+      if (fetched.response !== undefined) return { intercepted: true, response: fetched.response };
+      state.totalSize = fetched.totalSize;
+      return {
+        intercepted: true,
+        response: this.createResponse(fetched.bytes, start, end, fetched.totalSize, url),
+        bytes: fetched.bytes,
+        totalSize: fetched.totalSize,
+      };
     });
-    if (signal?.aborted) throw abortError();
-    if (fetched.response !== undefined) return { intercepted: true, response: fetched.response };
-    state.totalSize = fetched.totalSize;
-    return {
-      intercepted: true,
-      response: this.createResponse(fetched.bytes, start, end, fetched.totalSize, url),
-      bytes: fetched.bytes,
-      totalSize: fetched.totalSize,
-    };
   }
 
   async fetchForeground({ resourceKey, url, credentials, start, end, totalSize, signal, videoKey }) {
@@ -530,15 +401,32 @@ export class SegmentBank {
       chunkBytes: this.config.chunkBytes,
       totalSize,
       bankKeyValue: resourceKey,
-      aligned: false,
+      aligned: true,
     });
-    const results = await Promise.all(plans.map((plan) => this.getTask(plan, {
-      kind: 'foreground',
-      url,
-      credentials,
-      signal,
-      videoKey,
-    })));
+    const results = await Promise.all(plans.map((plan) => {
+      const stored = readMemoryRange(
+        this.chunks,
+        resourceKey,
+        plan.start,
+        plan.end,
+        this.config.chunkBytes,
+      );
+      if (stored.hit === true) {
+        return {
+          start: plan.start,
+          end: plan.end,
+          bytes: stored.bytes,
+          totalSize: stored.totalSize,
+        };
+      }
+      return this.getTask(plan, {
+        kind: 'foreground',
+        url,
+        credentials,
+        signal,
+        videoKey,
+      });
+    }));
     const httpError = results.find((result) => result.response !== undefined);
     if (httpError !== undefined) return httpError;
     const total = results.find((result) => Number.isSafeInteger(result.totalSize))?.totalSize;
@@ -562,6 +450,32 @@ export class SegmentBank {
     return { bytes: bytes.buffer, start, end, totalSize: total };
   }
 
+  disable(reason) {
+    if (this.disabled) return;
+    this.disabled = true;
+    this.enabled = false;
+    this.abortPrefetchTasks();
+    const retained = [];
+    for (const task of this.queue) {
+      if (task.kind !== 'prefetch') {
+        retained.push(task);
+        continue;
+      }
+      task.controller.abort();
+      task.reject(abortError());
+      if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+    }
+    this.queue = retained;
+    this.emitDiagnostic('bank.disabled', { reason });
+  }
+
+  noteRefetch(plan) {
+    if (plan.cacheable === false || !this.fetchedChunks.has(plan.cacheKey)) return;
+    const count = (this.refetchCounts.get(plan.cacheKey) || 0) + 1;
+    this.refetchCounts.set(plan.cacheKey, count);
+    if (count >= this.config.refetchAlarmCount) this.disable('refetch_alarm');
+  }
+
   getTask(plan, { kind, url, credentials, signal, videoKey }) {
     const existing = this.inflight.get(plan.cacheKey);
     if (existing !== undefined) {
@@ -580,6 +494,11 @@ export class SegmentBank {
         })
         .then(() => this.getTask(plan, { kind, url, credentials, signal, videoKey }));
     }
+    if (kind === 'prefetch' && plan.cacheable !== false
+      && (this.fetchedChunks.has(plan.cacheKey) || this.chunks.has(plan.cacheKey))) {
+      return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
+    }
+    if (kind === 'foreground') this.noteRefetch(plan);
     const controller = new AbortController();
     const task = {
       ...plan,
@@ -588,6 +507,7 @@ export class SegmentBank {
       credentials,
       videoKey,
       kind,
+      sessionGeneration: this.sessionGeneration,
       priority: priorityFor(kind),
       sequence: this.sequence,
       controller,
@@ -611,7 +531,7 @@ export class SegmentBank {
 
   waitForTask(task, signal) {
     task.waiters += 1;
-    return waitWithSignal(task.promise, signal, this.windowObject).finally(() => {
+    return waitWithSignal(task.promise, signal).finally(() => {
       task.waiters -= 1;
       if (signal !== undefined && signal.aborted && task.waiters === 0 && task.kind === 'foreground') {
         task.controller.abort();
@@ -683,14 +603,33 @@ export class SegmentBank {
       this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, 'invalid_response');
       throw new BankFallbackError('媒体分片网络字节长度不匹配');
     }
+    if (task.controller.signal.aborted) {
+      this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, 'aborted');
+      throw abortError();
+    }
     const result = {
       start: task.start,
       end: task.end,
       bytes,
       totalSize: contentRange.totalSize,
     };
-    this.rememberMemoryRange(task.bankKey, result);
-    this.persistTask(task, result);
+    if (task.cacheable !== false && task.sessionGeneration === this.sessionGeneration
+      && this.enabled === true && this.disabled === false) {
+      this.fetchedChunks.set(task.cacheKey, { fetchedAt: this.now() });
+      try {
+        this.storeTask(task, result);
+      } catch (error) {
+        this.emitDiagnostic('bank.store', {
+          operation: 'write',
+          chunkIndex: task.chunkIndex,
+          bytes: bytes.byteLength,
+          result: 'failed',
+          reason: 'write_error',
+        });
+        console.error('[BilibiliBuffer] 媒体分片内存写入失败', error);
+        this.disable('store_write_failed');
+      }
+    }
     this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, 'fetched');
     return result;
   }
@@ -699,6 +638,8 @@ export class SegmentBank {
     this.emitDiagnostic('bank.fetch.chunk', {
       source: scrubUrl(task.url),
       chunkIndex: task.chunkIndex,
+      start: task.start,
+      end: task.end,
       bytes,
       durationMs,
       priority: task.kind,
@@ -706,65 +647,63 @@ export class SegmentBank {
     });
   }
 
-  persistTask(task, result) {
-    if (this.rangeIsCovered(this.knownStoredRanges, task.cacheKey, result.start, result.end)
-      || this.rangeIsCovered(this.pendingStoreRanges, task.cacheKey, result.start, result.end)) return;
-    this.rememberRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
-    const storedBytes = result.bytes.slice(0);
-    const currentByteByBank = Object.fromEntries(
-      [...this.resourceState.entries()]
-        .filter(([, state]) => Number.isFinite(state.lastForegroundEnd))
-        .map(([key, state]) => [key, state.lastForegroundEnd]),
-    );
-    const currentByteByVideo = Object.fromEntries(
-      [...this.resourceState.values()]
-        .filter((state) => Number.isFinite(state.lastForegroundEnd))
-        .map((state) => [state.videoKey, state.lastForegroundEnd]),
-    );
-    let write;
+  storeTask(task, result) {
+    const previous = this.chunks.get(task.cacheKey);
     try {
-      write = this.storeClient.writeChunk({
+      const written = writeMemoryChunk({
+        chunks: this.chunks,
         bankKey: task.bankKey,
-        videoKey: task.videoKey,
         start: result.start,
         end: result.end,
         totalSize: result.totalSize,
-        bytes: storedBytes,
-        currentByteByBank,
-        currentByteByVideo,
+        bytes: result.bytes,
+        chunkBytes: this.config.chunkBytes,
+        storedAt: this.now(),
       });
-    } catch (error) {
-      this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
-      this.forgetMemoryRange(task.bankKey, result.start, result.end);
-      console.error('[BilibiliBuffer] 媒体分片异步落盘失败', error);
-      return;
-    }
-    void Promise.resolve(write).then((writeResult) => {
-      this.rememberRange(this.knownStoredRanges, task.cacheKey, result.start, result.end);
-      this.forgetMemoryRange(task.bankKey, result.start, result.end);
-      for (const record of writeResult?.records || []) {
-        this.knownStoredRanges.delete(record.cacheKey);
-      }
-      if (writeResult?.evictedBytes > 0) {
-        this.emitDiagnostic('bank.evict', {
-          bytes: writeResult.evictedBytes,
-          reason: writeResult.reason || 'limit',
+      const eviction = enforceMemoryLimit({
+        chunks: this.chunks,
+        maxBankBytes: this.config.maxBankBytes,
+        chunkBytes: this.config.chunkBytes,
+        currentByteByBank: this.currentByteByBank(),
+      });
+      this.emitDiagnostic('bank.store', {
+        operation: 'write',
+        chunkIndex: written.chunkIndex,
+        bytes: written.bytes,
+        result: 'stored',
+        reason: 'memory',
+      });
+      for (const entry of eviction.entries) {
+        this.fetchedChunks.delete(entry.cacheKey);
+        this.refetchCounts.delete(entry.cacheKey);
+        this.emitDiagnostic('bank.store', {
+          operation: 'evict',
+          chunkIndex: entry.chunkIndex,
+          bytes: entry.byteLength,
+          result: 'evicted',
+          reason: eviction.reason,
         });
       }
-    }).catch((error) => {
-      this.forgetMemoryRange(task.bankKey, result.start, result.end);
-      console.error('[BilibiliBuffer] 媒体分片异步落盘失败', error);
-    }).finally(() => {
-      this.forgetRange(this.pendingStoreRanges, task.cacheKey, result.start, result.end);
-    });
+      if (eviction.bytes > 0) {
+        this.emitDiagnostic('bank.evict', {
+          bytes: eviction.bytes,
+          reason: eviction.reason,
+        });
+      }
+      return eviction;
+    } catch (error) {
+      if (previous === undefined) this.chunks.delete(task.cacheKey);
+      else this.chunks.set(task.cacheKey, previous);
+      throw error;
+    }
   }
 
   async prefetch() {
-    if (!this.isEnabled()) {
+    if (!this.syncRouteLifecycle()) {
       this.abortPrefetchTasks();
       return;
     }
-    if (!isVideoLocation(this.windowObject.location)) {
+    if (!this.isEnabled()) {
       this.abortPrefetchTasks();
       return;
     }
@@ -794,19 +733,7 @@ export class SegmentBank {
         aligned: true,
       });
       for (const plan of plans) {
-        if (this.rangeIsCovered(this.knownStoredRanges, plan.cacheKey, plan.start, plan.end)
-          || this.rangeIsCovered(this.pendingStoreRanges, plan.cacheKey, plan.start, plan.end)
-          || this.inflight.has(plan.cacheKey)) continue;
-        let stored;
-        try {
-          stored = await this.readStoredRange(state.bankKey, plan.start, plan.end);
-        } catch (error) {
-          console.error('[BilibiliBuffer] 媒体分片预取读取存储失败', error);
-        }
-        if (stored?.hit === true) {
-          this.rememberRange(this.knownStoredRanges, plan.cacheKey, plan.start, plan.end);
-          continue;
-        }
+        if (plan.cacheable !== false && (this.chunks.has(plan.cacheKey) || this.fetchedChunks.has(plan.cacheKey))) continue;
         if (this.inflight.has(plan.cacheKey)) continue;
         void this.getTask(plan, {
           kind: 'prefetch',
@@ -824,7 +751,9 @@ export class SegmentBank {
   destroy() {
     if (this.prefetchTimer !== undefined) this.windowObject.clearInterval(this.prefetchTimer);
     for (const task of this.inflight.values()) task.controller.abort();
-    this.storeClient.destroy();
+    for (const task of this.queue) task.reject(abortError());
+    this.queue = [];
+    this.releaseSession();
   }
 }
 
@@ -846,7 +775,9 @@ export function installSegmentBank(windowObject = window) {
   const marker = {
     bank,
     installed: true,
-    setEnabled(enabled) { bank.enabled = enabled === true; },
+    setEnabled(enabled) {
+      if (!bank.disabled) bank.enabled = enabled === true;
+    },
     destroy() {
       windowObject.fetch = originalFetch;
       windowObject.XMLHttpRequest = originalXMLHttpRequest;

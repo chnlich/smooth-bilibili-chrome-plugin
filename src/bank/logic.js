@@ -128,17 +128,20 @@ export function planFetchRanges(start, end, {
 } = {}) {
   const request = { start, end };
   const length = rangeLength(request);
-  if (aligned !== true || length < chunkBytes / 2 || totalSize === undefined) {
+  if (aligned !== true || length < chunkBytes / 2) {
     return [{
       ...request,
       chunkIndex: chunkIndex(start, chunkBytes),
       cacheKey: cacheKey(bankKeyValue, chunkIndex(start, chunkBytes)),
+      cacheable: false,
     }];
   }
   const result = [];
   let current = Math.floor(start / chunkBytes) * chunkBytes;
   while (current <= end) {
-    const chunkEnd = Math.min(end, current + chunkBytes - 1, totalSize - 1);
+    const chunkEnd = totalSize === undefined
+      ? current + chunkBytes - 1
+      : Math.min(current + chunkBytes - 1, totalSize - 1);
     if (chunkEnd >= current) {
       const index = chunkIndex(current, chunkBytes);
       result.push({
@@ -146,6 +149,7 @@ export function planFetchRanges(start, end, {
         end: chunkEnd,
         chunkIndex: index,
         cacheKey: cacheKey(bankKeyValue, index),
+        cacheable: chunkEnd - current + 1 >= chunkBytes / 2,
       });
     }
     current += chunkBytes;
@@ -197,12 +201,7 @@ export function prefetchRange({ start, bitrate, aheadSeconds, totalSize }) {
 function entryBytes(entry) {
   if (Number.isSafeInteger(entry.byteLength) && entry.byteLength >= 0) return entry.byteLength;
   if (entry.bytes instanceof ArrayBuffer) return entry.bytes.byteLength;
-  if (Array.isArray(entry.segments)) return entry.segments.reduce((total, segment) => total + segment.bytes.byteLength, 0);
   throw new Error('淘汰条目缺少字节数');
-}
-
-function evictionGroup(entry) {
-  return entry.videoKey || entry.bankKey;
 }
 
 function evictionRank(entry, currentByte) {
@@ -214,13 +213,13 @@ function evictionRank(entry, currentByte) {
   return [1, -distance, entry.storedAt || 0];
 }
 
-function currentByteForEntry(entry, currentByteByBank, currentByteByVideo) {
-  return currentByteByBank[entry.bankKey] ?? currentByteByVideo[evictionGroup(entry)];
+function currentByteForEntry(entry, currentByteByBank) {
+  return currentByteByBank[entry.bankKey];
 }
 
-function compareEvictionEntries(left, right, currentByteByBank, currentByteByVideo) {
-  const leftRank = evictionRank(left, currentByteForEntry(left, currentByteByBank, currentByteByVideo));
-  const rightRank = evictionRank(right, currentByteForEntry(right, currentByteByBank, currentByteByVideo));
+function compareEvictionEntries(left, right, currentByteByBank) {
+  const leftRank = evictionRank(left, currentByteForEntry(left, currentByteByBank));
+  const rightRank = evictionRank(right, currentByteForEntry(right, currentByteByBank));
   for (let index = 0; index < leftRank.length; index += 1) {
     if (leftRank[index] !== rightRank[index]) return leftRank[index] - rightRank[index];
   }
@@ -230,35 +229,22 @@ function compareEvictionEntries(left, right, currentByteByBank, currentByteByVid
 export function selectEvictions({
   entries,
   maxBankBytes,
-  maxBankBytesPerVideo,
   currentByteByBank = {},
-  currentByteByVideo = currentByteByBank,
 }) {
   if (!Array.isArray(entries)) throw new Error('淘汰条目必须是数组');
   const total = entries.reduce((sum, entry) => sum + entryBytes(entry), 0);
-  const perVideo = new Map();
-  for (const entry of entries) {
-    const group = evictionGroup(entry);
-    perVideo.set(group, (perVideo.get(group) || 0) + entryBytes(entry));
-  }
   const selected = [];
   const remaining = [...entries];
   let currentTotal = total;
-  const currentPerVideo = new Map(perVideo);
-  while (currentTotal > maxBankBytes || [...currentPerVideo.values()].some((value) => value > maxBankBytesPerVideo)) {
-    const overVideo = new Set([...currentPerVideo.entries()]
-      .filter(([, value]) => value > maxBankBytesPerVideo)
-      .map(([key]) => key));
-    const candidates = remaining.filter((entry) => overVideo.size === 0 || overVideo.has(evictionGroup(entry)));
+  while (currentTotal > maxBankBytes) {
+    const candidates = remaining;
     if (candidates.length === 0) throw new Error('存储超限但没有可淘汰分片');
-    candidates.sort((left, right) => compareEvictionEntries(left, right, currentByteByBank, currentByteByVideo));
+    candidates.sort((left, right) => compareEvictionEntries(left, right, currentByteByBank));
     const victim = candidates[0];
     selected.push(victim);
     remaining.splice(remaining.indexOf(victim), 1);
     const bytes = entryBytes(victim);
     currentTotal -= bytes;
-    const group = evictionGroup(victim);
-    currentPerVideo.set(group, currentPerVideo.get(group) - bytes);
   }
   return { entries: selected, bytes: selected.reduce((sum, entry) => sum + entryBytes(entry), 0) };
 }

@@ -69,6 +69,8 @@ export const EVENT_CODES = Object.freeze([
   'bank.fetch.chunk',
   'bank.serve',
   'bank.evict',
+  'bank.store',
+  'bank.disabled',
   'extension.started',
   'extension.boot_error',
   'extension.observer_error',
@@ -169,6 +171,7 @@ export const DATA_ALLOWLIST = Object.freeze({
   bridge: Object.freeze(['operation', 'direction', 'status']),
   bank: Object.freeze([
     'source',
+    'operation',
     'chunkIndex',
     'start',
     'end',

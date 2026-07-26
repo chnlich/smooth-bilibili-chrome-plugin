@@ -235,7 +235,6 @@ const indexedDbSourceAllowlist = new Set([
   'diagnostics/idb.js',
   'diagnostics/worker.js',
   'diagnostics/logs.js',
-  'bank/storage.js',
 ]);
 for (const { relativePath, content } of sourceFiles) {
   if (!indexedDbSourceAllowlist.has(relativePath)) {
@@ -266,11 +265,21 @@ const bankSourceAllowlist = new Set([
   'bank/errors.js',
   'bank/logic.js',
   'bank/main.js',
-  'bank/relay.js',
   'bank/storage.js',
-  'bank/worker.js',
   'bank/xhr.js',
 ]);
+const bankSource = sourceFiles
+  .filter(({ relativePath }) => relativePath.startsWith('bank/'))
+  .map(({ content }) => content)
+  .join('\n');
+assert.doesNotMatch(
+  bankSource,
+  /\bindexedDB\b|\bchrome\.runtime\b|\blocalStorage\b|\bsessionStorage\b|\bcaches\b/,
+  'bank 源码不得触碰持久化存储或 runtime 二进制通道',
+);
+for (const removedModule of ['src/bank/relay.js', 'src/bank/worker.js']) {
+  await assert.rejects(fs.access(path.join(root, removedModule)));
+}
 const sourceWithoutAllowedMediaSourceOrBank = sourceFiles
   .filter(({ relativePath }) => !mediaSourceSourceAllowlist.has(relativePath) && !bankSourceAllowlist.has(relativePath))
   .map(({ content }) => content)
@@ -292,15 +301,13 @@ assert.deepEqual(Object.keys(BANK_CONFIG), [
   'chunkBytes',
   'prefetchAheadSeconds',
   'maxBankBytes',
-  'maxBankBytesPerVideo',
-  'storeReadTimeoutMs',
+  'refetchAlarmCount',
 ]);
 assert.deepEqual(BANK_CONFIG, {
   chunkBytes: 4 * 1024 ** 2,
   prefetchAheadSeconds: 900,
-  maxBankBytes: 2 * 1024 ** 3,
-  maxBankBytesPerVideo: 512 * 1024 ** 2,
-  storeReadTimeoutMs: 50,
+  maxBankBytes: 512 * 1024 ** 2,
+  refetchAlarmCount: 3,
 });
 assert.equal(LIVE_CONFIG.noDecodedFrameStallMilliseconds, 2000);
 assert.equal(LIVE_CONFIG.liveRetainSeconds, 30);
@@ -312,6 +319,8 @@ assert.equal(EVENT_CODES.includes('live.buffer.retained'), true);
 assert.equal(EVENT_CODES.includes('bank.fetch.chunk'), true);
 assert.equal(EVENT_CODES.includes('bank.serve'), true);
 assert.equal(EVENT_CODES.includes('bank.evict'), true);
+assert.equal(EVENT_CODES.includes('bank.store'), true);
+assert.equal(EVENT_CODES.includes('bank.disabled'), true);
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.match(bridgeContractSource, /setChasingFrameThreshold/);
 assert.doesNotMatch(`${liveSource}\n${shim}`, /bank\.|segment-bank|BANK_MESSAGE/);

@@ -22,9 +22,8 @@ export const VOD_CONFIG = Object.freeze({
 export const BANK_CONFIG = Object.freeze({
   chunkBytes: 4 * 1024 ** 2,
   prefetchAheadSeconds: 900,
-  maxBankBytes: 2 * 1024 ** 3,
-  maxBankBytesPerVideo: 512 * 1024 ** 2,
-  storeReadTimeoutMs: 50,
+  maxBankBytes: 512 * 1024 ** 2,
+  refetchAlarmCount: 3,
 });
 
 export const LIVE_CONFIG = Object.freeze({

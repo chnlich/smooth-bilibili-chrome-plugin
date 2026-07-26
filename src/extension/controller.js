@@ -12,7 +12,10 @@ import {
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
 import { SHIM_OBSERVATION_ATTRIBUTE, SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE } from './bridge-contract.js';
-import { installBankRelay, postBankControl } from '../bank/relay.js';
+import {
+  isBankDiagnosticMessage,
+  postBankControl,
+} from '../bank/contract.js';
 import { isVideoLocation } from '../bank/logic.js';
 
 export function isLivePage(locationObject) {
@@ -62,6 +65,19 @@ function logger() {
     },
     error(...args) {
       console.error('[BilibiliBuffer]', ...args);
+    },
+  };
+}
+
+export function installBankDiagnostics({ windowObject = window, diagnostics } = {}) {
+  const listener = (event) => {
+    if (event.source !== windowObject || !isBankDiagnosticMessage(event.data)) return;
+    diagnostics?.log(event.data.code, event.data.data || {});
+  };
+  windowObject.addEventListener('message', listener);
+  return {
+    destroy() {
+      windowObject.removeEventListener('message', listener);
     },
   };
 }
@@ -431,7 +447,7 @@ export class ExtensionCoordinator {
 
 if (typeof chrome !== 'undefined' && typeof document !== 'undefined' && typeof window !== 'undefined') {
   const diagnostics = new DiagnosticsClient();
-  if (window.location.hostname === 'www.bilibili.com') installBankRelay({ diagnostics });
+  if (window.location.hostname === 'www.bilibili.com') installBankDiagnostics({ diagnostics });
   installPopupMessageHandler(chrome.runtime, () => diagnostics.getStatus().sessionId);
   const coordinator = new ExtensionCoordinator({ diagnostics });
   void coordinator.start().catch((error) => {
