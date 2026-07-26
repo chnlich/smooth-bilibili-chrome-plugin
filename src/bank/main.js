@@ -11,15 +11,12 @@ import {
   cacheKey,
   classifyRequest,
   chunkIndex,
-  compareQueueTasks,
   estimateBitrate,
   headerValue,
-  insertQueueTask,
   parseContentRange,
   partialResponseHeaders,
   planFetchRanges,
   prefetchRange,
-  priorityFor,
   rangeLength,
   isVideoLocation,
 } from './logic.js';
@@ -31,7 +28,7 @@ import {
 } from './storage.js';
 import { createBankXMLHttpRequestClass } from './xhr.js';
 
-const MAX_CONCURRENCY = 3;
+const MAX_PREFETCH_CONCURRENCY = 2;
 
 function abortError() {
   return new DOMException('The operation was aborted', 'AbortError');
@@ -78,12 +75,14 @@ function inspectFetchArguments(args, locationObject) {
   };
 }
 
-function waitWithSignal(promise, signal) {
+function waitWithSignal(promise, signal, windowObject, timeoutMs, timeoutError) {
   if (signal?.aborted) return Promise.reject(abortError());
   return new Promise((resolve, reject) => {
     let settled = false;
+    let timer;
     const cleanup = () => {
       signal?.removeEventListener('abort', onAbort);
+      if (timer !== undefined) windowObject.clearTimeout(timer);
     };
     const finish = (callback, value) => {
       if (settled) return;
@@ -94,6 +93,10 @@ function waitWithSignal(promise, signal) {
     const onAbort = () => finish(reject, abortError());
     signal?.addEventListener('abort', onAbort, { once: true });
     promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
+    if (timeoutMs !== undefined) {
+      timer = windowObject.setTimeout(() => finish(reject, timeoutError()), timeoutMs);
+      if (settled) windowObject.clearTimeout(timer);
+    }
   });
 }
 
@@ -101,7 +104,7 @@ export class SegmentBank {
   constructor({
     windowObject = window,
     nativeFetch = windowObject.fetch,
-    maxConcurrency = MAX_CONCURRENCY,
+    maxPrefetchConcurrency = MAX_PREFETCH_CONCURRENCY,
     config = BANK_CONFIG,
     chunks = new Map(),
     now = Date.now,
@@ -109,20 +112,21 @@ export class SegmentBank {
     this.windowObject = windowObject;
     this.nativeFetch = nativeFetch;
     this.config = config;
-    this.maxConcurrency = maxConcurrency;
+    this.maxPrefetchConcurrency = maxPrefetchConcurrency;
     this.now = now;
     this.enabled = true;
     this.disabled = false;
     this.queue = [];
     this.inflight = new Map();
-    this.activeTasks = new Set();
-    this.sequence = 0;
+    this.activePrefetch = new Set();
+    this.activeForeground = new Set();
     this.sessionGeneration = 0;
     this.resourceState = new Map();
     this.recentResourceKeys = [];
     this.chunks = chunks;
     this.fetchedChunks = new Map();
     this.refetchCounts = new Map();
+    this.foregroundLatencyCount = 0;
     this.lastRouteWasVideo = this.windowObject.location === undefined
       || isVideoLocation(this.windowObject.location);
     this.prefetchTimer = this.windowObject.setInterval?.(() => {
@@ -189,16 +193,22 @@ export class SegmentBank {
   releaseSession() {
     this.sessionGeneration += 1;
     this.abortPrefetchTasks();
-    for (const task of this.queue) {
-      if (task.kind !== 'prefetch') continue;
+    for (const task of this.inflight.values()) {
+      if (task.kind === 'prefetch') continue;
+      this.clearTaskDeadline(task);
       task.controller.abort();
+    }
+    for (const task of this.queue) {
+      task.controller.abort();
+      task.settled = true;
       task.reject(abortError());
       if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
     }
-    this.queue = this.queue.filter((task) => task.kind !== 'prefetch');
+    this.queue = [];
     clearMemory(this.chunks);
     this.fetchedChunks.clear();
     this.refetchCounts.clear();
+    this.foregroundLatencyCount = 0;
     this.resourceState.clear();
     this.recentResourceKeys = [];
     this.playbackSamples = [];
@@ -228,7 +238,10 @@ export class SegmentBank {
 
   abortPrefetchTasks(predicate = () => true) {
     for (const task of this.inflight.values()) {
-      if (task.kind === 'prefetch' && predicate(task)) task.controller.abort();
+      if (task.kind === 'prefetch' && predicate(task)) {
+        this.clearTaskDeadline(task);
+        task.controller.abort();
+      }
     }
   }
 
@@ -353,6 +366,7 @@ export class SegmentBank {
         throw new BankFallbackError('媒体分片存储命中总长度无效');
       }
       state.totalSize = stored.totalSize;
+      this.noteForegroundSuccess();
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(url),
         start,
@@ -387,6 +401,7 @@ export class SegmentBank {
       if (signal?.aborted) throw abortError();
       if (fetched.response !== undefined) return { intercepted: true, response: fetched.response };
       state.totalSize = fetched.totalSize;
+      this.noteForegroundSuccess();
       return {
         intercepted: true,
         response: this.createResponse(fetched.bytes, start, end, fetched.totalSize, url),
@@ -401,7 +416,6 @@ export class SegmentBank {
       chunkBytes: this.config.chunkBytes,
       totalSize,
       bankKeyValue: resourceKey,
-      aligned: true,
     });
     const results = await Promise.all(plans.map((plan) => {
       const stored = readMemoryRange(
@@ -455,17 +469,13 @@ export class SegmentBank {
     this.disabled = true;
     this.enabled = false;
     this.abortPrefetchTasks();
-    const retained = [];
     for (const task of this.queue) {
-      if (task.kind !== 'prefetch') {
-        retained.push(task);
-        continue;
-      }
       task.controller.abort();
+      task.settled = true;
       task.reject(abortError());
       if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
     }
-    this.queue = retained;
+    this.queue = [];
     this.emitDiagnostic('bank.disabled', { reason });
   }
 
@@ -476,23 +486,70 @@ export class SegmentBank {
     if (count >= this.config.refetchAlarmCount) this.disable('refetch_alarm');
   }
 
+  noteForegroundFallback() {
+    this.foregroundLatencyCount += 1;
+    if (this.foregroundLatencyCount >= this.config.latencyAlarmCount) this.disable('foreground_latency');
+  }
+
+  noteForegroundSuccess() {
+    this.foregroundLatencyCount = 0;
+  }
+
+  clearTaskDeadline(task) {
+    if (task.deadlineTimer !== undefined) {
+      this.windowObject.clearTimeout(task.deadlineTimer);
+      task.deadlineTimer = undefined;
+    }
+  }
+
+  emitDeadlineDiagnostic(task) {
+    if (task.deadlineReported === true) return;
+    task.deadlineReported = true;
+    this.emitChunkDiagnostic(
+      task,
+      0,
+      performanceNow(this.windowObject) - task.startedAt,
+      'deadline',
+    );
+  }
+
+  startTask(task, activeSet) {
+    task.started = true;
+    task.startedAt = performanceNow(this.windowObject);
+    activeSet.add(task);
+    const deadlineMs = task.kind === 'prefetch'
+      ? this.config.prefetchDeadlineMs
+      : this.config.foregroundDeadlineMs;
+    task.deadlineTimer = this.windowObject.setTimeout(() => {
+      if (task.settled || task.controller.signal.aborted) return;
+      task.abortReason = 'deadline';
+      task.controller.abort();
+      this.emitDeadlineDiagnostic(task);
+      if (task.kind === 'foreground') this.noteForegroundFallback();
+    }, deadlineMs);
+    void this.runTask(task)
+      .then((result) => {
+        task.settled = true;
+        task.resolve(result);
+      }, (error) => {
+        task.settled = true;
+        task.reject(error);
+      })
+      .finally(() => {
+        this.clearTaskDeadline(task);
+        activeSet.delete(task);
+        if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+        this.pump();
+      });
+  }
+
   getTask(plan, { kind, url, credentials, signal, videoKey }) {
     const existing = this.inflight.get(plan.cacheKey);
     if (existing !== undefined) {
       if (existing.start <= plan.start && existing.end >= plan.end) {
-        if (priorityFor(kind) < existing.priority) {
-          existing.priority = priorityFor(kind);
-          existing.kind = kind;
-          this.queue.sort(compareQueueTasks);
-        }
-        return this.waitForTask(existing, signal);
+        return this.waitForTask(existing, signal, kind, kind === 'foreground');
       }
-      return existing.promise
-        .catch((error) => {
-          if (kind === 'foreground' && existing.kind === 'prefetch' && !signal?.aborted) return undefined;
-          throw error;
-        })
-        .then(() => this.getTask(plan, { kind, url, credentials, signal, videoKey }));
+      return this.waitForTask(existing, signal, kind, kind === 'foreground');
     }
     if (kind === 'prefetch' && plan.cacheable !== false
       && (this.fetchedChunks.has(plan.cacheKey) || this.chunks.has(plan.cacheKey))) {
@@ -508,54 +565,91 @@ export class SegmentBank {
       videoKey,
       kind,
       sessionGeneration: this.sessionGeneration,
-      priority: priorityFor(kind),
-      sequence: this.sequence,
       controller,
       started: false,
+      startedAt: undefined,
+      deadlineTimer: undefined,
+      deadlineReported: false,
+      abortReason: undefined,
+      settled: false,
       waiters: 0,
       promise: undefined,
       resolve: undefined,
       reject: undefined,
     };
-    this.sequence += 1;
     task.promise = new Promise((resolve, reject) => {
       task.resolve = resolve;
       task.reject = reject;
     });
     this.inflight.set(plan.cacheKey, task);
-    insertQueueTask(this.queue, task);
-    this.pump();
-    return this.waitForTask(task, signal);
+    if (kind === 'foreground') this.startTask(task, this.activeForeground);
+    else this.queue.push(task);
+    if (kind === 'prefetch') this.pump();
+    return this.waitForTask(task, signal, kind, false);
   }
 
-  waitForTask(task, signal) {
+  waitForTask(task, signal, kind, enforceDeadline) {
     task.waiters += 1;
-    return waitWithSignal(task.promise, signal).finally(() => {
-      task.waiters -= 1;
-      if (signal !== undefined && signal.aborted && task.waiters === 0 && task.kind === 'foreground') {
-        task.controller.abort();
-      }
-    });
+    let timeoutError;
+    return waitWithSignal(
+      task.promise,
+      signal,
+      this.windowObject,
+      enforceDeadline ? this.config.foregroundDeadlineMs : undefined,
+      () => {
+        timeoutError = new BankFallbackError('媒体分片等待超过补取死线');
+        return timeoutError;
+      },
+    )
+      .catch((error) => {
+        if (error === timeoutError) {
+          this.noteForegroundFallback();
+          throw error;
+        }
+        if (kind === 'foreground' && isAbortError(error) && task.abortReason === 'deadline') {
+          if (task.kind !== 'foreground') this.noteForegroundFallback();
+          throw new BankFallbackError('媒体分片网络取数超过死线', error);
+        }
+        throw error;
+      })
+      .then((result) => {
+        if (kind === 'foreground' && result.response === undefined) this.noteForegroundSuccess();
+        return result;
+      })
+      .finally(() => {
+        task.waiters -= 1;
+        if (signal !== undefined && signal.aborted && task.waiters === 0
+          && task.kind === 'foreground' && !task.settled) {
+          task.controller.abort();
+        }
+      });
   }
 
   pump() {
-    while (this.activeTasks.size < this.maxConcurrency && this.queue.length > 0) {
+    while (this.activeForeground.size === 0
+      && this.activePrefetch.size < this.maxPrefetchConcurrency
+      && this.queue.length > 0) {
       const task = this.queue.shift();
       if (task.controller.signal.aborted) {
+        task.settled = true;
         task.reject(abortError());
-        this.inflight.delete(task.cacheKey);
+        if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
         continue;
       }
-      task.started = true;
-      this.activeTasks.add(task);
-      void this.runTask(task)
-        .then((result) => task.resolve(result), (error) => task.reject(error))
-        .finally(() => {
-          this.activeTasks.delete(task);
-          if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
-          this.pump();
-        });
+      this.startTask(task, this.activePrefetch);
     }
+  }
+
+  taskAbortError(task, bytes, startedAt, error) {
+    if (task.abortReason === 'deadline') {
+      this.emitDeadlineDiagnostic(task);
+      if (task.kind === 'foreground') {
+        return new BankFallbackError('媒体分片网络取数超过死线', error);
+      }
+    } else {
+      this.emitChunkDiagnostic(task, bytes, performanceNow(this.windowObject) - startedAt, 'aborted');
+    }
+    return error;
   }
 
   async runTask(task) {
@@ -569,9 +663,12 @@ export class SegmentBank {
       });
     } catch (error) {
       const result = isAbortError(error) ? 'aborted' : 'network_error';
+      if (isAbortError(error)) throw this.taskAbortError(task, 0, startedAt, error);
       this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, result);
-      if (isAbortError(error)) throw error;
       throw new BankNetworkError('媒体分片网络取数失败', error);
+    }
+    if (task.controller.signal.aborted) {
+      throw this.taskAbortError(task, 0, startedAt, abortError());
     }
     if (response.status < 200 || response.status >= 300) {
       this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, 'http_error');
@@ -582,11 +679,13 @@ export class SegmentBank {
       bytes = await response.arrayBuffer();
     } catch (error) {
       if (isAbortError(error)) {
-        this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, 'aborted');
-        throw error;
+        throw this.taskAbortError(task, 0, startedAt, error);
       }
       this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, 'network_error');
       throw new BankNetworkError('媒体分片响应读取失败', error);
+    }
+    if (task.controller.signal.aborted) {
+      throw this.taskAbortError(task, bytes.byteLength, startedAt, abortError());
     }
     const contentRange = parseContentRange(headerValue(response.headers, 'Content-Range'));
     const isCompleteTailChunk = contentRange !== undefined
@@ -615,8 +714,7 @@ export class SegmentBank {
       throw new BankFallbackError('媒体分片网络字节长度不匹配');
     }
     if (task.controller.signal.aborted) {
-      this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, 'aborted');
-      throw abortError();
+      throw this.taskAbortError(task, bytes.byteLength, startedAt, abortError());
     }
     const result = {
       ...resultRange,
@@ -747,7 +845,6 @@ export class SegmentBank {
         totalSize: state.totalSize,
         bankKeyValue: state.bankKey,
         aligned: true,
-        forceAligned: true,
       });
       for (const plan of plans) {
         if (plan.cacheable !== false && (this.chunks.has(plan.cacheKey) || this.fetchedChunks.has(plan.cacheKey))) continue;
@@ -767,8 +864,15 @@ export class SegmentBank {
 
   destroy() {
     if (this.prefetchTimer !== undefined) this.windowObject.clearInterval(this.prefetchTimer);
-    for (const task of this.inflight.values()) task.controller.abort();
-    for (const task of this.queue) task.reject(abortError());
+    for (const task of this.inflight.values()) {
+      this.clearTaskDeadline(task);
+      task.controller.abort();
+    }
+    for (const task of this.queue) {
+      task.settled = true;
+      task.reject(abortError());
+      if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+    }
     this.queue = [];
     this.releaseSession();
   }

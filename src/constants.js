@@ -24,6 +24,9 @@ export const BANK_CONFIG = Object.freeze({
   prefetchAheadSeconds: 900,
   maxBankBytes: 512 * 1024 ** 2,
   refetchAlarmCount: 3,
+  foregroundDeadlineMs: 5000,
+  prefetchDeadlineMs: 20000,
+  latencyAlarmCount: 3,
 });
 
 export const LIVE_CONFIG = Object.freeze({

@@ -125,11 +125,10 @@ export function planFetchRanges(start, end, {
   totalSize,
   bankKeyValue = 'resource',
   aligned = false,
-  forceAligned = false,
 } = {}) {
   const request = { start, end };
-  const length = rangeLength(request);
-  if (aligned !== true || (forceAligned !== true && length < chunkBytes / 2)) {
+  rangeLength(request);
+  if (aligned !== true) {
     return [{
       ...request,
       chunkIndex: chunkIndex(start, chunkBytes),
@@ -156,23 +155,6 @@ export function planFetchRanges(start, end, {
     current += chunkBytes;
   }
   return result;
-}
-
-export function compareQueueTasks(left, right) {
-  if (left.priority !== right.priority) return left.priority - right.priority;
-  return left.sequence - right.sequence;
-}
-
-export function insertQueueTask(queue, task) {
-  queue.push(task);
-  queue.sort(compareQueueTasks);
-  return queue;
-}
-
-export function priorityFor(kind) {
-  if (kind === 'foreground') return 0;
-  if (kind === 'prefetch') return 1;
-  throw new Error(`未知取数任务类型: ${kind}`);
 }
 
 export function estimateBitrate(samples) {

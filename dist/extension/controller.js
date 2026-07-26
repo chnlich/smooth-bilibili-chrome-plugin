@@ -21,7 +21,10 @@
     chunkBytes: 4 * 1024 ** 2,
     prefetchAheadSeconds: 900,
     maxBankBytes: 512 * 1024 ** 2,
-    refetchAlarmCount: 3
+    refetchAlarmCount: 3,
+    foregroundDeadlineMs: 5e3,
+    prefetchDeadlineMs: 2e4,
+    latencyAlarmCount: 3
   });
   var LIVE_CONFIG = Object.freeze({
     noDecodedFrameStallMilliseconds: 2e3,
@@ -492,7 +495,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-fa7147bdb4eefa45300b0d43" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-1eba7e633fb3eca5ebcfaf4c" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }

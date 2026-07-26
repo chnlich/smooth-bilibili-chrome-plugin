@@ -20,7 +20,10 @@
     chunkBytes: 4 * 1024 ** 2,
     prefetchAheadSeconds: 900,
     maxBankBytes: 512 * 1024 ** 2,
-    refetchAlarmCount: 3
+    refetchAlarmCount: 3,
+    foregroundDeadlineMs: 5e3,
+    prefetchDeadlineMs: 2e4,
+    latencyAlarmCount: 3
   });
   var LIVE_CONFIG = Object.freeze({
     noDecodedFrameStallMilliseconds: 2e3,
@@ -350,12 +353,11 @@
     chunkBytes = BANK_CONFIG.chunkBytes,
     totalSize,
     bankKeyValue = "resource",
-    aligned = false,
-    forceAligned = false
+    aligned = false
   } = {}) {
     const request = { start, end };
-    const length = rangeLength(request);
-    if (aligned !== true || forceAligned !== true && length < chunkBytes / 2) {
+    rangeLength(request);
+    if (aligned !== true) {
       return [{
         ...request,
         chunkIndex: chunkIndex(start, chunkBytes),
@@ -380,20 +382,6 @@
       current += chunkBytes;
     }
     return result;
-  }
-  function compareQueueTasks(left, right) {
-    if (left.priority !== right.priority) return left.priority - right.priority;
-    return left.sequence - right.sequence;
-  }
-  function insertQueueTask(queue, task) {
-    queue.push(task);
-    queue.sort(compareQueueTasks);
-    return queue;
-  }
-  function priorityFor(kind) {
-    if (kind === "foreground") return 0;
-    if (kind === "prefetch") return 1;
-    throw new Error(`未知取数任务类型: ${kind}`);
   }
   function estimateBitrate(samples) {
     if (!Array.isArray(samples)) throw new Error("码率样本必须是数组");
@@ -956,7 +944,7 @@
   }
 
   // src/bank/main.js
-  var MAX_CONCURRENCY = 3;
+  var MAX_PREFETCH_CONCURRENCY = 2;
   function abortError() {
     return new DOMException("The operation was aborted", "AbortError");
   }
@@ -992,12 +980,14 @@
       signal: initField(init, "signal", inherited?.signal)
     };
   }
-  function waitWithSignal(promise, signal) {
+  function waitWithSignal(promise, signal, windowObject, timeoutMs, timeoutError) {
     if (signal?.aborted) return Promise.reject(abortError());
     return new Promise((resolve, reject) => {
       let settled = false;
+      let timer;
       const cleanup = () => {
         signal?.removeEventListener("abort", onAbort);
+        if (timer !== void 0) windowObject.clearTimeout(timer);
       };
       const finish = (callback, value) => {
         if (settled) return;
@@ -1008,13 +998,17 @@
       const onAbort = () => finish(reject, abortError());
       signal?.addEventListener("abort", onAbort, { once: true });
       promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
+      if (timeoutMs !== void 0) {
+        timer = windowObject.setTimeout(() => finish(reject, timeoutError()), timeoutMs);
+        if (settled) windowObject.clearTimeout(timer);
+      }
     });
   }
   var SegmentBank = class {
     constructor({
       windowObject = window,
       nativeFetch = windowObject.fetch,
-      maxConcurrency = MAX_CONCURRENCY,
+      maxPrefetchConcurrency = MAX_PREFETCH_CONCURRENCY,
       config = BANK_CONFIG,
       chunks = /* @__PURE__ */ new Map(),
       now = Date.now
@@ -1022,20 +1016,21 @@
       this.windowObject = windowObject;
       this.nativeFetch = nativeFetch;
       this.config = config;
-      this.maxConcurrency = maxConcurrency;
+      this.maxPrefetchConcurrency = maxPrefetchConcurrency;
       this.now = now;
       this.enabled = true;
       this.disabled = false;
       this.queue = [];
       this.inflight = /* @__PURE__ */ new Map();
-      this.activeTasks = /* @__PURE__ */ new Set();
-      this.sequence = 0;
+      this.activePrefetch = /* @__PURE__ */ new Set();
+      this.activeForeground = /* @__PURE__ */ new Set();
       this.sessionGeneration = 0;
       this.resourceState = /* @__PURE__ */ new Map();
       this.recentResourceKeys = [];
       this.chunks = chunks;
       this.fetchedChunks = /* @__PURE__ */ new Map();
       this.refetchCounts = /* @__PURE__ */ new Map();
+      this.foregroundLatencyCount = 0;
       this.lastRouteWasVideo = this.windowObject.location === void 0 || isVideoLocation(this.windowObject.location);
       this.prefetchTimer = this.windowObject.setInterval?.(() => {
         void this.prefetch().catch((error) => {
@@ -1093,16 +1088,22 @@
     releaseSession() {
       this.sessionGeneration += 1;
       this.abortPrefetchTasks();
-      for (const task of this.queue) {
-        if (task.kind !== "prefetch") continue;
+      for (const task of this.inflight.values()) {
+        if (task.kind === "prefetch") continue;
+        this.clearTaskDeadline(task);
         task.controller.abort();
+      }
+      for (const task of this.queue) {
+        task.controller.abort();
+        task.settled = true;
         task.reject(abortError());
         if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
       }
-      this.queue = this.queue.filter((task) => task.kind !== "prefetch");
+      this.queue = [];
       clearMemory(this.chunks);
       this.fetchedChunks.clear();
       this.refetchCounts.clear();
+      this.foregroundLatencyCount = 0;
       this.resourceState.clear();
       this.recentResourceKeys = [];
       this.playbackSamples = [];
@@ -1129,7 +1130,10 @@
     }
     abortPrefetchTasks(predicate = () => true) {
       for (const task of this.inflight.values()) {
-        if (task.kind === "prefetch" && predicate(task)) task.controller.abort();
+        if (task.kind === "prefetch" && predicate(task)) {
+          this.clearTaskDeadline(task);
+          task.controller.abort();
+        }
       }
     }
     updatePlaybackSample() {
@@ -1246,6 +1250,7 @@
           throw new BankFallbackError("媒体分片存储命中总长度无效");
         }
         state.totalSize = stored.totalSize;
+        this.noteForegroundSuccess();
         this.emitDiagnostic("bank.serve", {
           source: scrubUrl(url),
           start,
@@ -1280,6 +1285,7 @@
         if (signal?.aborted) throw abortError();
         if (fetched.response !== void 0) return { intercepted: true, response: fetched.response };
         state.totalSize = fetched.totalSize;
+        this.noteForegroundSuccess();
         return {
           intercepted: true,
           response: this.createResponse(fetched.bytes, start, end, fetched.totalSize, url),
@@ -1292,8 +1298,7 @@
       const plans = planFetchRanges(start, end, {
         chunkBytes: this.config.chunkBytes,
         totalSize,
-        bankKeyValue: resourceKey,
-        aligned: true
+        bankKeyValue: resourceKey
       });
       const results = await Promise.all(plans.map((plan) => {
         const stored = readMemoryRange(
@@ -1346,17 +1351,13 @@
       this.disabled = true;
       this.enabled = false;
       this.abortPrefetchTasks();
-      const retained = [];
       for (const task of this.queue) {
-        if (task.kind !== "prefetch") {
-          retained.push(task);
-          continue;
-        }
         task.controller.abort();
+        task.settled = true;
         task.reject(abortError());
         if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
       }
-      this.queue = retained;
+      this.queue = [];
       this.emitDiagnostic("bank.disabled", { reason });
     }
     noteRefetch(plan) {
@@ -1365,21 +1366,61 @@
       this.refetchCounts.set(plan.cacheKey, count);
       if (count >= this.config.refetchAlarmCount) this.disable("refetch_alarm");
     }
+    noteForegroundFallback() {
+      this.foregroundLatencyCount += 1;
+      if (this.foregroundLatencyCount >= this.config.latencyAlarmCount) this.disable("foreground_latency");
+    }
+    noteForegroundSuccess() {
+      this.foregroundLatencyCount = 0;
+    }
+    clearTaskDeadline(task) {
+      if (task.deadlineTimer !== void 0) {
+        this.windowObject.clearTimeout(task.deadlineTimer);
+        task.deadlineTimer = void 0;
+      }
+    }
+    emitDeadlineDiagnostic(task) {
+      if (task.deadlineReported === true) return;
+      task.deadlineReported = true;
+      this.emitChunkDiagnostic(
+        task,
+        0,
+        performanceNow(this.windowObject) - task.startedAt,
+        "deadline"
+      );
+    }
+    startTask(task, activeSet) {
+      task.started = true;
+      task.startedAt = performanceNow(this.windowObject);
+      activeSet.add(task);
+      const deadlineMs = task.kind === "prefetch" ? this.config.prefetchDeadlineMs : this.config.foregroundDeadlineMs;
+      task.deadlineTimer = this.windowObject.setTimeout(() => {
+        if (task.settled || task.controller.signal.aborted) return;
+        task.abortReason = "deadline";
+        task.controller.abort();
+        this.emitDeadlineDiagnostic(task);
+        if (task.kind === "foreground") this.noteForegroundFallback();
+      }, deadlineMs);
+      void this.runTask(task).then((result) => {
+        task.settled = true;
+        task.resolve(result);
+      }, (error) => {
+        task.settled = true;
+        task.reject(error);
+      }).finally(() => {
+        this.clearTaskDeadline(task);
+        activeSet.delete(task);
+        if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+        this.pump();
+      });
+    }
     getTask(plan, { kind, url, credentials, signal, videoKey }) {
       const existing = this.inflight.get(plan.cacheKey);
       if (existing !== void 0) {
         if (existing.start <= plan.start && existing.end >= plan.end) {
-          if (priorityFor(kind) < existing.priority) {
-            existing.priority = priorityFor(kind);
-            existing.kind = kind;
-            this.queue.sort(compareQueueTasks);
-          }
-          return this.waitForTask(existing, signal);
+          return this.waitForTask(existing, signal, kind, kind === "foreground");
         }
-        return existing.promise.catch((error) => {
-          if (kind === "foreground" && existing.kind === "prefetch" && !signal?.aborted) return void 0;
-          throw error;
-        }).then(() => this.getTask(plan, { kind, url, credentials, signal, videoKey }));
+        return this.waitForTask(existing, signal, kind, kind === "foreground");
       }
       if (kind === "prefetch" && plan.cacheable !== false && (this.fetchedChunks.has(plan.cacheKey) || this.chunks.has(plan.cacheKey))) {
         return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
@@ -1394,50 +1435,82 @@
         videoKey,
         kind,
         sessionGeneration: this.sessionGeneration,
-        priority: priorityFor(kind),
-        sequence: this.sequence,
         controller,
         started: false,
+        startedAt: void 0,
+        deadlineTimer: void 0,
+        deadlineReported: false,
+        abortReason: void 0,
+        settled: false,
         waiters: 0,
         promise: void 0,
         resolve: void 0,
         reject: void 0
       };
-      this.sequence += 1;
       task.promise = new Promise((resolve, reject) => {
         task.resolve = resolve;
         task.reject = reject;
       });
       this.inflight.set(plan.cacheKey, task);
-      insertQueueTask(this.queue, task);
-      this.pump();
-      return this.waitForTask(task, signal);
+      if (kind === "foreground") this.startTask(task, this.activeForeground);
+      else this.queue.push(task);
+      if (kind === "prefetch") this.pump();
+      return this.waitForTask(task, signal, kind, false);
     }
-    waitForTask(task, signal) {
+    waitForTask(task, signal, kind, enforceDeadline) {
       task.waiters += 1;
-      return waitWithSignal(task.promise, signal).finally(() => {
+      let timeoutError;
+      return waitWithSignal(
+        task.promise,
+        signal,
+        this.windowObject,
+        enforceDeadline ? this.config.foregroundDeadlineMs : void 0,
+        () => {
+          timeoutError = new BankFallbackError("媒体分片等待超过补取死线");
+          return timeoutError;
+        }
+      ).catch((error) => {
+        if (error === timeoutError) {
+          this.noteForegroundFallback();
+          throw error;
+        }
+        if (kind === "foreground" && isAbortError(error) && task.abortReason === "deadline") {
+          if (task.kind !== "foreground") this.noteForegroundFallback();
+          throw new BankFallbackError("媒体分片网络取数超过死线", error);
+        }
+        throw error;
+      }).then((result) => {
+        if (kind === "foreground" && result.response === void 0) this.noteForegroundSuccess();
+        return result;
+      }).finally(() => {
         task.waiters -= 1;
-        if (signal !== void 0 && signal.aborted && task.waiters === 0 && task.kind === "foreground") {
+        if (signal !== void 0 && signal.aborted && task.waiters === 0 && task.kind === "foreground" && !task.settled) {
           task.controller.abort();
         }
       });
     }
     pump() {
-      while (this.activeTasks.size < this.maxConcurrency && this.queue.length > 0) {
+      while (this.activeForeground.size === 0 && this.activePrefetch.size < this.maxPrefetchConcurrency && this.queue.length > 0) {
         const task = this.queue.shift();
         if (task.controller.signal.aborted) {
+          task.settled = true;
           task.reject(abortError());
-          this.inflight.delete(task.cacheKey);
+          if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
           continue;
         }
-        task.started = true;
-        this.activeTasks.add(task);
-        void this.runTask(task).then((result) => task.resolve(result), (error) => task.reject(error)).finally(() => {
-          this.activeTasks.delete(task);
-          if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
-          this.pump();
-        });
+        this.startTask(task, this.activePrefetch);
       }
+    }
+    taskAbortError(task, bytes, startedAt, error) {
+      if (task.abortReason === "deadline") {
+        this.emitDeadlineDiagnostic(task);
+        if (task.kind === "foreground") {
+          return new BankFallbackError("媒体分片网络取数超过死线", error);
+        }
+      } else {
+        this.emitChunkDiagnostic(task, bytes, performanceNow(this.windowObject) - startedAt, "aborted");
+      }
+      return error;
     }
     async runTask(task) {
       const startedAt = performanceNow(this.windowObject);
@@ -1450,9 +1523,12 @@
         });
       } catch (error) {
         const result2 = isAbortError(error) ? "aborted" : "network_error";
+        if (isAbortError(error)) throw this.taskAbortError(task, 0, startedAt, error);
         this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, result2);
-        if (isAbortError(error)) throw error;
         throw new BankNetworkError("媒体分片网络取数失败", error);
+      }
+      if (task.controller.signal.aborted) {
+        throw this.taskAbortError(task, 0, startedAt, abortError());
       }
       if (response.status < 200 || response.status >= 300) {
         this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, "http_error");
@@ -1463,11 +1539,13 @@
         bytes = await response.arrayBuffer();
       } catch (error) {
         if (isAbortError(error)) {
-          this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, "aborted");
-          throw error;
+          throw this.taskAbortError(task, 0, startedAt, error);
         }
         this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, "network_error");
         throw new BankNetworkError("媒体分片响应读取失败", error);
+      }
+      if (task.controller.signal.aborted) {
+        throw this.taskAbortError(task, bytes.byteLength, startedAt, abortError());
       }
       const contentRange = parseContentRange(headerValue(response.headers, "Content-Range"));
       const isCompleteTailChunk = contentRange !== void 0 && task.cacheable !== false && contentRange.start === task.start && contentRange.end < task.end && contentRange.end === contentRange.totalSize - 1;
@@ -1491,8 +1569,7 @@
         throw new BankFallbackError("媒体分片网络字节长度不匹配");
       }
       if (task.controller.signal.aborted) {
-        this.emitChunkDiagnostic(task, bytes.byteLength, performanceNow(this.windowObject) - startedAt, "aborted");
-        throw abortError();
+        throw this.taskAbortError(task, bytes.byteLength, startedAt, abortError());
       }
       const result = {
         ...resultRange,
@@ -1618,8 +1695,7 @@
           chunkBytes: this.config.chunkBytes,
           totalSize: state.totalSize,
           bankKeyValue: state.bankKey,
-          aligned: true,
-          forceAligned: true
+          aligned: true
         });
         for (const plan of plans) {
           if (plan.cacheable !== false && (this.chunks.has(plan.cacheKey) || this.fetchedChunks.has(plan.cacheKey))) continue;
@@ -1638,8 +1714,15 @@
     }
     destroy() {
       if (this.prefetchTimer !== void 0) this.windowObject.clearInterval(this.prefetchTimer);
-      for (const task of this.inflight.values()) task.controller.abort();
-      for (const task of this.queue) task.reject(abortError());
+      for (const task of this.inflight.values()) {
+        this.clearTaskDeadline(task);
+        task.controller.abort();
+      }
+      for (const task of this.queue) {
+        task.settled = true;
+        task.reject(abortError());
+        if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+      }
       this.queue = [];
       this.releaseSession();
     }
