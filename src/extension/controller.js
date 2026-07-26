@@ -12,17 +12,15 @@ import {
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
 import { SHIM_OBSERVATION_ATTRIBUTE, SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE } from './bridge-contract.js';
+import { installBankRelay, postBankControl } from '../bank/relay.js';
+import { isVideoLocation } from '../bank/logic.js';
 
 export function isLivePage(locationObject) {
   return locationObject.hostname === 'live.bilibili.com';
 }
 
 export function isVideoPage(locationObject) {
-  return locationObject.hostname === 'www.bilibili.com' && (
-    locationObject.pathname.startsWith('/video/') ||
-    locationObject.pathname === '/list/watchlater' ||
-    locationObject.pathname.startsWith('/list/watchlater/')
-  );
+  return isVideoLocation(locationObject);
 }
 
 export const isVodPage = isVideoPage;
@@ -190,6 +188,9 @@ export class ExtensionCoordinator {
     }
     this.diagnostics?.log('extension.started', { action: 'coordinator' });
     this.preferences = await readPreferences(this.storage);
+    if (this.windowObject.location.hostname === 'www.bilibili.com') {
+      postBankControl(this.windowObject, this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false);
+    }
     this.diagnostics?.log('preference.read', {
       name: EXTENSION_PREFERENCES.liveEnabled,
       enabled: this.preferences[EXTENSION_PREFERENCES.liveEnabled] !== false,
@@ -430,6 +431,7 @@ export class ExtensionCoordinator {
 
 if (typeof chrome !== 'undefined' && typeof document !== 'undefined' && typeof window !== 'undefined') {
   const diagnostics = new DiagnosticsClient();
+  if (window.location.hostname === 'www.bilibili.com') installBankRelay({ diagnostics });
   installPopupMessageHandler(chrome.runtime, () => diagnostics.getStatus().sessionId);
   const coordinator = new ExtensionCoordinator({ diagnostics });
   void coordinator.start().catch((error) => {

@@ -26,6 +26,13 @@ export function createManifest() {
       },
       {
         matches: [...EXTENSION_MANIFEST.matches],
+        js: ['bank.js'],
+        run_at: 'document_start',
+        all_frames: false,
+        world: 'MAIN',
+      },
+      {
+        matches: [...EXTENSION_MANIFEST.matches],
         js: ['main-bridge.js'],
         run_at: 'document_start',
         all_frames: false,

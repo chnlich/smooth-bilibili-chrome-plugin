@@ -17,6 +17,13 @@
   var VOD_CONFIG = Object.freeze({
     stableBufferSeconds: 120
   });
+  var BANK_CONFIG = Object.freeze({
+    chunkBytes: 4 * 1024 ** 2,
+    prefetchAheadSeconds: 900,
+    maxBankBytes: 2 * 1024 ** 3,
+    maxBankBytesPerVideo: 512 * 1024 ** 2,
+    storeReadTimeoutMs: 50
+  });
   var LIVE_CONFIG = Object.freeze({
     noDecodedFrameStallMilliseconds: 2e3,
     userSeekAuthorizationMilliseconds: 1e3,
@@ -91,6 +98,9 @@
     "bridge.request",
     "bridge.response",
     "bridge.error",
+    "bank.fetch.chunk",
+    "bank.serve",
+    "bank.evict",
     "extension.started",
     "extension.boot_error",
     "extension.observer_error",
@@ -182,6 +192,17 @@
       "originalEnd"
     ]),
     bridge: Object.freeze(["operation", "direction", "status"]),
+    bank: Object.freeze([
+      "source",
+      "chunkIndex",
+      "start",
+      "end",
+      "bytes",
+      "durationMs",
+      "priority",
+      "result",
+      "reason"
+    ]),
     extension: Object.freeze(["action", "reason", "status"]),
     persist: Object.freeze(["status", "batchSize", "eventCount", "message"])
   });
@@ -193,6 +214,7 @@
     if (code.startsWith("resource.")) return DATA_ALLOWLIST.resource;
     if (code.startsWith("live.")) return DATA_ALLOWLIST.live;
     if (code.startsWith("bridge.")) return DATA_ALLOWLIST.bridge;
+    if (code.startsWith("bank.")) return DATA_ALLOWLIST.bank;
     if (code.startsWith("extension.")) return DATA_ALLOWLIST.extension;
     if (code.startsWith("log.persist.")) return DATA_ALLOWLIST.persist;
     throw new Error(`诊断事件代码没有字段 allowlist: ${code}`);
@@ -468,7 +490,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-2e8688b7243a97de27030663" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-470bc644b05d25270f8a35e8" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -2956,12 +2978,131 @@
     };
   }
 
+  // src/bank/contract.js
+  var BANK_MESSAGE_NAMESPACE = "bilibili-buffer:segment-bank-v1";
+  var BANK_MESSAGE_TYPES = Object.freeze([
+    "read-range",
+    "write-chunk",
+    "diagnostic",
+    "configure"
+  ]);
+  function isBankMessage(message) {
+    return message !== null && typeof message === "object" && !Array.isArray(message) && message.namespace === BANK_MESSAGE_NAMESPACE && BANK_MESSAGE_TYPES.includes(message.type);
+  }
+
+  // src/bank/relay.js
+  function serializeError2(error) {
+    return {
+      name: typeof error?.name === "string" ? error.name : "Error",
+      code: typeof error?.code === "string" ? error.code : "BANK_RELAY_FAILED",
+      message: error?.message || String(error)
+    };
+  }
+  function runtimeRequest(runtimeObject, message) {
+    if (runtimeObject === void 0 || typeof runtimeObject.sendMessage !== "function") {
+      throw new Error("媒体分片 relay runtime.sendMessage 不可用");
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        callback(value);
+      };
+      try {
+        const result = runtimeObject.sendMessage(message, (response) => {
+          const lastError = runtimeObject.lastError || globalThis.chrome?.runtime?.lastError;
+          if (lastError !== void 0) {
+            finish(reject, new Error(lastError.message));
+            return;
+          }
+          finish(resolve, response);
+        });
+        if (result !== void 0 && typeof result.then === "function") {
+          result.then((response) => finish(resolve, response), (error) => finish(reject, error));
+        }
+      } catch (error) {
+        finish(reject, error);
+      }
+    });
+  }
+  function postWindowMessage(windowObject, message, transfer = []) {
+    windowObject.postMessage(message, "*", transfer);
+  }
+  function postBankControl(windowObject, enabled) {
+    if (typeof windowObject?.postMessage !== "function") return;
+    postWindowMessage(windowObject, {
+      namespace: BANK_MESSAGE_NAMESPACE,
+      direction: "control",
+      type: "configure",
+      enabled: enabled === true
+    });
+  }
+  function installBankRelay({
+    windowObject = window,
+    runtimeObject = chrome.runtime,
+    diagnostics
+  } = {}) {
+    let currentDiagnostics = diagnostics;
+    const listener = (event) => {
+      if (event.source !== windowObject || !isBankMessage(event.data)) return;
+      const message = event.data;
+      if (message.direction === "event") {
+        if (message.type !== "diagnostic" || typeof message.code !== "string") {
+          throw new Error("媒体分片诊断消息格式无效");
+        }
+        currentDiagnostics?.log(message.code, message.data || {});
+        return;
+      }
+      if (message.direction !== "request") return;
+      const response = async () => {
+        try {
+          const result = await runtimeRequest(runtimeObject, message);
+          const value = result?.value;
+          const transfer = value?.bytes instanceof ArrayBuffer ? [value.bytes] : [];
+          postWindowMessage(windowObject, {
+            namespace: BANK_MESSAGE_NAMESPACE,
+            direction: "response",
+            type: message.type,
+            requestId: message.requestId,
+            ok: result?.ok === true,
+            ...result?.ok === true ? { value } : { error: result?.error || serializeError2(new Error("媒体分片 worker 没有返回结果")) }
+          }, transfer);
+        } catch (error) {
+          postWindowMessage(windowObject, {
+            namespace: BANK_MESSAGE_NAMESPACE,
+            direction: "response",
+            type: message.type,
+            requestId: message.requestId,
+            ok: false,
+            error: serializeError2(error)
+          });
+        }
+      };
+      void response();
+    };
+    windowObject.addEventListener("message", listener);
+    return {
+      setDiagnostics(nextDiagnostics) {
+        currentDiagnostics = nextDiagnostics;
+      },
+      destroy() {
+        windowObject.removeEventListener("message", listener);
+      }
+    };
+  }
+
+  // src/bank/logic.js
+  function isVideoLocation(locationObject) {
+    return locationObject.hostname === "www.bilibili.com" && (locationObject.pathname.startsWith("/video/") || locationObject.pathname === "/list/watchlater" || locationObject.pathname.startsWith("/list/watchlater/"));
+  }
+
   // src/extension/controller.js
   function isLivePage(locationObject) {
     return locationObject.hostname === "live.bilibili.com";
   }
   function isVideoPage(locationObject) {
-    return locationObject.hostname === "www.bilibili.com" && (locationObject.pathname.startsWith("/video/") || locationObject.pathname === "/list/watchlater" || locationObject.pathname.startsWith("/list/watchlater/"));
+    return isVideoLocation(locationObject);
   }
   var isVodPage = isVideoPage;
   function modeForLocation(locationObject) {
@@ -3115,6 +3256,9 @@
       }
       this.diagnostics?.log("extension.started", { action: "coordinator" });
       this.preferences = await readPreferences(this.storage);
+      if (this.windowObject.location.hostname === "www.bilibili.com") {
+        postBankControl(this.windowObject, this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false);
+      }
       this.diagnostics?.log("preference.read", {
         name: EXTENSION_PREFERENCES.liveEnabled,
         enabled: this.preferences[EXTENSION_PREFERENCES.liveEnabled] !== false
@@ -3332,6 +3476,7 @@
   };
   if (typeof chrome !== "undefined" && typeof document !== "undefined" && typeof window !== "undefined") {
     const diagnostics = new DiagnosticsClient();
+    if (window.location.hostname === "www.bilibili.com") installBankRelay({ diagnostics });
     installPopupMessageHandler(chrome.runtime, () => diagnostics.getStatus().sessionId);
     const coordinator = new ExtensionCoordinator({ diagnostics });
     void coordinator.start().catch((error) => {

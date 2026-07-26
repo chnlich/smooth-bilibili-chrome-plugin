@@ -66,6 +66,9 @@ export const EVENT_CODES = Object.freeze([
   'bridge.request',
   'bridge.response',
   'bridge.error',
+  'bank.fetch.chunk',
+  'bank.serve',
+  'bank.evict',
   'extension.started',
   'extension.boot_error',
   'extension.observer_error',
@@ -164,6 +167,17 @@ export const DATA_ALLOWLIST = Object.freeze({
     'originalEnd',
   ]),
   bridge: Object.freeze(['operation', 'direction', 'status']),
+  bank: Object.freeze([
+    'source',
+    'chunkIndex',
+    'start',
+    'end',
+    'bytes',
+    'durationMs',
+    'priority',
+    'result',
+    'reason',
+  ]),
   extension: Object.freeze(['action', 'reason', 'status']),
   persist: Object.freeze(['status', 'batchSize', 'eventCount', 'message']),
 });
@@ -176,6 +190,7 @@ export function allowedDataFields(code) {
   if (code.startsWith('resource.')) return DATA_ALLOWLIST.resource;
   if (code.startsWith('live.')) return DATA_ALLOWLIST.live;
   if (code.startsWith('bridge.')) return DATA_ALLOWLIST.bridge;
+  if (code.startsWith('bank.')) return DATA_ALLOWLIST.bank;
   if (code.startsWith('extension.')) return DATA_ALLOWLIST.extension;
   if (code.startsWith('log.persist.')) return DATA_ALLOWLIST.persist;
   throw new Error(`诊断事件代码没有字段 allowlist: ${code}`);

@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { EXTENSION_MANIFEST, LIVE_CONFIG, VOD_CONFIG } from '../src/constants.js';
+import { BANK_CONFIG, EXTENSION_MANIFEST, LIVE_CONFIG, VOD_CONFIG } from '../src/constants.js';
 import { createManifest } from '../src/extension/manifest-source.js';
 import { EVENT_CODES, MEDIA_EVENT_NAMES } from '../src/diagnostics/catalog.js';
 
@@ -114,6 +114,7 @@ const sourceVisibleAssets = await readTextFiles(path.join(root, 'src'), ['.html'
 const extensionVisibleFiles = await readTextFiles(extensionDirectory, ['.js', '.html', '.css', '.json']);
 const controller = await fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8');
 const bridge = await fs.readFile(path.join(extensionDirectory, 'main-bridge.js'), 'utf8');
+const bank = await fs.readFile(path.join(extensionDirectory, 'bank.js'), 'utf8');
 const shim = await fs.readFile(path.join(extensionDirectory, 'source-buffer-shim.js'), 'utf8');
 const popup = await fs.readFile(path.join(extensionDirectory, 'popup.js'), 'utf8');
 const worker = await fs.readFile(path.join(extensionDirectory, 'worker.js'), 'utf8');
@@ -142,6 +143,13 @@ assert.deepEqual(manifest.content_scripts, [
   },
   {
     matches: [...EXTENSION_MANIFEST.matches],
+    js: ['bank.js'],
+    run_at: 'document_start',
+    all_frames: false,
+    world: 'MAIN',
+  },
+  {
+    matches: [...EXTENSION_MANIFEST.matches],
     js: ['main-bridge.js'],
     run_at: 'document_start',
     all_frames: false,
@@ -162,6 +170,8 @@ const buildId = extractBuildId([controller, worker]);
 assert.equal(buildId, secondBuild.buildId);
 
 const expectedFiles = [
+  'bank.js',
+  'bank.js.map',
   'controller.js',
   'controller.js.map',
   'logs.css',
@@ -225,6 +235,7 @@ const indexedDbSourceAllowlist = new Set([
   'diagnostics/idb.js',
   'diagnostics/worker.js',
   'diagnostics/logs.js',
+  'bank/storage.js',
 ]);
 for (const { relativePath, content } of sourceFiles) {
   if (!indexedDbSourceAllowlist.has(relativePath)) {
@@ -250,20 +261,47 @@ assert.doesNotMatch(passiveMediaSource, /\b(?:play|pause)\s*\(/);
 assert.doesNotMatch(passiveMediaSource, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
 assert.doesNotMatch(passiveMediaSource, /\b(?:fetch|MediaSource|SourceBuffer)\b/);
 assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /document\.cookie|localStorage|sessionStorage|sendBeacon/);
-const sourceWithoutAllowedMediaSource = sourceFiles
-  .filter(({ relativePath }) => !mediaSourceSourceAllowlist.has(relativePath))
+const bankSourceAllowlist = new Set([
+  'bank/contract.js',
+  'bank/errors.js',
+  'bank/logic.js',
+  'bank/main.js',
+  'bank/relay.js',
+  'bank/storage.js',
+  'bank/worker.js',
+  'bank/xhr.js',
+]);
+const sourceWithoutAllowedMediaSourceOrBank = sourceFiles
+  .filter(({ relativePath }) => !mediaSourceSourceAllowlist.has(relativePath) && !bankSourceAllowlist.has(relativePath))
   .map(({ content }) => content)
   .join('\n');
 assert.doesNotMatch(
-  `${sourceWithoutAllowedMediaSource}\n${controller}\n${bridge}\n${worker}\n${logs}`,
+  `${sourceWithoutAllowedMediaSourceOrBank}\n${controller}\n${bridge}\n${worker}\n${logs}`,
   /fetch\s*\(|XMLHttpRequest|MediaSource/,
 );
+assert.match(bank, /fetch\s*\(/);
+assert.match(bank, /XMLHttpRequest/);
+assert.doesNotMatch(`${source}\n${bank}`, /prefetchPauseBelowSeconds/);
 assert.doesNotMatch(source, /window\.onerror|window\.onunhandledrejection/);
 const diagnosticStorageSource = `${await fs.readFile(path.join(root, 'src/diagnostics/idb.js'), 'utf8')}\n${await fs.readFile(path.join(root, 'src/diagnostics/worker.js'), 'utf8')}`;
 assert.doesNotMatch(diagnosticStorageSource, /\.put\s*\(|\.delete\s*\(|\.clear\s*\(/);
 assert.match(vodSource, /setStableBufferTime/);
 assert.equal((vodSource.match(/\.setStableBufferTime\(/g) || []).length, 1);
 assert.equal(VOD_CONFIG.stableBufferSeconds, 120);
+assert.deepEqual(Object.keys(BANK_CONFIG), [
+  'chunkBytes',
+  'prefetchAheadSeconds',
+  'maxBankBytes',
+  'maxBankBytesPerVideo',
+  'storeReadTimeoutMs',
+]);
+assert.deepEqual(BANK_CONFIG, {
+  chunkBytes: 4 * 1024 ** 2,
+  prefetchAheadSeconds: 900,
+  maxBankBytes: 2 * 1024 ** 3,
+  maxBankBytesPerVideo: 512 * 1024 ** 2,
+  storeReadTimeoutMs: 50,
+});
 assert.equal(LIVE_CONFIG.noDecodedFrameStallMilliseconds, 2000);
 assert.equal(LIVE_CONFIG.liveRetainSeconds, 30);
 assert.equal(EVENT_CODES.includes('log.persist.result'), true);
@@ -271,8 +309,14 @@ assert.equal(EVENT_CODES.includes('live.delay_protection.applied'), true);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
 assert.equal(EVENT_CODES.includes('live.delay.unavailable'), true);
 assert.equal(EVENT_CODES.includes('live.buffer.retained'), true);
+assert.equal(EVENT_CODES.includes('bank.fetch.chunk'), true);
+assert.equal(EVENT_CODES.includes('bank.serve'), true);
+assert.equal(EVENT_CODES.includes('bank.evict'), true);
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.match(bridgeContractSource, /setChasingFrameThreshold/);
+assert.doesNotMatch(`${liveSource}\n${shim}`, /bank\.|segment-bank|BANK_MESSAGE/);
+assert.doesNotMatch(bank, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
+assert.doesNotMatch(bank, /\b(?:play|pause)\s*\(/);
 for (const mediaEvent of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${mediaEvent}`));
 assert.match(controller, /unlimitedStorage|diagnostic/);
 assert.match(logs, /showSaveFilePicker|createWritable|recordType/);

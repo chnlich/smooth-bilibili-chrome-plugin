@@ -390,6 +390,9 @@ export { appendBatch, handleMessage, readLogs, stableStringify };
 
 if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage?.addListener) {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (typeof message?.namespace === 'string' && message.namespace.startsWith('bilibili-buffer:segment-bank-')) {
+      return false;
+    }
     void handleMessage(message, sender)
       .then((response) => sendResponse({ version: DIAGNOSTIC_MESSAGE_VERSION, ok: true, ...response }))
       .catch((error) => sendResponse({

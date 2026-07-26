@@ -16,6 +16,13 @@
   var VOD_CONFIG = Object.freeze({
     stableBufferSeconds: 120
   });
+  var BANK_CONFIG = Object.freeze({
+    chunkBytes: 4 * 1024 ** 2,
+    prefetchAheadSeconds: 900,
+    maxBankBytes: 2 * 1024 ** 3,
+    maxBankBytesPerVideo: 512 * 1024 ** 2,
+    storeReadTimeoutMs: 50
+  });
   var LIVE_CONFIG = Object.freeze({
     noDecodedFrameStallMilliseconds: 2e3,
     userSeekAuthorizationMilliseconds: 1e3,

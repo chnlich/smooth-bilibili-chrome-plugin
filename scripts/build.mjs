@@ -44,10 +44,11 @@ function calculateBuildId(entries) {
 const buildId = calculateBuildId(await sourceEntries(sourceDirectory));
 const entries = [
   ['src/extension/source-buffer-shim.js', 'source-buffer-shim.js'],
+  ['src/bank/main.js', 'bank.js'],
   ['src/extension/main-bridge.js', 'main-bridge.js'],
   ['src/extension/controller.js', 'controller.js'],
   ['src/extension/popup.js', 'popup.js'],
-  ['src/diagnostics/worker.js', 'worker.js'],
+  ['src/extension/worker.js', 'worker.js'],
   ['src/diagnostics/logs.js', 'logs.js'],
 ];
 

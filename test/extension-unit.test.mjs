@@ -22,6 +22,8 @@ test('manifest is MV3 with only storage permissions, unlimited diagnostic storag
   assert.deepEqual(manifest.host_permissions, []);
   assert.deepEqual(manifest.content_scripts[0].matches, [...EXTENSION_MANIFEST.matches]);
   assert.deepEqual(manifest.content_scripts[1].matches, [...EXTENSION_MANIFEST.matches]);
+  assert.deepEqual(manifest.content_scripts[1].js, ['bank.js']);
+  assert.equal(manifest.content_scripts[1].world, 'MAIN');
   assert.deepEqual(manifest.background, { service_worker: 'worker.js' });
   assert.equal(manifest.action.default_popup, 'popup.html');
   assert.equal(manifest.options_page, undefined);

@@ -19,6 +19,14 @@ export const VOD_CONFIG = Object.freeze({
   stableBufferSeconds: 120,
 });
 
+export const BANK_CONFIG = Object.freeze({
+  chunkBytes: 4 * 1024 ** 2,
+  prefetchAheadSeconds: 900,
+  maxBankBytes: 2 * 1024 ** 3,
+  maxBankBytesPerVideo: 512 * 1024 ** 2,
+  storeReadTimeoutMs: 50,
+});
+
 export const LIVE_CONFIG = Object.freeze({
   noDecodedFrameStallMilliseconds: 2000,
   userSeekAuthorizationMilliseconds: 1000,
