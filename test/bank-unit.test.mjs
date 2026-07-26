@@ -830,6 +830,70 @@ test('a foreground deadline falls back unchanged instead of exposing AbortError'
   assert.equal(bank.inflight.size, 0);
 });
 
+test('foreground deadline counts every waiter and noncovering fallback preserves the latency streak', async () => {
+  const config = configFor({ foregroundDeadlineMs: 5, prefetchDeadlineMs: 20 });
+  const timers = manualTimers();
+  let releasePrefetch;
+  const { bank } = createBank({
+    config,
+    timers,
+    nativeFetch: (_url, init) => {
+      const range = rangeFromInit(init);
+      if (range.end === 3) {
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+        });
+      }
+      if (range.end === 15) {
+        return new Promise((resolve) => {
+          releasePrefetch = resolve;
+        });
+      }
+      throw new Error(`unexpected range ${range.start}-${range.end}`);
+    },
+  });
+  let fallbackCalls = 0;
+  const fallback = async () => {
+    fallbackCalls += 1;
+    return new Response('native', { status: 200 });
+  };
+  const first = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-3' } }, fallback);
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-3' } }, fallback);
+  await new Promise((resolve) => setImmediate(resolve));
+  const foregroundTask = bank.inflight.get(`${MEDIA_KEY}#0`);
+  const deadline = timers.pending.get(foregroundTask.deadlineTimer);
+  timers.pending.delete(foregroundTask.deadlineTimer);
+  deadline.callback();
+  const [firstResponse, secondResponse] = await Promise.all([first, second]);
+  assert.equal(await firstResponse.text(), 'native');
+  assert.equal(await secondResponse.text(), 'native');
+  assert.equal(fallbackCalls, 2);
+  assert.equal(bank.foregroundLatencyCount, 2);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const prefetch = bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+    cacheable: true,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const noncovering = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-31' } }, fallback);
+  await new Promise((resolve) => setImmediate(resolve));
+  releasePrefetch(responseFor(0, 15, 100, bytesFor(0, 15)));
+  assert.equal(await (await noncovering).text(), 'native');
+  await prefetch;
+  assert.equal(fallbackCalls, 3);
+  assert.equal(bank.foregroundLatencyCount, 2);
+});
+
 test('coverage and noncoverage foreground attachments both have wait deadlines', async () => {
   const config = configFor({ foregroundDeadlineMs: 5, prefetchDeadlineMs: 20 });
   const timers = manualTimers();
