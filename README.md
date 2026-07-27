@@ -9,6 +9,16 @@
 - 用户和 Bilibili 的播放、暂停、拖动、倍速、画质、音量选择始终有效。普通换画质或 source/video 替换只重新绑定；只有确认发生真实卡顿并保存了延迟时，才按仍可播放的时间位置恢复旧延迟。
 - popup 只显示增强开关和可直接读取的事实。视频显示实际连续缓存秒数、120 秒目标状态和错误；直播显示暂停、最近一秒新画面、连续缓存、可计算延迟、原生分辨率/画质、用户速度、替换次数、最近媒体事件或错误、日志 session 与持久化状态。没有阶段字段和恢复按钮。
 
+## 下载层
+
+- 补取（播放器正在等的取数）**直发**：不进队列、不受并发上限约束，按播放器请求的原区间发；只有投机预取入队。
+- 调度器只节流预取：并发上限 2，且**有在途补取时一个新预取都不启动**。
+- 补取死线 5 秒 / 预取死线 20 秒。
+- 补取超死线 → 抛 `BankFallbackError` → 下载层用原始 `fetch`/`XHR` 重发播放器的原请求，响应原样交回。
+- 退场路径①：补取**连续** 3 次降级（成功即清零）→ `bank.disabled(foreground_latency)`。
+- 退场路径②：同一分片被重复取满 3 次（**按 `cacheKey` 累计，成功不清零**）→ `bank.disabled(refetch_alarm)`。
+- 分片 4 MiB、预取前方 900 秒、内存上限 512 MiB；分片只存在 `Map` 里，不落盘。
+
 ## 安装
 
 需要 Node.js 20+ 与 Chrome/Chromium 120+：
@@ -18,14 +28,13 @@ npm ci
 npm run build
 ```
 
-Windows 上运行真实 Chrome 的 A/B harness 时，从 Windows checkout 执行以下安装和构建命令。它使用系统 Chrome，不下载 Playwright Chromium：
+Windows 上运行真实 Chrome 测试时，从 Windows checkout 执行以下安装和构建命令。它使用系统 Chrome，不下载 Playwright Chromium：
 
 ```bat
 cd /d E:\workspace\smooth-bilibili-chrome-plugin
 set "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1"
 E:\tools\node\npm.cmd install
 E:\tools\node\npm.cmd run build
-E:\tools\node\node.exe scripts\stall-ab.mjs --self-check --profile "<persistent-signed-in-profile-dir>"
 ```
 
 在 `chrome://extensions` 开启开发者模式，选择 `dist/extension` 加载未打包扩展。源代码或构建产物更新后，在扩展页手动点击“重新加载”，再刷新已经打开的 Bilibili 页面。本仓库已提交可直接加载的 `dist/extension`，包括 MV3 service worker、页面桥接、控制器、popup、开发日志页和外部 source map。
@@ -40,30 +49,6 @@ popup 的“直播增强”和“视频增强”是刷新后的默认开关；�
 
 日志记录包括独立记录身份、连续编号、播放器和媒体来源的更换记录、所有实际触发的标准媒体事件（包括 `volumechange`）、每秒完整 buffered/seekable ranges、资源 timing 与字节字段、120 秒提示、真实直播卡顿/延迟/换源/保护、桥接、生命周期和保存结果。日志不上传，不保存 Cookie、账号、页面文字、聊天、API body、签名 query、媒体字节、帧或截图。
 
-## Stall A/B harness
-
-`stall-ab` 用同一个 document-start probe 在真实 Bilibili 视频页上测量 extension-on 和 extension-off 两个 arm。它随机化 arm 顺序，在每个 arm 前清理 profile 的 media cache，并把 extension-on 的 `logs:events-page` 全量分页结果自动写出，不需要点击日志页的导出按钮。`--start-seconds` 默认为 `0`，harness 将 Bilibili 的 `t` URL 参数设为这个位置；播放开始后会用实际 `currentTime` 校验，容差为 1 秒，用来覆盖 `play()` 调度和 probe 取样时序，同时远小于测量区间。位置不匹配时以 `BLOCKED` 和非零状态退出，不记录该 arm。
-
-stall A/B 只使用一个持久化 profile，profile 必须放在仓库外。先在 `chrome://extensions` 开启开发者模式，把 `dist/extension` 作为未打包扩展安装到这个 profile，一次即可。当前 Chrome 不可用命令行 `--load-extension`，harness 不再传入它或 `--disable-extensions-except`。extension-on 通过移除 Playwright 默认的 `--disable-extensions` 使用 profile 中的扩展；extension-off 保留 Playwright 默认设置，让同一个扩展保持不活动。这样两个 arm 共享登录和 Cookie 状态。`--login` 也使用这个 profile，并保留 `--mute-audio` 与 document-start 静音 guard。
-
-`--self-check` 会用 extension-on 配置打开一个匹配扩展的 Bilibili 视频页，并检查 shim marker 与非原生的 `SourceBuffer.prototype.remove`，确认扩展真的注入；它不会播放视频，也不会记录 probe。测量开始前每个 arm 都会执行同样的检查，arm 状态不符合预期时以 `BLOCKED` 和非零状态退出，不会写出 `compare.json`。
-
-先用持久化 profile 完成一次人工登录：
-
-```bat
-E:\tools\node\node.exe scripts\stall-ab.mjs --login --profile "<persistent-signed-in-profile-dir>"
-```
-
-后续运行使用同一个 profile：
-
-```bat
-E:\tools\node\node.exe scripts\stall-ab.mjs --bv BV1syga6fEL7 --start-seconds 90 --seconds 180 --rate 2 --arms extension-on,extension-off --profile "<persistent-signed-in-profile-dir>" --out artifacts\stall-ab-20260724T000000Z
-```
-
-每个 arm 会先读取视频 duration，并拒绝 `start-seconds + seconds * rate` 超出视频的请求，同时报告视频 duration、请求 span 和最大可用的 `--seconds`。成功的输出目录包含两个 arm 的 `probe.jsonl` 与 `metric.json`、extension-on 的 `extlog.jsonl` 和 `compare.json`。每个 `metric.json` 及 `compare.json` 中的 arm 对象都包含 `startCurrentTime`、`endCurrentTime`、`mediaDuration`、`reachedEndOfMedia` 和 `valid`，因此可以直接核对两个 arm 的实际区间。记录期间到达媒体结尾或发生位置回绕会将该 arm 标为无效并以 `BLOCKED` 和非零状态退出，不会写出比较结果。`compare.json` 只报告 Phase 1 gate，不自动改变播放行为。登录失效、页面不可达、没有原生 video、profile 被其他 Chrome 实例占用，或扩展 arm 没有处于预期状态时，命令以非零状态报告 `BLOCKED`，不会伪造比较结果。
-
-如果 profile 已被另一个 Chrome 窗口打开，命令会快速以 `PROFILE_IN_USE` 和非零状态失败；关闭那个窗口后再运行。
-
 ## 构建与验证
 
 ```sh
@@ -73,4 +58,10 @@ npm audit --json
 npm audit --omit=dev --json
 ```
 
-构建保持未压缩并为每个 JavaScript bundle 生成外部 source map。`buildId` 由 `src` 内容确定性生成；源码不变时连续构建的文件内容、文件列表和 build id 相同。stall A/B automation 使用 `--profile` 指定的 persistent signed-in profile；现有 deterministic browser tests 仍使用 fresh temporary profile。所有自动化浏览器都保持 `--mute-audio` 和 document-start 静音 guard；真实 Bilibili 页面受环境阻挡时只报告 `BLOCKED`，不伪造通过。
+构建保持未压缩，并为每个 JavaScript bundle 生成外部 source map。`buildId` 由 `src` 内容确定性生成；源码不变时连续构建的文件内容、文件列表和 build id 相同。现有确定性浏览器测试仍使用新建的临时 profile。所有自动化浏览器都保持 `--mute-audio` 和 document-start 静音 guard；真实 Bilibili 页面受环境阻挡时只报告 `BLOCKED`，不伪造通过。
+
+## 自己验证
+
+1. 执行 `npm run build` 后，在 `chrome://extensions` 加载 `dist/extension`。
+2. 打开一个**播放量 1000 以下的冷门视频**（热门视频被 CDN 预热会掩盖问题）。
+3. 在 popup 中打开开发日志页，观察：`bank.serve` 的 hit/miss 随播放时长的变化、`bank.fetch.chunk` 有没有 `result: 'deadline'`、有没有 `bank.disabled`。
