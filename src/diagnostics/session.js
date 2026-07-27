@@ -20,7 +20,6 @@ export function createSessionIdentity({
   runtimeObject = globalThis,
   now = new Date(),
   sessionId = globalThis.crypto?.randomUUID?.(),
-  roomId,
   bvid,
   part,
   watchLaterItem,
@@ -41,7 +40,7 @@ export function createSessionIdentity({
     origin,
     pathname,
   };
-  for (const [field, value] of Object.entries({ roomId, bvid, part, watchLaterItem })) {
+  for (const [field, value] of Object.entries({ bvid, part, watchLaterItem })) {
     if (value !== undefined) {
       identity[field] = typeof value === 'string' ? value : String(value);
     }
@@ -69,7 +68,6 @@ export const SESSION_FIELDS = Object.freeze([
   'routeKind',
   'origin',
   'pathname',
-  'roomId',
   'bvid',
   'part',
   'watchLaterItem',
@@ -96,7 +94,7 @@ export function validateSession(session, { requireTabId = true } = {}) {
   if (!requireTabId && Object.prototype.hasOwnProperty.call(session, 'tabId')) {
     throw new Error('页面 session 不得包含 tabId');
   }
-  for (const field of ['roomId', 'bvid', 'part', 'watchLaterItem']) {
+  for (const field of ['bvid', 'part', 'watchLaterItem']) {
     optionalString(session[field], field);
     if (typeof session[field] === 'string' && /[?#]/.test(session[field])) {
       throw new Error(`session ${field} 必须没有 query/hash`);

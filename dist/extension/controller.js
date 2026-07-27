@@ -103,7 +103,6 @@
       "origin",
       "pathname",
       "reason",
-      "roomId",
       "bvid",
       "part",
       "watchLaterItem"
@@ -302,7 +301,7 @@
       if (typeof value !== "string" || !value.startsWith("/")) return UNKNOWN_VALUE;
       return scrubPathname(value);
     }
-    if (["roomId", "bvid", "part", "watchLaterItem"].includes(field)) return scrubIdentifier(value);
+    if (["bvid", "part", "watchLaterItem"].includes(field)) return scrubIdentifier(value);
     if (field === "source" || field === "previousSource" || field === "name") return scrubUrl(value);
     if (field === "bufferedRanges" || field === "seekableRanges") return safeRangeList(value);
     if (field === "sourceBufferRanges") return safeSourceBufferRanges(value);
@@ -452,7 +451,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-c256e83fb94c5658d5c78e33" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-a3e9e4a1a26344d555f00edf" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -470,7 +469,6 @@
     runtimeObject = globalThis,
     now = /* @__PURE__ */ new Date(),
     sessionId = globalThis.crypto?.randomUUID?.(),
-    roomId,
     bvid,
     part,
     watchLaterItem
@@ -491,7 +489,7 @@
       origin,
       pathname
     };
-    for (const [field, value] of Object.entries({ roomId, bvid, part, watchLaterItem })) {
+    for (const [field, value] of Object.entries({ bvid, part, watchLaterItem })) {
       if (value !== void 0) {
         identity[field] = typeof value === "string" ? value : String(value);
       }
@@ -508,7 +506,6 @@
     "routeKind",
     "origin",
     "pathname",
-    "roomId",
     "bvid",
     "part",
     "watchLaterItem"
@@ -696,7 +693,6 @@
         locationObject: this.locationObject,
         routeKind: route.routeKind,
         runtimeObject: this.windowObject,
-        roomId: route.roomId,
         bvid: route.bvid,
         part: route.part,
         watchLaterItem: route.watchLaterItem,
@@ -709,7 +705,6 @@
         routeKind: this.session.routeKind,
         origin: this.session.origin,
         pathname: this.session.pathname,
-        roomId: this.session.roomId,
         bvid: this.session.bvid,
         part: this.session.part,
         watchLaterItem: this.session.watchLaterItem

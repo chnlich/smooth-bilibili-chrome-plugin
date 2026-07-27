@@ -82,7 +82,6 @@ export const DATA_ALLOWLIST = Object.freeze({
     'origin',
     'pathname',
     'reason',
-    'roomId',
     'bvid',
     'part',
     'watchLaterItem',

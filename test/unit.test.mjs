@@ -579,12 +579,10 @@ test('diagnostic catalog covers all required media events and preserves browser-
     origin: 'https://www.example.test/?account=secret',
     pathname: '/video/BVprivacy?token=secret#fragment',
     bvid: 'BVprivacy?secret=1',
-    roomId: '123?secret=1',
   }), {
     origin: 'https://www.example.test',
     pathname: '/video/BVprivacy',
     bvid: 'BVprivacy',
-    roomId: '123',
   });
 });
 

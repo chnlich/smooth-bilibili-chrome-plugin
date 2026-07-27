@@ -134,7 +134,7 @@ function sanitizeField(field, value) {
     if (typeof value !== 'string' || !value.startsWith('/')) return UNKNOWN_VALUE;
     return scrubPathname(value);
   }
-  if (['roomId', 'bvid', 'part', 'watchLaterItem'].includes(field)) return scrubIdentifier(value);
+  if (['bvid', 'part', 'watchLaterItem'].includes(field)) return scrubIdentifier(value);
   if (field === 'source' || field === 'previousSource' || field === 'name') return scrubUrl(value);
   if (field === 'bufferedRanges' || field === 'seekableRanges') return safeRangeList(value);
   if (field === 'sourceBufferRanges') return safeSourceBufferRanges(value);

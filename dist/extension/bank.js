@@ -95,7 +95,6 @@
       "origin",
       "pathname",
       "reason",
-      "roomId",
       "bvid",
       "part",
       "watchLaterItem"

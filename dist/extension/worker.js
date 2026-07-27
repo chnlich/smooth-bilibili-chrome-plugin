@@ -102,7 +102,6 @@
       "origin",
       "pathname",
       "reason",
-      "roomId",
       "bvid",
       "part",
       "watchLaterItem"
@@ -326,7 +325,7 @@
       if (typeof value !== "string" || !value.startsWith("/")) return UNKNOWN_VALUE;
       return scrubPathname(value);
     }
-    if (["roomId", "bvid", "part", "watchLaterItem"].includes(field)) return scrubIdentifier(value);
+    if (["bvid", "part", "watchLaterItem"].includes(field)) return scrubIdentifier(value);
     if (field === "source" || field === "previousSource" || field === "name") return scrubUrl(value);
     if (field === "bufferedRanges" || field === "seekableRanges") return safeRangeList(value);
     if (field === "sourceBufferRanges") return safeSourceBufferRanges(value);
@@ -493,7 +492,6 @@
     "routeKind",
     "origin",
     "pathname",
-    "roomId",
     "bvid",
     "part",
     "watchLaterItem"
@@ -519,7 +517,7 @@
     if (!requireTabId && Object.prototype.hasOwnProperty.call(session, "tabId")) {
       throw new Error("页面 session 不得包含 tabId");
     }
-    for (const field of ["roomId", "bvid", "part", "watchLaterItem"]) {
+    for (const field of ["bvid", "part", "watchLaterItem"]) {
       optionalString(session[field], field);
       if (typeof session[field] === "string" && /[?#]/.test(session[field])) {
         throw new Error(`session ${field} 必须没有 query/hash`);

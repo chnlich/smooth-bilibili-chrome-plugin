@@ -313,6 +313,7 @@ assert.deepEqual(BANK_CONFIG, {
 assert.equal(EVENT_CODES.includes('log.persist.result'), true);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
 assert.equal(EVENT_CODES.some((code) => code.startsWith('live.')), false);
+assert.doesNotMatch(source, /\broomId\b/);
 assert.equal(EVENT_CODES.includes('bank.fetch.chunk'), true);
 assert.equal(EVENT_CODES.includes('bank.serve'), true);
 assert.equal(EVENT_CODES.includes('bank.evict'), true);
