@@ -2,4 +2,3 @@ node_modules/
 reports/
 *.log
 .cache/
-artifacts/stall-ab-*/

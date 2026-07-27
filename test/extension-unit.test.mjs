@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
+import { readStoredEvents } from '../scripts/extension-log-pull.mjs';
 import { EXTENSION_MANIFEST, EXTENSION_PREFERENCES, VOD_CONFIG } from '../src/constants.js';
 import {
   BRIDGE_CORE_SYNC_METHODS,
@@ -268,6 +270,53 @@ test('error serialization rejects arbitrary cause objects while keeping safe cau
   const serialized = serializeError(error);
   assert.equal(serialized.code, 'SAFE');
   assert.deepEqual(serialized.cause, { name: 'Cause', message: 'nested' });
+});
+
+test('extension log autopull reads every events page through its snapshot', async () => {
+  const messages = [];
+  let closed = false;
+  const chrome = {
+    runtime: {
+      lastError: undefined,
+      sendMessage(message, callback) {
+        messages.push(message);
+        if (message.type === 'logs:max-event-id') {
+          callback({ ok: true, maxEventId: 12 });
+          return;
+        }
+        if (message.afterEventId === 4) {
+          callback({
+            ok: true,
+            events: [{ eventId: 5 }, { eventId: 8 }],
+            hasMore: true,
+            nextAfterEventId: 8,
+          });
+          return;
+        }
+        assert.equal(message.afterEventId, 8);
+        callback({ ok: true, events: [{ eventId: 12 }], hasMore: false, nextAfterEventId: 12 });
+      },
+    },
+  };
+  const page = {
+    async goto() {},
+    async evaluate(callback, argument) {
+      return runInNewContext(`(${callback.toString()})(${JSON.stringify(argument)})`, { chrome });
+    },
+    async close() { closed = true; },
+  };
+  const result = await readStoredEvents({ newPage: async () => page }, 'extension-id', 4);
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    maxEventId: 12,
+    events: [{ eventId: 5 }, { eventId: 8 }, { eventId: 12 }],
+  });
+  assert.deepEqual(messages.map(({ type }) => type), [
+    'logs:max-event-id',
+    'logs:events-page',
+    'logs:events-page',
+  ]);
+  assert.equal(closed, true);
 });
 
 assert.equal(EXTENSION_PREFERENCES.vodEnabled, 'vodEnabled');
