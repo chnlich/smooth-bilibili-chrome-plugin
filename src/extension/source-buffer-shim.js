@@ -22,7 +22,7 @@ const sourceBufferTracks = new WeakMap();
 const appendErrors = Object.create(null);
 let activeSource;
 
-function findLiveVideoCurrentTime() {
+function findMaxVideoCurrentTime() {
   const videos = [...document.querySelectorAll('video')];
   for (const iframe of document.querySelectorAll('iframe')) {
     try {
@@ -156,7 +156,10 @@ if (typeof SourceBuffer !== 'undefined' && SourceBuffer.prototype && typeof Sour
   const originalRemove = SourceBuffer.prototype.remove;
   SourceBuffer.prototype.remove = function smoothRemove(start, end) {
     stats.removeCalls += 1;
-    const currentTime = findLiveVideoCurrentTime();
+    if (window.location.hostname !== 'live.bilibili.com') {
+      return originalRemove.call(this, start, end);
+    }
+    const currentTime = findMaxVideoCurrentTime();
     const action = computeRetentionAction(currentTime, start, end, RETAIN_SECONDS);
     if (action === null) {
       return originalRemove.call(this, start, end);

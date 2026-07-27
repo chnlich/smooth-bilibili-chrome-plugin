@@ -21,4 +21,4 @@
 
 ## 自动化约束
 
-所有 Playwright/Chromium 自动测试都必须使用 fresh temporary profile、Chromium `--mute-audio`，并在 document-start 对所有媒体安装静音 guard；fixture 也不得产生音频。不得使用用户现有 Chrome profile、登录态或可发声窗口。真实页面验证受匿名页面、登录、编解码器或网络环境阻挡时，必须诚实报告 `BLOCKED` 并保留诊断证据。
+确定性 Playwright/Chromium 浏览器测试必须使用 fresh temporary profile；真实 Bilibili 页面验证使用仓库外的专用持久化 profile，该 profile 可以使用为验证准备的一次性 Bilibili 登录态。不得使用用户日常使用的 Chrome profile。所有自动化浏览器都必须使用 Chromium `--mute-audio`，并在 document-start 对所有媒体安装静音 guard；fixture 也不得产生音频。真实页面验证受匿名页面、登录、编解码器或网络环境阻挡时，必须诚实报告 `BLOCKED` 并保留诊断证据。
