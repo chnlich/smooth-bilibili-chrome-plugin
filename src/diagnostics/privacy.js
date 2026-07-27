@@ -296,7 +296,3 @@ export function resourceTimingFields(entry) {
   }
   return fields;
 }
-
-export function sanitizeResourceTiming(entry) {
-  return sanitizeEventData('resource.observed', resourceTimingFields(entry));
-}

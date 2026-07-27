@@ -104,8 +104,3 @@ export function validateSession(session, { requireTabId = true } = {}) {
   }
   return session;
 }
-
-export function sessionIdentityWithoutTabId(session) {
-  const { tabId: _ignoredTabId, ...copy } = session;
-  return copy;
-}

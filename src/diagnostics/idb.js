@@ -26,15 +26,4 @@ export function openLogDatabase(indexedDbObject = globalThis.indexedDB) {
   });
 }
 
-export function requestResult(request) {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error('IndexedDB 请求失败'));
-  });
-}
-
-export function logStoreNames() {
-  return { DATABASE_NAME, DATABASE_VERSION, SESSION_STORE, EVENT_STORE, EVENT_INDEX };
-}
-
-export { DATABASE_NAME, DATABASE_VERSION, SESSION_STORE, EVENT_STORE, EVENT_INDEX };
+export { SESSION_STORE, EVENT_STORE, EVENT_INDEX };

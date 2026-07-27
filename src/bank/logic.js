@@ -110,16 +110,6 @@ export function partialResponseHeaders(start, end, totalSize) {
   };
 }
 
-export function clipBytes(bytes, sourceStart, requestedStart, requestedEnd) {
-  if (!(bytes instanceof ArrayBuffer)) throw new Error('分片字节必须是 ArrayBuffer');
-  const sourceEnd = sourceStart + bytes.byteLength - 1;
-  if (requestedStart < sourceStart || requestedEnd > sourceEnd) {
-    throw new Error('分片字节不覆盖请求区间');
-  }
-  const offset = requestedStart - sourceStart;
-  return bytes.slice(offset, offset + rangeLength({ start: requestedStart, end: requestedEnd }));
-}
-
 export function planFetchRanges(start, end, {
   chunkBytes = BANK_CONFIG.chunkBytes,
   totalSize,

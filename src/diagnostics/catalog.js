@@ -88,10 +88,6 @@ export function assertEventCode(code) {
   return code;
 }
 
-export function isMediaEventCode(code) {
-  return typeof code === 'string' && code.startsWith('media.');
-}
-
 export const DATA_ALLOWLIST = Object.freeze({
   route: Object.freeze([
     'routeKind',
