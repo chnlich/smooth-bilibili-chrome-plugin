@@ -16,8 +16,8 @@ function session(sessionId, pathname = '/100') {
     startedAt: '2026-07-20T00:00:00.000Z',
     extensionVersion: '1.0.0',
     buildId: 'src-test',
-    routeKind: 'live',
-    origin: 'https://live.bilibili.com',
+    routeKind: 'video',
+    origin: 'https://www.bilibili.com',
     pathname,
   };
 }
@@ -38,7 +38,7 @@ function message(identity, events) {
 }
 
 function sender(tabId, pathname = '/100') {
-  return { tab: { id: tabId }, url: `https://live.bilibili.com${pathname}` };
+  return { tab: { id: tabId }, url: `https://www.bilibili.com${pathname}` };
 }
 
 async function readAllEvents(indexedDb, maxEventId) {

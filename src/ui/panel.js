@@ -2,7 +2,7 @@ import { fail } from '../errors.js';
 
 export const STATUS_MESSAGE_VERSION = 2;
 
-const MODE_LABELS = Object.freeze({ live: '直播', video: '视频' });
+const MODE_LABELS = Object.freeze({ video: '视频' });
 const VIDEO_FIELDS = Object.freeze([
   'mode',
   'state',
@@ -11,24 +11,6 @@ const VIDEO_FIELDS = Object.freeze([
   'effective',
   'error',
 ]);
-const LIVE_FIELDS = Object.freeze([
-  'mode',
-  'paused',
-  'recentFrame',
-  'buffered',
-  'delay',
-  'effective',
-  'resolution',
-  'quality',
-  'speed',
-  'videoReplacements',
-  'sourceReplacements',
-  'recentEvent',
-  'error',
-  'sessionId',
-  'persistence',
-]);
-
 const VIDEO_STATE_LABELS = Object.freeze({
   WAITING: '等待',
   APPLIED: '已应用',
@@ -44,7 +26,6 @@ function displayValue(value) {
 
 function fieldsForMode(mode) {
   if (mode === 'video') return VIDEO_FIELDS;
-  if (mode === 'live') return LIVE_FIELDS;
   fail('UI_MODE_INVALID', `状态 surface 模式未允许: ${mode}`);
 }
 
@@ -129,7 +110,7 @@ export function getCurrentStatusSurface() {
 }
 
 export function createUnavailableStatusSnapshot(routeMode) {
-  const mode = routeMode === 'live' ? 'live' : routeMode === 'video' || routeMode === 'vod' ? 'video' : undefined;
+  const mode = routeMode === 'video' || routeMode === 'vod' ? 'video' : undefined;
   const fields = mode === undefined ? ['mode'] : fieldsForMode(mode);
   return {
     version: STATUS_MESSAGE_VERSION,
@@ -139,4 +120,4 @@ export function createUnavailableStatusSnapshot(routeMode) {
   };
 }
 
-export { LIVE_FIELDS, VIDEO_FIELDS };
+export { VIDEO_FIELDS };

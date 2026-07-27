@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { BANK_CONFIG, EXTENSION_MANIFEST, LIVE_CONFIG, VOD_CONFIG } from '../src/constants.js';
+import { BANK_CONFIG, EXTENSION_MANIFEST, VOD_CONFIG } from '../src/constants.js';
 import { createManifest } from '../src/extension/manifest-source.js';
 import { EVENT_CODES, MEDIA_EVENT_NAMES } from '../src/diagnostics/catalog.js';
 
@@ -120,7 +120,6 @@ const popup = await fs.readFile(path.join(extensionDirectory, 'popup.js'), 'utf8
 const worker = await fs.readFile(path.join(extensionDirectory, 'worker.js'), 'utf8');
 const logs = await fs.readFile(path.join(extensionDirectory, 'logs.js'), 'utf8');
 const vodSource = await fs.readFile(path.join(root, 'src/vod/controller.js'), 'utf8');
-const liveSource = await fs.readFile(path.join(root, 'src/live/observer.js'), 'utf8');
 const passiveMediaSource = await fs.readFile(path.join(root, 'src/diagnostics/passive-media-observer.js'), 'utf8');
 const manifestSource = createManifest();
 const goal = await fs.readFile(path.join(root, 'GOAL.md'), 'utf8');
@@ -132,6 +131,7 @@ assert.equal(manifest.manifest_version, 3);
 assert.equal(manifest.minimum_chrome_version, '120');
 assert.deepEqual(manifest.permissions, ['storage', 'unlimitedStorage']);
 assert.deepEqual(manifest.host_permissions, [...EXTENSION_MANIFEST.hostPermissions]);
+assert.deepEqual(EXTENSION_MANIFEST.matches, ['https://www.bilibili.com/*']);
 assert.deepEqual(manifest.background, { service_worker: 'worker.js' });
 assert.deepEqual(manifest.content_scripts, [
   {
@@ -197,11 +197,9 @@ for (const bundle of ['bank.js', 'controller.js', 'main-bridge.js', 'source-buff
 }
 
 assert.equal(Object.hasOwn(packageMetadata.dependencies || {}, 'hls.js'), false);
-assert.doesNotMatch(source, /hls\.js|HLS_DEPENDENCY|LIVE_STATE|LiveStateMachine/);
-assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /hls\.js|LIVE_STATE|LiveStateMachine/);
-for (const oldModule of ['api', 'controller', 'danmaku', 'fetcher', 'guard', 'hls', 'manifest', 'mse', 'queue', 'state']) {
-  await assert.rejects(fs.access(path.join(root, 'src/live', `${oldModule}.js`)));
-}
+assert.doesNotMatch(source, /hls\.js|HLS_DEPENDENCY/);
+assert.doesNotMatch(`${source}\n${controller}\n${bridge}\n${worker}\n${logs}`, /hls\.js|HLS_DEPENDENCY/);
+await assert.rejects(fs.access(path.join(root, 'src/live')));
 assert.doesNotMatch(bridge, /chrome\./);
 assert.doesNotMatch(bridge, /\b(?:fetch|MediaSource|SourceBuffer)\b/);
 const sourceBufferSourceAllowlist = new Set([
@@ -251,9 +249,6 @@ for (const [bundleName, bundle] of Object.entries({
 })) {
   assert.doesNotMatch(bundle, indexedDbReference, `${bundleName} bundle 不得使用 IndexedDB`);
 }
-assert.doesNotMatch(liveSource, /\b(?:play|pause)\s*\(/);
-assert.doesNotMatch(liveSource, /playbackRate\s*=/);
-assert.doesNotMatch(liveSource, /(?:\.src|\.currentSrc|\.muted|\.volume)\s*=/);
 assert.doesNotMatch(vodSource, /\b(?:play|pause)\s*\(/);
 assert.doesNotMatch(vodSource, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
 assert.doesNotMatch(passiveMediaSource, /\b(?:play|pause)\s*\(/);
@@ -315,21 +310,19 @@ assert.deepEqual(BANK_CONFIG, {
   prefetchDeadlineMs: 20000,
   latencyAlarmCount: 3,
 });
-assert.equal(LIVE_CONFIG.noDecodedFrameStallMilliseconds, 2000);
-assert.equal(LIVE_CONFIG.liveRetainSeconds, 30);
 assert.equal(EVENT_CODES.includes('log.persist.result'), true);
-assert.equal(EVENT_CODES.includes('live.delay_protection.applied'), true);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
-assert.equal(EVENT_CODES.includes('live.delay.unavailable'), true);
-assert.equal(EVENT_CODES.includes('live.buffer.retained'), true);
+assert.equal(EVENT_CODES.some((code) => code.startsWith('live.')), false);
 assert.equal(EVENT_CODES.includes('bank.fetch.chunk'), true);
 assert.equal(EVENT_CODES.includes('bank.serve'), true);
 assert.equal(EVENT_CODES.includes('bank.evict'), true);
 assert.equal(EVENT_CODES.includes('bank.store'), true);
 assert.equal(EVENT_CODES.includes('bank.disabled'), true);
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
-assert.match(bridgeContractSource, /setChasingFrameThreshold/);
-assert.doesNotMatch(`${liveSource}\n${shim}`, /bank\.|segment-bank|BANK_MESSAGE/);
+assert.doesNotMatch(bridgeContractSource, /BRIDGE_LIVE|setChasingFrameThreshold|getLiveCapabilitySnapshot|disableLiveAutoCatchup/);
+assert.doesNotMatch(shim, /adjustedEnd|dispatchEvent\s*\(/);
+assert.match(shim, /return originalRemove\.call\(this, start, end\)/);
+assert.doesNotMatch(shim, /intercepted|lastReason|lastCurrentTime|lastRemoveStart|lastRemoveEnd|lastOriginalEnd/);
 assert.doesNotMatch(bank, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);
 assert.doesNotMatch(bank, /\b(?:play|pause)\s*\(/);
 for (const mediaEvent of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${mediaEvent}`));
@@ -351,7 +344,8 @@ assert.match(readme, /GOAL\.md/);
 assert.match(readme, /\/list\/watchlater\*/);
 assert.match(source, /\/list\/watchlater/);
 assert.match(goal, /视频[\s\S]*120 秒/);
-assert.match(goal, /直播[\s\S]*卡顿[\s\S]*延迟/);
+assert.match(goal, /直播功能已从扩展移除[\s\S]*不再是产品目标/);
+assert.match(goal, /live\.bilibili\.com/);
 assert.match(goal, /用户[\s\S]*控制/);
 assert.match(goal, /完整结构化日志/);
 assert.match(goal, /--mute-audio/);

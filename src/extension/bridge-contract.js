@@ -2,26 +2,12 @@ export const BRIDGE_VERSION = 1;
 export const BRIDGE_REQUEST_EVENT = 'bilibili-buffer:bridge-request-v1';
 export const BRIDGE_RESPONSE_EVENT = 'bilibili-buffer:bridge-response-v1';
 export const BRIDGE_RESPONSE_ATTRIBUTE = 'data-bilibili-buffer-bridge-response-v1';
-export const SHIM_OBSERVATION_ATTRIBUTE = 'data-bilibili-buffer-shim-observation';
-export const SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = 'data-bilibili-buffer-shim-seq';
 export const SHIM_DIAGNOSTIC_ATTRIBUTE = 'data-bilibili-buffer-shim-diagnostics';
 
 export const BRIDGE_OPERATIONS = Object.freeze([
   'getCoreSnapshot',
   'callCoreSync',
-  'getLiveCapabilitySnapshot',
-  'disableLiveAutoCatchup',
 ]);
-
-export const BRIDGE_LIVE_METHODS = Object.freeze([
-  'setChasingFrameThreshold',
-]);
-
-// 探测证实真实 Bilibili 直播播放器的自动追赶关闭杠杆是 setChasingFrameThreshold，
-// 它接受一个数值阈值（放大以容忍更大延迟、换取缓存）。
-export const BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
-  setChasingFrameThreshold: 600,
-});
 
 export const BRIDGE_CORE_SYNC_METHODS = Object.freeze(['setStableBufferTime']);
 

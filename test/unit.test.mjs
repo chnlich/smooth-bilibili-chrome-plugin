@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LIVE_CONFIG, VOD_CONFIG } from '../src/constants.js';
+import { VOD_CONFIG } from '../src/constants.js';
 import { serializeError } from '../src/extension/bridge-contract.js';
-import { LiveObserver } from '../src/live/observer.js';
 import { ExtensionCoordinator } from '../src/extension/controller.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
-import { computeRetentionAction } from '../src/live/buffer-retention.js';
 import { VodBufferController } from '../src/vod/controller.js';
 import { DiagnosticsClient, createRouteIdentity } from '../src/diagnostics/client.js';
 import { MediaEventRecorder, readMediaFacts } from '../src/diagnostics/media.js';
@@ -128,33 +126,6 @@ function eventDocument(video) {
   };
 }
 
-function timelineControl(attributes = {}) {
-  return {
-    tagName: 'input',
-    type: 'range',
-    parentElement: null,
-    getAttribute(name) {
-      return Object.hasOwn(attributes, name) ? attributes[name] : null;
-    },
-    ...attributes,
-  };
-}
-
-function runtimeWithIntervals() {
-  const callbacks = [];
-  return {
-    performance: { now: () => 1000 },
-    setInterval(callback) {
-      callbacks.push(callback);
-      return callback;
-    },
-    clearInterval() {},
-    setTimeout() { return 1; },
-    clearTimeout() {},
-    callbacks,
-  };
-}
-
 function diagnosticsRecorder() {
   return {
     events: [],
@@ -164,8 +135,8 @@ function diagnosticsRecorder() {
   };
 }
 
-function coordinatorFixture({ mode = 'video', diagnostics = diagnosticsRecorder(), enabled = false } = {}) {
-  const video = mediaVideo(`https://media.example/${mode}-passive-1`);
+function coordinatorFixture({ diagnostics = diagnosticsRecorder(), enabled = false } = {}) {
+  const video = mediaVideo('https://media.example/video-passive-1');
   const documentObject = eventDocument(video);
   const callbacks = [];
   const runtimeObject = {
@@ -177,9 +148,11 @@ function coordinatorFixture({ mode = 'video', diagnostics = diagnosticsRecorder(
     setTimeout() { return 1; },
     clearTimeout() {},
   };
-  const location = mode === 'live'
-    ? { href: 'https://live.bilibili.com/123', hostname: 'live.bilibili.com', pathname: '/123' }
-    : { href: 'https://www.bilibili.com/video/BVpassive', hostname: 'www.bilibili.com', pathname: '/video/BVpassive' };
+  const location = {
+    href: 'https://www.bilibili.com/video/BVpassive',
+    hostname: 'www.bilibili.com',
+    pathname: '/video/BVpassive',
+  };
   const bridgeClient = {
     destroy() {},
     callAsync() { throw new Error('被动诊断不得调用 bridge'); },
@@ -190,7 +163,7 @@ function coordinatorFixture({ mode = 'video', diagnostics = diagnosticsRecorder(
     runtimeObject,
     storage: {
       async get() {
-        return { liveEnabled: enabled, vodEnabled: enabled };
+        return { vodEnabled: enabled };
       },
     },
     bridgeClient,
@@ -467,44 +440,42 @@ test('video controller reports zero native buffer when current time has no cover
   fixture.controller.destroy();
 });
 
-test('disabled video and live routes passively record media without media or bridge ownership', async () => {
-  for (const mode of ['video', 'live']) {
-    const diagnostics = diagnosticsRecorder();
-    let availableCount = 0;
-    let noVideoPending = true;
-    diagnostics.markVideoAvailable = () => {
-      availableCount += 1;
-      noVideoPending = false;
-    };
-    diagnostics.destroy = () => {};
-    const fixture = coordinatorFixture({ mode, diagnostics });
-    const ownership = nativeOwnership(fixture.video);
+test('disabled video route passively records media without media or bridge ownership', async () => {
+  const diagnostics = diagnosticsRecorder();
+  let availableCount = 0;
+  let noVideoPending = true;
+  diagnostics.markVideoAvailable = () => {
+    availableCount += 1;
+    noVideoPending = false;
+  };
+  diagnostics.destroy = () => {};
+  const fixture = coordinatorFixture({ diagnostics });
+  const ownership = nativeOwnership(fixture.video);
 
-    await fixture.coordinator.start();
-    assert.equal(fixture.coordinator.active.controller, undefined);
-    assert.notEqual(fixture.coordinator.active.passiveObserver, undefined);
-    assert.equal(availableCount, 1);
-    assert.equal(noVideoPending, false);
-    assert.equal(diagnostics.events.filter((event) => event.code === 'media.sample').length, 1);
-    fixture.video.emit('playing');
-    assert.equal(diagnostics.events.filter((event) => event.code === 'media.playing').length, 1);
-    assert.deepEqual(nativeOwnership(fixture.video), ownership);
+  await fixture.coordinator.start();
+  assert.equal(fixture.coordinator.active.controller, undefined);
+  assert.notEqual(fixture.coordinator.active.passiveObserver, undefined);
+  assert.equal(availableCount, 1);
+  assert.equal(noVideoPending, false);
+  assert.equal(diagnostics.events.filter((event) => event.code === 'media.sample').length, 1);
+  fixture.video.emit('playing');
+  assert.equal(diagnostics.events.filter((event) => event.code === 'media.playing').length, 1);
+  assert.deepEqual(nativeOwnership(fixture.video), ownership);
 
-    fixture.video.src = `https://media.example/${mode}-passive-2`;
-    fixture.video.currentSrc = fixture.video.src;
-    fixture.coordinator.active.passiveObserver.reconcile();
-    const replacement = diagnostics.events.find((event) => event.code === 'video.source_replaced');
-    assert.equal(replacement.context.videoInstance, 1);
-    assert.equal(replacement.context.sourceInstance, 2);
-    assert.equal(fixture.video.playCalls, 0);
-    assert.equal(fixture.video.pauseCalls, 0);
-    assert.deepEqual(fixture.video.assignments, []);
+  fixture.video.src = 'https://media.example/video-passive-2';
+  fixture.video.currentSrc = fixture.video.src;
+  fixture.coordinator.active.passiveObserver.reconcile();
+  const replacement = diagnostics.events.find((event) => event.code === 'video.source_replaced');
+  assert.equal(replacement.context.videoInstance, 1);
+  assert.equal(replacement.context.sourceInstance, 2);
+  assert.equal(fixture.video.playCalls, 0);
+  assert.equal(fixture.video.pauseCalls, 0);
+  assert.deepEqual(fixture.video.assignments, []);
 
-    await fixture.coordinator.destroy();
-    const eventCount = diagnostics.events.length;
-    fixture.video.emit('timeupdate');
-    assert.equal(diagnostics.events.length, eventCount);
-  }
+  await fixture.coordinator.destroy();
+  const eventCount = diagnostics.events.length;
+  fixture.video.emit('timeupdate');
+  assert.equal(diagnostics.events.length, eventCount);
 });
 
 test('a failed controller boot falls back to passive diagnostics after destroying the partial controller', async () => {
@@ -524,508 +495,6 @@ test('a failed controller boot falls back to passive diagnostics after destroyin
   assert.ok(diagnostics.events.some((event) => event.code === 'extension.boot_error'));
   assert.ok(diagnostics.events.some((event) => event.code === 'media.sample'));
   await fixture.coordinator.destroy();
-});
-
-test('native live observer does not touch playback before a genuine post-frame stall', async () => {
-  const video = mediaVideo('https://media.example/live-1');
-  const documentObject = eventDocument(video);
-  const runtimeObject = runtimeWithIntervals();
-  const diagnostics = diagnosticsRecorder();
-  let capabilityChecks = 0;
-  let disableCalls = 0;
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject,
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics,
-    pageAdapter: {
-      refreshLiveCapabilities() {
-        capabilityChecks += 1;
-        return Promise.resolve({
-          supportsDisableAutoCatchup: () => false,
-          disableAutoCatchup: async () => { disableCalls += 1; },
-        });
-      },
-    },
-    config: { ...LIVE_CONFIG, noDecodedFrameStallMilliseconds: 2000 },
-  });
-  observer.start();
-  video.emit('waiting');
-  assert.equal(capabilityChecks, 0);
-  assert.equal(video.playCalls, 0);
-  assert.equal(video.pauseCalls, 0);
-  assert.deepEqual(video.assignments, []);
-
-  video.emit('loadeddata');
-  video.emit('waiting');
-  await tick();
-  assert.equal(capabilityChecks, 1);
-  assert.equal(disableCalls, 0);
-  assert.equal(video.playCalls, 0);
-  assert.equal(video.pauseCalls, 0);
-  assert.deepEqual(video.assignments, []);
-  assert.ok(diagnostics.events.some((event) => event.code === 'live.stall.detected'));
-  observer.destroy();
-});
-
-test('a normal video without requestVideoFrameCallback does not arm a no-frame stall', () => {
-  const video = mediaVideo('https://media.example/live-no-rvfc');
-  const documentObject = eventDocument(video);
-  let milliseconds = 0;
-  const runtimeObject = {
-    performance: { now: () => milliseconds },
-    setInterval() { return 1; },
-    clearInterval() {},
-  };
-  let capabilityChecks = 0;
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject,
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: {
-      refreshLiveCapabilities() {
-        capabilityChecks += 1;
-        return Promise.resolve({ supportsDisableAutoCatchup: () => false });
-      },
-    },
-    config: { ...LIVE_CONFIG, noDecodedFrameStallMilliseconds: 2000 },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  milliseconds = 3000;
-  observer.sample();
-  assert.equal(observer.activeStall, undefined);
-  assert.equal(capabilityChecks, 0);
-  assert.deepEqual(video.assignments, []);
-  observer.destroy();
-});
-
-test('a trusted timeline pointerdown records user seek authorization without cancelling protection by itself', async () => {
-  const video = mediaVideo('https://media.example/live-2');
-  const documentObject = eventDocument(video);
-  const runtimeObject = runtimeWithIntervals();
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject,
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  documentObject.emit('pointerdown', {
-    type: 'pointerdown',
-    isTrusted: true,
-    target: timelineControl({ id: 'seek', 'data-seek': '' }),
-  });
-  assert.ok(observer.userSeekAuthorization !== undefined);
-  assert.ok(observer.activeStall !== undefined);
-  video.emit('loadeddata');
-  observer.destroy();
-});
-
-test('a trusted timeline input cancels protection before its seeking event', () => {
-  const video = mediaVideo('https://media.example/live-input-seek');
-  const documentObject = eventDocument(video);
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  documentObject.emit('input', {
-    type: 'input',
-    isTrusted: true,
-    target: timelineControl({ id: 'timeline', 'data-seek': '' }),
-  });
-  assert.equal(observer.activeStall, undefined);
-  assert.equal(observer.delayProtection, undefined);
-  assert.equal(observer.awaitingUserSeekFrame, true);
-  video.emit('seeking');
-  video.emit('loadeddata');
-  assert.equal(observer.awaitingUserSeekFrame, false);
-  observer.destroy();
-});
-
-test('live source replacement corrects only active protection and preserves the target when possible', () => {
-  const video = mediaVideo('https://media.example/live-3');
-  const documentObject = eventDocument(video);
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  video.assignments.length = 0;
-  video.currentSrc = 'https://media.example/live-4';
-  video.src = video.currentSrc;
-  video.currentTime = 90;
-  observer.sample();
-  assert.deepEqual(video.assignments, [90, 10]);
-
-  const normal = mediaVideo('https://media.example/live-5');
-  const normalObserver = new LiveObserver({
-    documentObject: eventDocument(normal),
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: normal,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  normalObserver.start();
-  normal.assignments.length = 0;
-  normal.currentSrc = 'https://media.example/live-6';
-  normal.src = normal.currentSrc;
-  normalObserver.sample();
-  assert.deepEqual(normal.assignments, []);
-  observer.destroy();
-  normalObserver.destroy();
-});
-
-test('a normal source replacement cannot use the previous source frame to arm a stall', () => {
-  const video = mediaVideo('https://media.example/live-normal-replacement-old');
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  assert.equal(observer.hasDecodedFrame, true);
-
-  video.currentSrc = 'https://media.example/live-normal-replacement-new';
-  video.src = video.currentSrc;
-  video.emit('waiting');
-
-  assert.equal(observer.hasDecodedFrame, false);
-  assert.equal(observer.activeStall, undefined);
-  observer.destroy();
-});
-
-test('live visual cover appears only for an active-stall media gap', () => {
-  const video = mediaVideo('https://media.example/live-cover-old');
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  assert.notEqual(observer.activeStall, undefined);
-
-  let coverCalls = 0;
-  observer.showOverlay = () => { coverCalls += 1; };
-  video.currentSrc = 'https://media.example/live-cover-new';
-  video.src = video.currentSrc;
-  observer.sample();
-  assert.equal(coverCalls, 1);
-
-  video.currentSrc = '';
-  video.src = '';
-  observer.sample();
-  assert.equal(coverCalls, 2);
-  video.emit('emptied');
-  assert.equal(coverCalls, 3);
-
-  observer.bindVideo(mediaVideo('https://media.example/live-cover-replacement'));
-  assert.equal(coverCalls, 4);
-  observer.destroy();
-});
-
-test('a decoded callback from a removed stalled video cannot clear current-stall protection', () => {
-  const video = mediaVideo('https://media.example/live-removed-frame');
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  assert.notEqual(observer.activeStall, undefined);
-
-  video.isConnected = false;
-  observer.onDecodedFrame(video);
-  assert.notEqual(observer.activeStall, undefined);
-  assert.equal(observer.delayProtection, undefined);
-  observer.destroy();
-});
-
-test('a repeated media-time callback is not a real live-stall recovery frame', () => {
-  const video = mediaVideo('https://media.example/live-repeated-frame');
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  observer.onDecodedFrame(video, { mediaTime: 10 });
-  video.emit('waiting');
-  assert.notEqual(observer.activeStall, undefined);
-
-  observer.onDecodedFrame(video, { mediaTime: 10 });
-  assert.notEqual(observer.activeStall, undefined);
-  observer.onDecodedFrame(video, { mediaTime: 10.01 });
-  assert.equal(observer.activeStall, undefined);
-  observer.destroy();
-});
-
-test('live replacement rebases an unavailable protected time and skips cleared sources', () => {
-  const video = mediaVideo('https://media.example/live-rebase-old');
-  const diagnostics = diagnosticsRecorder();
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics,
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  video.seekable = ranges([[100, 120]]);
-  video.currentSrc = 'https://media.example/live-rebase-new';
-  video.src = video.currentSrc;
-  video.assignments.length = 0;
-  video.currentTime = 115;
-  observer.sample();
-  assert.deepEqual(video.assignments, [115, 100]);
-  assert.equal(observer.activeStall.protectedDelay, 20);
-  assert.equal(
-    diagnostics.events.find((event) => event.code === 'live.delay.corrected').data.currentTime,
-    115,
-  );
-
-  video.currentSrc = '';
-  video.src = '';
-  video.currentTime = 110;
-  video.assignments.length = 0;
-  observer.sample();
-  assert.deepEqual(video.assignments, []);
-  observer.destroy();
-});
-
-test('live protection is continuous in readable delay and never follows an old absolute time', () => {
-  const video = mediaVideo('https://media.example/live-delay-continuity');
-  video.currentTime = 90;
-  const documentObject = eventDocument(video);
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  assert.equal(observer.activeStall.protectedDelay, 30);
-
-  video.seekable = ranges([[0, 125]]);
-  video.currentTime = 90;
-  observer.onDecodedFrame(video);
-  assert.equal(observer.activeStall, undefined);
-  assert.equal(observer.delayProtection.protectedDelay, 35);
-
-  video.seekable = ranges([[100, 200]]);
-  video.currentTime = 165;
-  video.assignments.length = 0;
-  observer.onDecodedFrame(video);
-  assert.deepEqual(video.assignments, []);
-  observer.destroy();
-});
-
-test('a frozen seekable range grows the protected target from the monotonic stall clock', () => {
-  let milliseconds = 1000;
-  const video = mediaVideo('https://media.example/live-frozen-seekable');
-  video.currentTime = 90;
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: {
-      performance: { now: () => milliseconds },
-      setInterval() { return 1; },
-      clearInterval() {},
-    },
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  assert.equal(observer.activeStall.delayBeforeStall, 30);
-
-  milliseconds = 4250;
-  observer.sample();
-  assert.ok(observer.activeStall.targetDelay >= 33.2 && observer.activeStall.targetDelay <= 33.3);
-
-  milliseconds = 5000;
-  video.currentTime = 86;
-  observer.onDecodedFrame(video);
-  assert.equal(observer.activeStall, undefined);
-  assert.ok(observer.delayProtection.protectedDelay >= 33.9 && observer.delayProtection.protectedDelay <= 34.1);
-  observer.destroy();
-});
-
-test('recovery clears the current stall, a second stall gets a new D and T, and rate changes rebase observed delay', () => {
-  let milliseconds = 1000;
-  const video = mediaVideo('https://media.example/live-repeat-stall');
-  video.currentTime = 90;
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: {
-      performance: { now: () => milliseconds },
-      setInterval() { return 1; },
-      clearInterval() {},
-    },
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-  milliseconds = 3000;
-  video.currentTime = 88;
-  observer.onDecodedFrame(video);
-  assert.equal(observer.activeStall, undefined);
-  assert.equal(observer.delayProtection.protectedDelay, 32);
-
-  milliseconds = 4000;
-  video.emit('waiting');
-  assert.equal(observer.activeStall.delayBeforeStall, 32);
-  milliseconds = 7000;
-  video.currentTime = 85;
-  observer.onDecodedFrame(video);
-  assert.equal(observer.activeStall, undefined);
-  assert.equal(observer.delayProtection.protectedDelay, 35);
-
-  video.playbackRate = 2;
-  video.currentTime = 100;
-  observer.onDecodedFrame(video);
-  assert.equal(observer.delayProtection.protectedDelay, 20);
-  observer.destroy();
-});
-
-test('a genuine waiting immediately after automatic correction starts a new stall', () => {
-  let milliseconds = 1000;
-  const video = mediaVideo('https://media.example/live-corrected-repeat-stall');
-  video.currentTime = 90;
-  const observer = new LiveObserver({
-    documentObject: eventDocument(video),
-    windowObject: {},
-    runtimeObject: {
-      performance: { now: () => milliseconds },
-      setInterval() { return 1; },
-      clearInterval() {},
-    },
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  video.emit('loadeddata');
-  video.emit('waiting');
-
-  milliseconds = 3000;
-  video.currentTime = 100;
-  observer.onDecodedFrame(video);
-  assert.notEqual(observer.lastCorrection, undefined);
-  assert.equal(observer.delayProtection.protectedDelay, 32);
-
-  video.emit('waiting');
-  assert.equal(observer.activeStall.delayBeforeStall, 32);
-  observer.destroy();
-});
-
-test('tainted pixel reads preserve a successfully drawn memory frame without persisting pixels', () => {
-  const video = mediaVideo('https://media.example/live-tainted');
-  const appended = [];
-  video.parentElement = { append(canvas) { appended.push(canvas); } };
-  const frameContext = {
-    drawImage() {},
-    getImageData() { throw Object.assign(new Error('canvas is origin tainted'), { name: 'SecurityError' }); },
-  };
-  const documentObject = {
-    ...eventDocument(video),
-    createElement(name) {
-      if (name === 'canvas') {
-        return {
-          width: 0,
-          height: 0,
-          style: {},
-          setAttribute() {},
-          getContext() { return frameContext; },
-          remove() {},
-        };
-      }
-      throw new Error(`unexpected element ${name}`);
-    },
-  };
-  const observer = new LiveObserver({
-    documentObject,
-    windowObject: {},
-    runtimeObject: runtimeWithIntervals(),
-    initialVideo: video,
-    panel: { setModel() {} },
-    diagnostics: diagnosticsRecorder(),
-    pageAdapter: { refreshLiveCapabilities: async () => ({ supportsDisableAutoCatchup: () => false }) },
-  });
-  observer.start();
-  observer.onDecodedFrame(video);
-  assert.notEqual(observer.frameCanvas, undefined);
-  video.emit('waiting');
-  observer.showOverlay();
-  assert.equal(observer.overlayCanvas, appended[0]);
-  assert.equal(observer.overlayCanvas.style.pointerEvents, 'none');
-  observer.destroy();
 });
 
 test('every catalog media event records its own eventType while samples remain sample', () => {
@@ -1134,7 +603,7 @@ test('media attribution fields pass through the existing privacy path', () => {
           sourceBufferRanges: [{ track: 'video', ranges: [{ start: 0, end: 80 }] }],
           mediaSourceState: 'open',
           appendErrors: { QuotaExceededError: 2 },
-          removeStats: { removeCalls: 7, intercepted: 3 },
+          removeStats: { removeCalls: 7 },
         });
       },
     },
@@ -1145,7 +614,7 @@ test('media attribution fields pass through the existing privacy path', () => {
   assert.deepEqual(sanitized.sourceBufferRanges, [{ track: 'video', ranges: [{ start: 0, end: 80 }] }]);
   assert.equal(sanitized.mediaSourceState, 'open');
   assert.deepEqual(sanitized.appendErrors, { QuotaExceededError: 2 });
-  assert.deepEqual(sanitized.removeStats, { removeCalls: 7, intercepted: 3 });
+  assert.deepEqual(sanitized.removeStats, { removeCalls: 7 });
 });
 
 test('watch-later route identity preserves the real item and omits an absent item', () => {
@@ -1535,30 +1004,4 @@ test('resource timing omits non-media and unknown resource names while retaining
   assert.equal(JSON.stringify(resourceEvents).includes('account'), false);
   assert.equal(JSON.stringify(resourceEvents).includes('cookie'), false);
   client.destroy();
-});
-
-test('computeRetentionAction 放行保留窗口之前的驱逐', () => {
-  assert.equal(computeRetentionAction(100, 0, 60, 30), null);
-  assert.equal(computeRetentionAction(100, 0, 70, 30), null);
-  assert.equal(computeRetentionAction(100, 50, 70, 30), null);
-});
-
-test('computeRetentionAction 跳过完全在保留窗口内的驱逐', () => {
-  const result = computeRetentionAction(100, 75, 95, 30);
-  assert.deepEqual(result, { action: 'skipped', adjustedEnd: undefined });
-});
-
-test('computeRetentionAction 截断跨越保留窗口边界的驱逐', () => {
-  const result = computeRetentionAction(100, 60, 90, 30);
-  assert.deepEqual(result, { action: 'truncated', adjustedEnd: 70 });
-});
-
-test('computeRetentionAction 对无效输入放行', () => {
-  assert.equal(computeRetentionAction(undefined, 0, 60, 30), null);
-  assert.equal(computeRetentionAction(0, 0, 60, 30), null);
-  assert.equal(computeRetentionAction(NaN, 0, 60, 30), null);
-  assert.equal(computeRetentionAction(100, NaN, 60, 30), null);
-  assert.equal(computeRetentionAction(100, 0, NaN, 30), null);
-  assert.equal(computeRetentionAction(100, 60, 60, 30), null);
-  assert.equal(computeRetentionAction(100, 70, 60, 30), null);
 });

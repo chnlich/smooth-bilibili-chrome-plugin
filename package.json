@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Bilibili native video buffering and live delay continuity Manifest V3 extension",
+  "description": "Bilibili native video buffering Manifest V3 extension",
   "scripts": {
     "build": "node scripts/build.mjs",
     "test:unit": "node --test test/unit.test.mjs test/extension-unit.test.mjs test/idb-unit.test.mjs test/source-buffer-shim-unit.test.mjs test/bank-unit.test.mjs",

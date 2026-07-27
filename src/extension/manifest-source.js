@@ -5,7 +5,7 @@ export function createManifest() {
     manifest_version: EXTENSION_MANIFEST.manifestVersion,
     name: 'Bilibili 桌面网页抗卡',
     version: VERSION,
-    description: '直播原生播放延迟连续性与视频原生 120 秒缓存提示增强',
+    description: '视频原生 120 秒缓存提示增强',
     minimum_chrome_version: EXTENSION_MANIFEST.minimumChromeVersion,
     permissions: ['storage', 'unlimitedStorage'],
     host_permissions: [...EXTENSION_MANIFEST.hostPermissions],

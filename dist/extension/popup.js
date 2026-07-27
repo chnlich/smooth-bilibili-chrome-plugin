@@ -4,13 +4,11 @@
     manifestVersion: 3,
     minimumChromeVersion: "120",
     matches: Object.freeze([
-      "https://live.bilibili.com/*",
       "https://www.bilibili.com/*"
     ]),
     hostPermissions: Object.freeze([])
   });
   var EXTENSION_PREFERENCES = Object.freeze({
-    liveEnabled: "liveEnabled",
     vodEnabled: "vodEnabled"
   });
   var VOD_CONFIG = Object.freeze({
@@ -25,14 +23,6 @@
     prefetchDeadlineMs: 2e4,
     latencyAlarmCount: 3
   });
-  var LIVE_CONFIG = Object.freeze({
-    noDecodedFrameStallMilliseconds: 2e3,
-    userSeekAuthorizationMilliseconds: 1e3,
-    correctionToleranceSeconds: 2.5,
-    statusRefreshMilliseconds: 500,
-    delayUnavailableCheckMilliseconds: 5e3,
-    liveRetainSeconds: 30
-  });
 
   // src/diagnostics/log-session.js
   var UNKNOWN_SESSION_ID = "未提供";
@@ -45,23 +35,6 @@
   var MESSAGE_VERSION = 2;
   var PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
   var VIDEO_FIELDS = Object.freeze(["mode", "state", "buffered", "target", "effective", "error"]);
-  var LIVE_FIELDS = Object.freeze([
-    "mode",
-    "paused",
-    "recentFrame",
-    "buffered",
-    "delay",
-    "effective",
-    "resolution",
-    "quality",
-    "speed",
-    "videoReplacements",
-    "sourceReplacements",
-    "recentEvent",
-    "error",
-    "sessionId",
-    "persistence"
-  ]);
   var statusElement = document.querySelector("[data-status]");
   var inputs = new Map(
     PREFERENCES.map((name) => [name, document.querySelector(`input[data-preference="${name}"]`)])
@@ -71,18 +44,12 @@
     return value === void 0 || value === null || value === "" ? "未提供" : String(value);
   }
   function fieldsForSnapshot(snapshot) {
-    return snapshot?.mode === "直播" ? LIVE_FIELDS : VIDEO_FIELDS;
+    return VIDEO_FIELDS;
   }
   function renderSnapshot(snapshot) {
     const values = snapshot || {};
     const fields = fieldsForSnapshot(values);
-    const live = values.mode === "直播";
-    for (const row of document.querySelectorAll("[data-mode-only]")) {
-      row.hidden = row.dataset.modeOnly !== (live ? "live" : values.mode === "视频" ? "video" : "none");
-    }
-    for (const row of document.querySelectorAll('[data-live-only="true"]')) row.hidden = !live;
-    for (const row of document.querySelectorAll('[data-video-only="true"]')) row.hidden = live;
-    for (const field of /* @__PURE__ */ new Set([...VIDEO_FIELDS, ...LIVE_FIELDS])) {
+    for (const field of VIDEO_FIELDS) {
       const element = document.querySelector(`[data-status-field="${field}"]`);
       if (element !== null) element.textContent = fields.includes(field) ? displayValue(values[field]) : "未提供";
     }

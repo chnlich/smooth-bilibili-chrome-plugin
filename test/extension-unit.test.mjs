@@ -5,15 +5,13 @@ import { readStoredEvents } from '../scripts/extension-log-pull.mjs';
 import { EXTENSION_MANIFEST, EXTENSION_PREFERENCES, VOD_CONFIG } from '../src/constants.js';
 import {
   BRIDGE_CORE_SYNC_METHODS,
-  BRIDGE_LIVE_METHODS,
   BRIDGE_OPERATIONS,
   serializeError,
 } from '../src/extension/bridge-contract.js';
-import { BridgeCore, LiveCapabilities } from '../src/extension/bridge-client.js';
+import { BridgeCore } from '../src/extension/bridge-client.js';
 import { createManifest } from '../src/extension/manifest-source.js';
 import { installPopupMessageHandler, isVideoPage, isVodPage, modeForLocation } from '../src/extension/controller.js';
 import { createStatusPanel, createUnavailableStatusSnapshot, STATUS_MESSAGE_VERSION } from '../src/ui/panel.js';
-import { createSessionIdentity, validateSession } from '../src/diagnostics/session.js';
 import { logSessionFragment, sessionIdFromHash } from '../src/diagnostics/log-session.js';
 import { assertAppendSessionPolicy, isSessionWithinEventCutoff, readLogs } from '../src/diagnostics/worker.js';
 
@@ -53,31 +51,9 @@ test('video route selection has one behavior for video and Watch Later only', ()
     assert.equal(isVideoPage(location(url)), false);
     assert.equal(modeForLocation(location(url)), undefined);
   }
-  assert.equal(modeForLocation(location('https://live.bilibili.com/123')), 'live');
 });
 
-test('status panel exposes only direct facts and no playback or recovery actions', () => {
-  const panel = createStatusPanel({}, 'live');
-  panel.setModel({
-    mode: '直播',
-    paused: '否',
-    recentFrame: '是',
-    buffered: 8,
-    delay: 12,
-    resolution: '1280×720',
-    speed: '1×',
-    videoReplacements: 1,
-    sourceReplacements: 2,
-    recentEvent: 'playing',
-  });
-  const snapshot = panel.getSnapshot();
-  assert.equal(snapshot.version, STATUS_MESSAGE_VERSION);
-  assert.equal(snapshot.mode, '直播');
-  assert.equal(Object.hasOwn(snapshot, 'actions'), false);
-  assert.equal(Object.hasOwn(snapshot, 'stage'), false);
-  assert.equal(Object.hasOwn(snapshot, 'state'), false);
-  panel.destroy();
-
+test('status panel exposes only direct video facts and no playback or recovery actions', () => {
   const unavailable = createUnavailableStatusSnapshot('video');
   assert.equal(unavailable.mode, '视频');
   assert.equal(unavailable.target, '未提供');
@@ -157,27 +133,20 @@ test('popup diagnostics session request is a fixed narrow message and never expa
   panel.destroy();
 });
 
-test('bridge contract allows only native video hint and narrow live capability operations', () => {
+test('bridge contract allows only the native video hint operations', () => {
   assert.deepEqual(BRIDGE_CORE_SYNC_METHODS, ['setStableBufferTime']);
-  assert.deepEqual(BRIDGE_LIVE_METHODS, ['setChasingFrameThreshold']);
   assert.deepEqual(BRIDGE_OPERATIONS, [
     'getCoreSnapshot',
     'callCoreSync',
-    'getLiveCapabilitySnapshot',
-    'disableLiveAutoCatchup',
   ]);
 });
 
-test('BridgeCore preserves stale-generation errors and LiveCapabilities calls only once', async () => {
+test('BridgeCore preserves stale-generation errors', () => {
   const calls = [];
   const client = {
     callSync(operation, args) {
       calls.push({ operation, args });
       throw Object.assign(new Error('stale'), { code: 'BRIDGE_CORE_STALE' });
-    },
-    callAsync(operation) {
-      calls.push({ operation });
-      return Promise.resolve(true);
     },
   };
   const core = new BridgeCore(client, {
@@ -187,28 +156,6 @@ test('BridgeCore preserves stale-generation errors and LiveCapabilities calls on
   });
   assert.throws(() => core.setStableBufferTime(120), (error) => error.code === 'BRIDGE_CORE_STALE');
   assert.throws(() => core.setStableBufferTime(120), (error) => error.code === 'BRIDGE_CORE_STALE');
-  const capabilities = new LiveCapabilities(client, { live: { disableAutoCatchup: true } });
-  await capabilities.disableAutoCatchup();
-  await assert.rejects(() => capabilities.disableAutoCatchup(), (error) => error.code === 'LIVE_AUTO_CATCHUP_ALREADY_ATTEMPTED');
-  assert.equal(calls.filter((call) => call.operation === 'disableLiveAutoCatchup').length, 1);
-});
-
-test('session identity omits page tab id and keeps route identity fields', () => {
-  const session = createSessionIdentity({
-    locationObject: {
-      origin: 'https://live.bilibili.com',
-      pathname: '/6363772?foo=secret',
-    },
-    routeKind: 'live',
-    runtimeObject: {},
-    sessionId: 'session-fixed',
-    roomId: 6363772,
-  });
-  assert.equal(session.tabId, undefined);
-  assert.equal(session.pathname, '/6363772');
-  assert.equal(session.roomId, '6363772');
-  assert.doesNotThrow(() => validateSession(session, { requireTabId: false }));
-  assert.throws(() => validateSession({ ...session, tabId: 3 }, { requireTabId: false }));
 });
 
 test('diagnostic sender policy allows only stored same-origin SPA session transitions', () => {
@@ -233,7 +180,7 @@ test('diagnostic sender policy allows only stored same-origin SPA session transi
   );
   assert.doesNotThrow(() => assertAppendSessionPolicy({ ...session }, session, newRouteSender));
   assert.throws(
-    () => assertAppendSessionPolicy({ ...session }, session, { tab: { id: 7 }, url: 'https://live.bilibili.com/1' }),
+    () => assertAppendSessionPolicy({ ...session }, session, { tab: { id: 7 }, url: 'https://other.example/video/BVother' }),
     (error) => error.code === 'SESSION_ROUTE_CONFLICT',
   );
   assert.throws(

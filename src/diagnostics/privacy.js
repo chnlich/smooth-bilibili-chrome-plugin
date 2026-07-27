@@ -116,7 +116,6 @@ function safeRemoveStats(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return UNKNOWN_VALUE;
   return {
     removeCalls: Number.isInteger(value.removeCalls) && value.removeCalls >= 0 ? value.removeCalls : UNKNOWN_VALUE,
-    intercepted: Number.isInteger(value.intercepted) && value.intercepted >= 0 ? value.intercepted : UNKNOWN_VALUE,
   };
 }
 

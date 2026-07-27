@@ -1,117 +1,20 @@
 (() => {
-  // src/constants.js
-  var EXTENSION_MANIFEST = Object.freeze({
-    manifestVersion: 3,
-    minimumChromeVersion: "120",
-    matches: Object.freeze([
-      "https://live.bilibili.com/*",
-      "https://www.bilibili.com/*"
-    ]),
-    hostPermissions: Object.freeze([])
-  });
-  var EXTENSION_PREFERENCES = Object.freeze({
-    liveEnabled: "liveEnabled",
-    vodEnabled: "vodEnabled"
-  });
-  var VOD_CONFIG = Object.freeze({
-    stableBufferSeconds: 120
-  });
-  var BANK_CONFIG = Object.freeze({
-    chunkBytes: 4 * 1024 ** 2,
-    prefetchAheadSeconds: 900,
-    maxBankBytes: 512 * 1024 ** 2,
-    refetchAlarmCount: 3,
-    foregroundDeadlineMs: 5e3,
-    prefetchDeadlineMs: 2e4,
-    latencyAlarmCount: 3
-  });
-  var LIVE_CONFIG = Object.freeze({
-    noDecodedFrameStallMilliseconds: 2e3,
-    userSeekAuthorizationMilliseconds: 1e3,
-    correctionToleranceSeconds: 2.5,
-    statusRefreshMilliseconds: 500,
-    delayUnavailableCheckMilliseconds: 5e3,
-    liveRetainSeconds: 30
-  });
-
   // src/extension/bridge-contract.js
-  var SHIM_OBSERVATION_ATTRIBUTE = "data-bilibili-buffer-shim-observation";
-  var SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = "data-bilibili-buffer-shim-seq";
   var SHIM_DIAGNOSTIC_ATTRIBUTE = "data-bilibili-buffer-shim-diagnostics";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
-    "callCoreSync",
-    "getLiveCapabilitySnapshot",
-    "disableLiveAutoCatchup"
+    "callCoreSync"
   ]);
-  var BRIDGE_LIVE_METHODS = Object.freeze([
-    "setChasingFrameThreshold"
-  ]);
-  var BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
-    setChasingFrameThreshold: 600
-  });
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
 
-  // src/live/buffer-retention.js
-  var RETAIN_PASS = null;
-  function computeRetentionAction(currentTime, removeStart, removeEnd, retainSeconds) {
-    if (!Number.isFinite(currentTime) || currentTime <= 0 || !Number.isFinite(removeStart) || !Number.isFinite(removeEnd) || removeEnd <= removeStart) {
-      return RETAIN_PASS;
-    }
-    const floor = currentTime - retainSeconds;
-    if (removeEnd <= floor) return RETAIN_PASS;
-    if (removeStart >= floor) return { action: "skipped", adjustedEnd: void 0 };
-    return { action: "truncated", adjustedEnd: floor };
-  }
-
   // src/extension/source-buffer-shim.js
-  var RETAIN_SECONDS = LIVE_CONFIG.liveRetainSeconds;
   var installed = false;
-  var observationSequence = 0;
   var stats = {
-    removeCalls: 0,
-    intercepted: 0,
-    lastReason: null,
-    lastCurrentTime: null,
-    lastRemoveStart: null,
-    lastRemoveEnd: null,
-    lastOriginalEnd: null
+    removeCalls: 0
   };
   var sourceBufferTracks = /* @__PURE__ */ new WeakMap();
   var appendErrors = /* @__PURE__ */ Object.create(null);
   var activeSource;
-  function findMaxVideoCurrentTime() {
-    const videos = [...document.querySelectorAll("video")];
-    for (const iframe of document.querySelectorAll("iframe")) {
-      try {
-        const iframeDocument = iframe.contentDocument;
-        if (iframeDocument !== null) {
-          videos.push(...iframeDocument.querySelectorAll("video"));
-        }
-      } catch {
-      }
-    }
-    let latest = void 0;
-    for (const video of videos) {
-      if (video !== null && Number.isFinite(video.currentTime) && video.currentTime > 0) {
-        if (latest === void 0 || video.currentTime > latest) latest = video.currentTime;
-      }
-    }
-    return latest;
-  }
-  function dispatchObservation(detail) {
-    try {
-      observationSequence += 1;
-      const seq = String(observationSequence);
-      const payload = JSON.stringify(detail);
-      const target = window !== window.top && window.parent !== window ? window.parent?.document?.documentElement ?? document.documentElement : document.documentElement;
-      if (target !== null) {
-        target.setAttribute(SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE, seq);
-        target.setAttribute(SHIM_OBSERVATION_ATTRIBUTE, payload);
-      }
-    } catch {
-    }
-  }
   function readSourceBufferRanges(sourceBuffer) {
     const ranges = [];
     try {
@@ -140,8 +43,7 @@
         mediaSourceState: activeSource?.readyState || null,
         appendErrors: { ...appendErrors },
         removeStats: {
-          removeCalls: stats.removeCalls,
-          intercepted: stats.intercepted
+          removeCalls: stats.removeCalls
         }
       }));
     } catch (error) {
@@ -205,40 +107,11 @@
     const originalRemove = SourceBuffer.prototype.remove;
     SourceBuffer.prototype.remove = function smoothRemove(start, end) {
       stats.removeCalls += 1;
-      if (window.location.hostname !== "live.bilibili.com") {
-        return originalRemove.call(this, start, end);
-      }
-      const currentTime = findMaxVideoCurrentTime();
-      const action = computeRetentionAction(currentTime, start, end, RETAIN_SECONDS);
-      if (action === null) {
-        return originalRemove.call(this, start, end);
-      }
-      stats.intercepted += 1;
-      stats.lastCurrentTime = currentTime;
-      stats.lastRemoveStart = start;
-      stats.lastOriginalEnd = end;
-      dispatchDiagnostics();
-      if (action.action === "skipped") {
-        stats.lastReason = "skipped";
-        stats.lastRemoveEnd = end;
-        dispatchObservation({ reason: "skipped", currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
-        const buffer = this;
-        setTimeout(() => {
-          try {
-            buffer.dispatchEvent(new Event("updateend"));
-          } catch {
-          }
-        }, 0);
-        return;
-      }
-      stats.lastReason = "truncated";
-      stats.lastRemoveEnd = action.adjustedEnd;
-      dispatchObservation({ reason: "truncated", targetTime: action.adjustedEnd, currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
-      return originalRemove.call(this, start, action.adjustedEnd);
+      return originalRemove.call(this, start, end);
     };
     installed = true;
   }
-  window.__smoothBufferShim = { retainSeconds: RETAIN_SECONDS, installed, stats };
+  window.__smoothBufferShim = { installed, stats };
   dispatchDiagnostics();
 })();
 //# sourceMappingURL=source-buffer-shim.js.map

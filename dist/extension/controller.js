@@ -5,13 +5,11 @@
     manifestVersion: 3,
     minimumChromeVersion: "120",
     matches: Object.freeze([
-      "https://live.bilibili.com/*",
       "https://www.bilibili.com/*"
     ]),
     hostPermissions: Object.freeze([])
   });
   var EXTENSION_PREFERENCES = Object.freeze({
-    liveEnabled: "liveEnabled",
     vodEnabled: "vodEnabled"
   });
   var VOD_CONFIG = Object.freeze({
@@ -25,14 +23,6 @@
     foregroundDeadlineMs: 5e3,
     prefetchDeadlineMs: 2e4,
     latencyAlarmCount: 3
-  });
-  var LIVE_CONFIG = Object.freeze({
-    noDecodedFrameStallMilliseconds: 2e3,
-    userSeekAuthorizationMilliseconds: 1e3,
-    correctionToleranceSeconds: 2.5,
-    statusRefreshMilliseconds: 500,
-    delayUnavailableCheckMilliseconds: 5e3,
-    liveRetainSeconds: 30
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -85,18 +75,6 @@
     "video.buffer_hint.unsupported",
     "video.buffer_hint.failed",
     "video.buffer_observed",
-    "live.stall.detected",
-    "live.stall.recovered",
-    "live.delay.observed",
-    "live.delay.corrected",
-    "live.delay.unavailable",
-    "live.buffer.retained",
-    "live.source_replaced",
-    "live.delay_protection.capability",
-    "live.delay_protection.applied",
-    "live.delay_protection.unsupported",
-    "live.delay_protection.failed",
-    "live.delay_protection.cancelled",
     "bridge.request",
     "bridge.response",
     "bridge.error",
@@ -176,25 +154,6 @@
       "encodedBodySize",
       "decodedBodySize"
     ]),
-    live: Object.freeze([
-      "reason",
-      "delayBeforeStall",
-      "stallDuration",
-      "targetDelay",
-      "protectedDelay",
-      "targetTime",
-      "currentTime",
-      "estimatedDelay",
-      "previousSource",
-      "source",
-      "videoInstance",
-      "sourceInstance",
-      "capability",
-      "status",
-      "waitedSeconds",
-      "retainSeconds",
-      "originalEnd"
-    ]),
     bridge: Object.freeze(["operation", "direction", "status"]),
     bank: Object.freeze([
       "source",
@@ -217,7 +176,6 @@
     if (code.startsWith("video.buffer_hint.") || code.startsWith("video.")) return DATA_ALLOWLIST.video;
     if (code.startsWith("media.")) return DATA_ALLOWLIST.media;
     if (code.startsWith("resource.")) return DATA_ALLOWLIST.resource;
-    if (code.startsWith("live.")) return DATA_ALLOWLIST.live;
     if (code.startsWith("bridge.")) return DATA_ALLOWLIST.bridge;
     if (code.startsWith("bank.")) return DATA_ALLOWLIST.bank;
     if (code.startsWith("extension.")) return DATA_ALLOWLIST.extension;
@@ -327,8 +285,7 @@
   function safeRemoveStats(value) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
     return {
-      removeCalls: Number.isInteger(value.removeCalls) && value.removeCalls >= 0 ? value.removeCalls : UNKNOWN_VALUE,
-      intercepted: Number.isInteger(value.intercepted) && value.intercepted >= 0 ? value.intercepted : UNKNOWN_VALUE
+      removeCalls: Number.isInteger(value.removeCalls) && value.removeCalls >= 0 ? value.removeCalls : UNKNOWN_VALUE
     };
   }
   function safeResolution(value) {
@@ -495,7 +452,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-6a2fec3890dc8126c6d1bba4" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-c256e83fb94c5658d5c78e33" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -562,21 +519,11 @@
   var BRIDGE_REQUEST_EVENT = "bilibili-buffer:bridge-request-v1";
   var BRIDGE_RESPONSE_EVENT = "bilibili-buffer:bridge-response-v1";
   var BRIDGE_RESPONSE_ATTRIBUTE = "data-bilibili-buffer-bridge-response-v1";
-  var SHIM_OBSERVATION_ATTRIBUTE = "data-bilibili-buffer-shim-observation";
-  var SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE = "data-bilibili-buffer-shim-seq";
   var SHIM_DIAGNOSTIC_ATTRIBUTE = "data-bilibili-buffer-shim-diagnostics";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
-    "callCoreSync",
-    "getLiveCapabilitySnapshot",
-    "disableLiveAutoCatchup"
+    "callCoreSync"
   ]);
-  var BRIDGE_LIVE_METHODS = Object.freeze([
-    "setChasingFrameThreshold"
-  ]);
-  var BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
-    setChasingFrameThreshold: 600
-  });
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function encodeMessage(message) {
     return JSON.stringify(message);
@@ -689,9 +636,6 @@
   function routeIdentity(locationObject) {
     const pathname = locationObject.pathname || "/";
     const part = new URLSearchParams(locationObject.search || "").get("p") || void 0;
-    if (locationObject.hostname === "live.bilibili.com") {
-      return { routeKind: "live", roomId: pathname.split("/")[1] || void 0, part };
-    }
     if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/video/")) {
       return { routeKind: "video", bvid: pathname.split("/")[2] || void 0, part };
     }
@@ -1260,842 +1204,6 @@
     }
   };
 
-  // src/live/observer.js
-  var UNKNOWN = "未提供";
-  var CORRECTION_SETTLE_MILLISECONDS = 500;
-  var FRAME_PROGRESS_EPSILON_SECONDS = 1e-3;
-  function currentSource2(video) {
-    return video?.currentSrc || video?.src || "";
-  }
-  function nowMilliseconds(runtimeObject) {
-    return typeof runtimeObject.performance?.now === "function" ? runtimeObject.performance.now() : Date.now();
-  }
-  function readTimeRanges(timeRanges) {
-    if (timeRanges === void 0 || timeRanges === null) return void 0;
-    const ranges = [];
-    for (let index = 0; index < timeRanges.length; index += 1) {
-      const start = timeRanges.start(index);
-      const end = timeRanges.end(index);
-      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
-        throw new Error(`直播媒体 range ${index} 无效`);
-      }
-      ranges.push({ start, end });
-    }
-    return ranges;
-  }
-  function readSeekable(video) {
-    return readTimeRanges(video?.seekable);
-  }
-  function continuousBuffer(video) {
-    const ranges = readTimeRanges(video?.buffered);
-    if (ranges === void 0 || !Number.isFinite(video.currentTime)) return UNKNOWN;
-    const match = ranges.find((range) => range.start <= video.currentTime && video.currentTime <= range.end);
-    return match === void 0 ? 0 : Math.max(0, match.end - video.currentTime);
-  }
-  function delayFromSeekable(video) {
-    const ranges = readSeekable(video);
-    if (ranges === void 0 || ranges.length === 0 || !Number.isFinite(video.currentTime)) return UNKNOWN;
-    const end = ranges[ranges.length - 1].end;
-    return Number.isFinite(end) ? Math.max(0, end - video.currentTime) : UNKNOWN;
-  }
-  function delayOrUnknown(video, diagnostics, reason, context) {
-    try {
-      return delayFromSeekable(video);
-    } catch (error) {
-      diagnostics?.log("extension.observer_error", { reason }, error, context);
-      return UNKNOWN;
-    }
-  }
-  function closestSeekablePosition(ranges, target, earliestWhenOutside) {
-    if (!Array.isArray(ranges) || ranges.length === 0 || !Number.isFinite(target)) return void 0;
-    for (const range of ranges) {
-      if (range.start <= target && target <= range.end) return target;
-    }
-    if (earliestWhenOutside) return ranges[0].start;
-    if (target < ranges[0].start) return ranges[0].start;
-    if (target > ranges[ranges.length - 1].end) return ranges[ranges.length - 1].end;
-    for (let index = 1; index < ranges.length; index += 1) {
-      const previousEnd = ranges[index - 1].end;
-      const nextStart = ranges[index].start;
-      if (previousEnd < target && target < nextStart) {
-        return target - previousEnd <= nextStart - target ? previousEnd : nextStart;
-      }
-    }
-    throw new Error("无法为直播目标位置选择 seekable 端点");
-  }
-  function seekablePositionForDelay(ranges, targetDelay) {
-    if (!Array.isArray(ranges) || ranges.length === 0 || !Number.isFinite(targetDelay)) return void 0;
-    const seekableEnd = ranges[ranges.length - 1].end;
-    const targetTime = seekableEnd - targetDelay;
-    return closestSeekablePosition(ranges, targetTime, true);
-  }
-  var SEEK_KEYS = /* @__PURE__ */ new Set(["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"]);
-  var CONTROL_EXCLUSIONS = /volume|音量|quality|画质|speed|倍速|rate|播放速度|chat|comment|弹幕/i;
-  var TIMELINE_MARKERS = /seek|timeline|progress|position|进度|时间轴/i;
-  function eventPath(event) {
-    if (typeof event?.composedPath === "function") return event.composedPath();
-    const path = [];
-    let current = event?.target;
-    while (current !== void 0 && current !== null) {
-      path.push(current);
-      current = current.parentElement;
-    }
-    return path;
-  }
-  function elementText(element) {
-    const attributes = ["id", "class", "aria-label", "title", "name", "data-seek", "data-timeline", "data-progress"];
-    return attributes.map((attribute) => element?.getAttribute?.(attribute) || element?.[attribute] || "").join(" ");
-  }
-  function isTimelineControl(element) {
-    if (element === void 0 || element === null || typeof element !== "object") return false;
-    const text = elementText(element);
-    const explicit = ["data-seek", "data-timeline", "data-progress"].some((attribute) => typeof element.getAttribute === "function" && element.getAttribute(attribute) !== null);
-    if (CONTROL_EXCLUSIONS.test(text)) return false;
-    if (explicit) return true;
-    const tagName = String(element.tagName || "").toLowerCase();
-    const inputType = String(element.type || element.getAttribute?.("type") || "").toLowerCase();
-    const role = String(element.getAttribute?.("role") || element.role || "").toLowerCase();
-    if (tagName === "input" && inputType === "range") return TIMELINE_MARKERS.test(text);
-    if (role === "slider") return TIMELINE_MARKERS.test(text);
-    return TIMELINE_MARKERS.test(text) && !CONTROL_EXCLUSIONS.test(text);
-  }
-  function isUserSeekIntent(event, video, documentObject) {
-    const path = eventPath(event);
-    const timeline = path.some((element) => isTimelineControl(element));
-    if (event?.type === "pointerdown") return timeline;
-    if (event?.type === "input") return timeline;
-    if (event?.type !== "keydown" || !SEEK_KEYS.has(event.key)) return false;
-    return timeline || path.includes(video) || documentObject.activeElement === video;
-  }
-  function collectSameOriginVideos(documentObject) {
-    const videos = [...documentObject.querySelectorAll("video")];
-    for (const iframe of documentObject.querySelectorAll("iframe")) {
-      try {
-        const iframeDocument = iframe.contentDocument;
-        if (iframeDocument !== null) videos.push(...iframeDocument.querySelectorAll("video"));
-      } catch {
-      }
-    }
-    return videos;
-  }
-  function selectVideo(documentObject) {
-    const videos = collectSameOriginVideos(documentObject).filter((video) => video.isConnected !== false);
-    return videos.sort((left, right) => {
-      const leftArea = (left.clientWidth || 0) * (left.clientHeight || 0);
-      const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);
-      return rightArea - leftArea;
-    })[0];
-  }
-  var LiveObserver = class {
-    constructor({
-      documentObject = document,
-      windowObject = window,
-      runtimeObject = windowObject,
-      panel,
-      logger: logger2,
-      diagnostics,
-      pageAdapter,
-      initialVideo,
-      config = LIVE_CONFIG
-    }) {
-      this.documentObject = documentObject;
-      this.windowObject = windowObject;
-      this.runtimeObject = runtimeObject;
-      this.panel = panel;
-      this.logger = logger2;
-      this.diagnostics = diagnostics;
-      this.pageAdapter = pageAdapter;
-      this.config = config;
-      this.video = initialVideo;
-      this.videoInstance = 0;
-      this.sourceInstance = 0;
-      this.videoReplacements = 0;
-      this.sourceReplacements = 0;
-      this.sourceKey = "";
-      this.videoParent = void 0;
-      this.recorder = void 0;
-      this.mutationObserver = void 0;
-      this.statusTimer = void 0;
-      this.started = false;
-      this.destroyed = false;
-      this.hasDecodedFrame = false;
-      this.lastDecodedAtMilliseconds = void 0;
-      this.lastDecodedMediaTime = void 0;
-      this.recentEvent = UNKNOWN;
-      this.recentError = UNKNOWN;
-      this.activeStall = void 0;
-      this.delayProtection = void 0;
-      this.awaitingUserSeekFrame = false;
-      this.userSeekAuthorization = void 0;
-      this.lastCorrection = void 0;
-      this.correcting = false;
-      this.replacementNeedsCorrection = false;
-      this.iframeMutationObservers = [];
-      this.frameCanvas = void 0;
-      this.overlayCanvas = void 0;
-      this.autoCatchupAttempted = false;
-      this.delayUnavailableTimer = void 0;
-      this.delayUnavailableEmitted = false;
-      this.liveCapabilities = void 0;
-      this.liveCapabilitiesPromise = void 0;
-      this.boundUserInput = (event) => this.noteUserInput(event);
-      this.boundMutation = () => this.reconcileVideo();
-    }
-    currentProtectedDelay() {
-      if (this.activeStall !== void 0) {
-        this.updateStallTarget(this.activeStall);
-        return this.activeStall.targetDelay;
-      }
-      if (this.delayProtection !== void 0) return this.delayProtection.protectedDelay;
-      return void 0;
-    }
-    updateStallTarget(stall) {
-      const elapsedSeconds = Math.max(0, nowMilliseconds(this.runtimeObject) - stall.startedAt) / 1e3;
-      const timedTarget = stall.delayBeforeStall + elapsedSeconds;
-      stall.targetDelay = Math.max(stall.targetDelay, timedTarget);
-      if (Number.isFinite(stall.lastObservedDelay)) stall.protectedDelay = stall.lastObservedDelay;
-      return stall.targetDelay;
-    }
-    observeProtectedDelay(video, observedDelay) {
-      if (this.delayProtection === void 0 || this.delayProtection.video !== video || this.delayProtection.videoInstance !== this.videoInstance || this.delayProtection.sourceInstance !== this.sourceInstance || !Number.isFinite(observedDelay)) return;
-      this.delayProtection.lastObservedDelay = observedDelay;
-      this.delayProtection.protectedDelay = observedDelay;
-    }
-    start() {
-      if (this.destroyed) throw new Error("直播观察器已经销毁");
-      if (this.started) throw new Error("直播观察器已经启动");
-      this.started = true;
-      this.documentObject.addEventListener("pointerdown", this.boundUserInput, true);
-      this.documentObject.addEventListener("keydown", this.boundUserInput, true);
-      this.documentObject.addEventListener("input", this.boundUserInput, true);
-      if (typeof this.windowObject.MutationObserver === "function") {
-        this.mutationObserver = new this.windowObject.MutationObserver(this.boundMutation);
-        this.mutationObserver.observe(this.documentObject, { childList: true, subtree: true });
-      }
-      this.statusTimer = this.runtimeObject.setInterval(() => this.sample(), this.config.statusRefreshMilliseconds);
-      this.attachIframeObservers();
-      if (this.video !== void 0) {
-        const initialVideo = this.video;
-        this.video = void 0;
-        this.bindVideo(selectVideo(this.documentObject) || initialVideo);
-      } else {
-        this.reconcileVideo();
-      }
-      this.updateStatus();
-    }
-    attachIframeObservers() {
-      this.detachIframeObservers();
-      if (typeof this.windowObject.MutationObserver !== "function") return;
-      for (const iframe of this.documentObject.querySelectorAll("iframe")) {
-        try {
-          const iframeDocument = iframe.contentDocument;
-          if (iframeDocument === null) continue;
-          const observer = new this.windowObject.MutationObserver(this.boundMutation);
-          observer.observe(iframeDocument, { childList: true, subtree: true });
-          this.iframeMutationObservers.push(observer);
-        } catch {
-        }
-      }
-    }
-    detachIframeObservers() {
-      for (const observer of this.iframeMutationObservers) observer.disconnect();
-      this.iframeMutationObservers = [];
-    }
-    context() {
-      return {
-        videoInstance: this.videoInstance || void 0,
-        sourceInstance: this.sourceInstance || void 0
-      };
-    }
-    reconcileVideo() {
-      if (this.destroyed || !this.started) return;
-      const nextVideo = selectVideo(this.documentObject);
-      if (nextVideo === void 0) {
-        if (this.video !== void 0 && this.video.isConnected === false) {
-          this.showOverlay();
-        }
-        this.updateStatus();
-        return;
-      }
-      if (nextVideo !== this.video) {
-        if (this.video !== void 0) {
-          this.videoReplacements += 1;
-          this.showOverlay();
-        }
-        this.bindVideo(nextVideo);
-        return;
-      }
-      this.rebindSourceIfNeeded();
-    }
-    bindVideo(video) {
-      const previousVideo = this.video;
-      const previousSource = this.sourceKey;
-      const previousStall = this.activeStall;
-      const previousProtection = this.delayProtection;
-      this.hideOverlay();
-      this.recorder?.destroy();
-      this.video = video;
-      this.videoParent = video.parentElement || this.videoParent;
-      this.videoInstance += 1;
-      this.hasDecodedFrame = false;
-      this.lastDecodedAtMilliseconds = void 0;
-      this.lastDecodedMediaTime = void 0;
-      this.recentError = UNKNOWN;
-      this.sourceKey = currentSource2(video);
-      if (this.sourceKey !== "") this.sourceInstance += 1;
-      if (previousVideo !== void 0 && previousSource !== this.sourceKey) {
-        this.sourceReplacements += 1;
-        this.diagnostics?.log("live.source_replaced", {
-          previousSource,
-          source: this.sourceKey,
-          status: previousStall === void 0 && previousProtection === void 0 ? "observed" : "protected"
-        }, void 0, this.context());
-        this.diagnostics?.log("video.source_replaced", {
-          previousSource,
-          source: this.sourceKey,
-          reason: "video_replaced"
-        }, void 0, this.context());
-      }
-      if (previousVideo !== void 0) {
-        this.diagnostics?.log("video.replaced", {
-          reason: "video_replaced"
-        }, void 0, this.context());
-      }
-      if (previousStall !== void 0) {
-        this.activeStall = {
-          ...previousStall,
-          video,
-          videoInstance: this.videoInstance,
-          sourceInstance: this.sourceInstance,
-          lastDecodedMediaTime: void 0
-        };
-        this.replacementNeedsCorrection = true;
-      }
-      if (previousProtection !== void 0) {
-        this.delayProtection = {
-          ...previousProtection,
-          video,
-          videoInstance: this.videoInstance,
-          sourceInstance: this.sourceInstance
-        };
-        this.replacementNeedsCorrection = true;
-      }
-      this.diagnostics?.markVideoAvailable();
-      this.diagnostics?.log("video.attached", { source: this.sourceKey }, void 0, this.context());
-      this.autoCatchupAttempted = false;
-      this.delayUnavailableEmitted = false;
-      this.clearDelayUnavailableTimer();
-      this.recorder = new MediaEventRecorder({
-        video,
-        logger: this.diagnostics,
-        runtimeObject: this.runtimeObject,
-        context: () => this.context(),
-        onEvent: (name, currentVideo) => this.onMediaEvent(name, currentVideo),
-        onFrame: (currentVideo, metadata) => this.onDecodedFrame(currentVideo, metadata)
-      });
-      this.recorder.start();
-      this.attachIframeObservers();
-      if (previousStall !== void 0) this.showOverlay();
-      this.applyReplacementCorrection();
-      this.updateStatus();
-    }
-    rebindSourceIfNeeded() {
-      const nextSource = currentSource2(this.video);
-      if (nextSource === this.sourceKey) return;
-      const previousSource = this.sourceKey;
-      this.sourceKey = nextSource;
-      this.sourceInstance += 1;
-      this.lastDecodedMediaTime = void 0;
-      this.autoCatchupAttempted = false;
-      this.delayUnavailableEmitted = false;
-      this.clearDelayUnavailableTimer();
-      if (previousSource !== "") this.sourceReplacements += 1;
-      if (this.activeStall === void 0) this.hasDecodedFrame = false;
-      if (this.activeStall !== void 0) this.showOverlay();
-      if (this.activeStall !== void 0) {
-        this.activeStall = {
-          ...this.activeStall,
-          sourceInstance: this.sourceInstance,
-          lastDecodedMediaTime: void 0
-        };
-      }
-      if (this.delayProtection !== void 0) {
-        this.delayProtection = { ...this.delayProtection, sourceInstance: this.sourceInstance };
-      }
-      this.replacementNeedsCorrection = this.activeStall !== void 0 || this.delayProtection !== void 0;
-      this.diagnostics?.log("live.source_replaced", {
-        previousSource,
-        source: nextSource,
-        status: this.activeStall === void 0 && this.delayProtection === void 0 ? "observed" : "protected"
-      }, void 0, this.context());
-      this.diagnostics?.log("video.source_replaced", { previousSource, source: nextSource }, void 0, this.context());
-      if (this.replacementNeedsCorrection) this.applyReplacementCorrection();
-      this.updateStatus();
-    }
-    onMediaEvent(name, video) {
-      if (video !== this.video || this.destroyed) return;
-      this.rebindSourceIfNeeded();
-      this.recentEvent = name;
-      if (name === "loadeddata" && !this.hasDecodedFrame && typeof video.requestVideoFrameCallback !== "function") this.onDecodedFrame(video);
-      if (name === "emptied" && this.activeStall !== void 0) this.showOverlay();
-      if (name === "waiting" || name === "stalled") this.maybeArmStall(name);
-      if (name === "loadedmetadata" || name === "canplay" || name === "loadeddata" || name === "playing") {
-        this.applyReplacementCorrection();
-      }
-      if (name === "error") {
-        const serialized = serializeError(video.error || new Error("原生 video error"));
-        this.recentError = serialized.code === "BRIDGE_CALL_FAILED" ? serialized.message : `${serialized.code}: ${serialized.message}`;
-      }
-      this.updateStatus();
-    }
-    onDecodedFrame(video, metadata) {
-      if (video !== this.video || video.isConnected === false || this.destroyed) return;
-      const mediaTime = Number.isFinite(metadata?.mediaTime) ? metadata.mediaTime : void 0;
-      if (this.activeStall !== void 0 && Number.isFinite(mediaTime) && Number.isFinite(this.activeStall.lastDecodedMediaTime) && mediaTime <= this.activeStall.lastDecodedMediaTime + FRAME_PROGRESS_EPSILON_SECONDS) return;
-      if (this.lastCorrection !== void 0 && this.lastCorrection.video === video && this.lastCorrection.videoInstance === this.videoInstance && this.lastCorrection.sourceInstance === this.sourceInstance) this.lastCorrection = void 0;
-      const wasAwaiting = this.awaitingUserSeekFrame;
-      const firstFrameForInstance = !this.hasDecodedFrame;
-      this.hasDecodedFrame = true;
-      this.lastDecodedAtMilliseconds = nowMilliseconds(this.runtimeObject);
-      if (Number.isFinite(mediaTime)) this.lastDecodedMediaTime = mediaTime;
-      if (firstFrameForInstance) this.scheduleDelayUnavailableCheck();
-      this.captureFrame(video);
-      this.hideOverlay();
-      if (wasAwaiting) this.awaitingUserSeekFrame = false;
-      const observedDelay = delayOrUnknown(video, this.diagnostics, "decoded-seekable-read", this.context());
-      if (this.activeStall !== void 0) {
-        const stall = this.activeStall;
-        this.updateStallTarget(stall);
-        if (Number.isFinite(observedDelay)) stall.lastObservedDelay = observedDelay;
-        const targetDelay = stall.targetDelay;
-        this.activeStall = void 0;
-        this.delayProtection = {
-          video,
-          videoInstance: this.videoInstance,
-          sourceInstance: this.sourceInstance,
-          protectedDelay: targetDelay,
-          targetDelay,
-          lastObservedDelay: Number.isFinite(observedDelay) ? observedDelay : UNKNOWN
-        };
-        this.applyReplacementCorrection(true);
-        const actualDelay = delayOrUnknown(
-          video,
-          this.diagnostics,
-          "recovered-seekable-read",
-          this.context()
-        );
-        if (Number.isFinite(actualDelay)) this.observeProtectedDelay(video, actualDelay);
-        this.diagnostics?.log("live.stall.recovered", {
-          delayBeforeStall: stall.delayBeforeStall,
-          stallDuration: Math.max(0, this.lastDecodedAtMilliseconds - stall.startedAt) / 1e3,
-          targetDelay,
-          protectedDelay: Number.isFinite(actualDelay) ? actualDelay : targetDelay
-        }, void 0, this.context());
-      } else {
-        if (this.replacementNeedsCorrection) this.applyReplacementCorrection();
-        this.observeProtectedDelay(video, observedDelay);
-      }
-      this.updateStatus();
-    }
-    noteUserInput(event) {
-      if (this.destroyed || event?.isTrusted !== true) return;
-      if (!isUserSeekIntent(event, this.video, this.documentObject)) {
-        this.userSeekAuthorization = void 0;
-        return;
-      }
-      if (this.video === void 0) return;
-      if (event.type === "input") {
-        this.cancelProtection("user_seek");
-        this.awaitingUserSeekFrame = true;
-        this.hasDecodedFrame = false;
-        this.frameCanvas = void 0;
-        return;
-      }
-      this.userSeekAuthorization = {
-        video: this.video,
-        initialTime: Number.isFinite(this.video?.currentTime) ? this.video.currentTime : void 0,
-        expiresAt: nowMilliseconds(this.runtimeObject) + this.config.userSeekAuthorizationMilliseconds
-      };
-    }
-    maybeArmStall(reason) {
-      if (this.activeStall !== void 0 || this.awaitingUserSeekFrame || this.video === void 0) return;
-      if (this.video.paused !== false || !this.hasDecodedFrame) return;
-      const delayBeforeStall = delayOrUnknown(
-        this.video,
-        this.diagnostics,
-        "stall-seekable-read",
-        this.context()
-      );
-      const currentTime = this.video.currentTime;
-      if (!Number.isFinite(delayBeforeStall) || !Number.isFinite(currentTime)) return;
-      const startedAt = nowMilliseconds(this.runtimeObject);
-      this.activeStall = {
-        video: this.video,
-        videoInstance: this.videoInstance,
-        sourceInstance: this.sourceInstance,
-        startedAt,
-        delayBeforeStall,
-        targetDelay: delayBeforeStall,
-        protectedDelay: delayBeforeStall,
-        lastObservedDelay: delayBeforeStall,
-        lastDecodedMediaTime: this.lastDecodedMediaTime
-      };
-      this.replacementNeedsCorrection = false;
-      this.diagnostics?.log("live.stall.detected", {
-        reason,
-        delayBeforeStall,
-        currentTime,
-        protectedDelay: delayBeforeStall
-      }, void 0, this.context());
-      this.attemptDisableAutoCatchup();
-    }
-    checkForNoFrameStall() {
-      if (this.video === void 0 || this.video.paused !== false || !this.hasDecodedFrame || this.lastDecodedAtMilliseconds === void 0) return;
-      if (typeof this.video.requestVideoFrameCallback !== "function") return;
-      const elapsed = nowMilliseconds(this.runtimeObject) - this.lastDecodedAtMilliseconds;
-      if (elapsed >= this.config.noDecodedFrameStallMilliseconds) this.maybeArmStall("no_decoded_frame");
-    }
-    attemptDisableAutoCatchup() {
-      if (this.autoCatchupAttempted) return;
-      this.autoCatchupAttempted = true;
-      const stall = this.activeStall;
-      let capabilityPromise;
-      try {
-        capabilityPromise = this.liveCapabilities === void 0 ? this.pageAdapter?.refreshLiveCapabilities?.() : Promise.resolve(this.liveCapabilities);
-      } catch (error) {
-        this.diagnostics?.log("bridge.error", { operation: "getLiveCapabilitySnapshot", direction: "response" }, error, this.context());
-        this.diagnostics?.log("live.delay_protection.failed", {
-          capability: "disableAutoCatchup",
-          status: "failed"
-        }, error, this.context());
-        return;
-      }
-      if (capabilityPromise === void 0) {
-        this.diagnostics?.log("live.delay_protection.unsupported", {
-          reason: "capability_not_available",
-          status: "unsupported"
-        }, void 0, this.context());
-        return;
-      }
-      this.liveCapabilitiesPromise = Promise.resolve(capabilityPromise).then((capabilities) => {
-        this.liveCapabilities = capabilities;
-        const supported = capabilities.supportsDisableAutoCatchup();
-        this.diagnostics?.log("live.delay_protection.capability", {
-          capability: supported ? "disableAutoCatchup" : "none",
-          status: supported ? "supported" : "unsupported"
-        }, void 0, this.context());
-        if (!supported || this.activeStall !== stall) {
-          if (!supported) {
-            this.diagnostics?.log("live.delay_protection.unsupported", {
-              reason: "capability_missing",
-              status: "unsupported"
-            }, void 0, this.context());
-          }
-          return void 0;
-        }
-        return capabilities.disableAutoCatchup().then(() => {
-          this.diagnostics?.log("live.delay_protection.applied", {
-            capability: "disableAutoCatchup",
-            status: "applied"
-          }, void 0, this.context());
-        });
-      }).catch((error) => {
-        this.diagnostics?.log("bridge.error", { operation: "getLiveCapabilitySnapshot", direction: "response" }, error, this.context());
-        this.diagnostics?.log("live.delay_protection.failed", {
-          capability: "disableAutoCatchup",
-          status: "failed"
-        }, error, this.context());
-      });
-    }
-    applyReplacementCorrection(force = false) {
-      if (!this.replacementNeedsCorrection && !force || this.video === void 0 || this.sourceKey === "" || this.video.paused !== false || this.userSeekAuthorization !== void 0) return;
-      const protectedDelay = this.currentProtectedDelay();
-      if (!Number.isFinite(protectedDelay)) return;
-      let ranges;
-      try {
-        ranges = readSeekable(this.video);
-      } catch (error) {
-        this.diagnostics?.log("extension.observer_error", { reason: "replacement-seekable-read" }, error, this.context());
-        return;
-      }
-      const target = seekablePositionForDelay(ranges, protectedDelay);
-      if (!Number.isFinite(target) || !Number.isFinite(this.video.currentTime)) return;
-      const currentTime = this.video.currentTime;
-      const currentDelay = delayOrUnknown(
-        this.video,
-        this.diagnostics,
-        "replacement-seekable-read-current",
-        this.context()
-      );
-      if (Number.isFinite(currentDelay) && currentDelay >= protectedDelay) {
-        this.observeProtectedDelay(this.video, currentDelay);
-      }
-      this.replacementNeedsCorrection = false;
-      if (!Number.isFinite(currentDelay) || currentDelay >= protectedDelay) return;
-      this.correcting = true;
-      try {
-        this.video.currentTime = target;
-        this.lastCorrection = {
-          video: this.video,
-          videoInstance: this.videoInstance,
-          sourceInstance: this.sourceInstance,
-          target: this.video.currentTime,
-          expiresAtMilliseconds: nowMilliseconds(this.runtimeObject) + CORRECTION_SETTLE_MILLISECONDS
-        };
-        if (!Number.isFinite(this.video.currentTime) || Math.abs(this.video.currentTime - target) > this.config.correctionToleranceSeconds) return;
-        const actualDelay = delayOrUnknown(
-          this.video,
-          this.diagnostics,
-          "replacement-seekable-read-after-correction",
-          this.context()
-        );
-        if (this.activeStall !== void 0) {
-          if (Number.isFinite(actualDelay)) {
-            this.activeStall.lastObservedDelay = actualDelay;
-            this.activeStall.protectedDelay = actualDelay;
-          }
-        } else {
-          this.observeProtectedDelay(this.video, actualDelay);
-        }
-        this.replacementNeedsCorrection = false;
-        this.diagnostics?.log("live.delay.corrected", {
-          reason: "source_replaced",
-          targetTime: target,
-          currentTime,
-          targetDelay: protectedDelay,
-          protectedDelay: Number.isFinite(actualDelay) ? actualDelay : protectedDelay
-        }, void 0, this.context());
-      } catch (error) {
-        this.diagnostics?.log("live.delay_protection.failed", { reason: "source_replaced", status: "failed" }, error, this.context());
-      } finally {
-        this.correcting = false;
-      }
-    }
-    captureFrame(video) {
-      if (video.videoWidth <= 0 || video.videoHeight <= 0 || typeof this.documentObject.createElement !== "function") return;
-      let canvas;
-      try {
-        canvas = this.documentObject.createElement("canvas");
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const context = canvas.getContext("2d");
-        if (context === null) return;
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        if (typeof context.getImageData === "function") {
-          try {
-            const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-            let nonBlack = false;
-            for (let index = 0; index < pixels.length; index += 4) {
-              if (pixels[index] + pixels[index + 1] + pixels[index + 2] > 12 && pixels[index + 3] > 0) {
-                nonBlack = true;
-                break;
-              }
-            }
-            if (!nonBlack) return;
-          } catch (error) {
-            if (error?.name !== "SecurityError") throw error;
-          }
-        }
-        this.frameCanvas = canvas;
-      } catch (error) {
-        this.diagnostics?.log("extension.observer_error", { reason: "frame-capture" }, error, this.context());
-      }
-    }
-    showOverlay() {
-      if (this.activeStall === void 0 || this.frameCanvas === void 0 || this.overlayCanvas !== void 0) return;
-      const parent = this.video?.parentElement || this.videoParent;
-      if (parent === null || parent === void 0 || typeof this.documentObject.createElement !== "function") return;
-      try {
-        const canvas = this.documentObject.createElement("canvas");
-        canvas.width = this.frameCanvas.width;
-        canvas.height = this.frameCanvas.height;
-        canvas.style.position = "absolute";
-        canvas.style.inset = "0";
-        canvas.style.width = "100%";
-        canvas.style.height = "100%";
-        canvas.style.pointerEvents = "none";
-        canvas.setAttribute("aria-hidden", "true");
-        const context = canvas.getContext("2d");
-        context?.drawImage(this.frameCanvas, 0, 0, canvas.width, canvas.height);
-        parent.append(canvas);
-        this.overlayCanvas = canvas;
-      } catch (error) {
-        this.diagnostics?.log("extension.observer_error", { reason: "overlay" }, error, this.context());
-      }
-    }
-    hideOverlay() {
-      if (this.overlayCanvas === void 0) return;
-      try {
-        this.overlayCanvas.remove();
-        this.overlayCanvas = void 0;
-      } catch (error) {
-        this.diagnostics?.log("extension.observer_error", { reason: "overlay-remove" }, error, this.context());
-      }
-    }
-    sample() {
-      if (this.destroyed) return;
-      if (this.userSeekAuthorization !== void 0 && nowMilliseconds(this.runtimeObject) > this.userSeekAuthorization.expiresAt) {
-        this.userSeekAuthorization = void 0;
-      }
-      this.reconcileVideo();
-      this.checkForNoFrameStall();
-      if (this.replacementNeedsCorrection) this.applyReplacementCorrection();
-      if (this.video !== void 0) {
-        const estimatedDelay = delayOrUnknown(
-          this.video,
-          this.diagnostics,
-          "sample-seekable-read",
-          this.context()
-        );
-        if (this.activeStall !== void 0) {
-          if (Number.isFinite(estimatedDelay)) this.activeStall.lastObservedDelay = estimatedDelay;
-          this.updateStallTarget(this.activeStall);
-        } else {
-          this.observeProtectedDelay(this.video, estimatedDelay);
-        }
-        if (this.activeStall !== void 0 || this.delayProtection !== void 0) {
-          const protectedDelay = this.currentProtectedDelay();
-          this.diagnostics?.log("live.delay.observed", {
-            estimatedDelay,
-            currentTime: this.video.currentTime,
-            protectedDelay,
-            targetDelay: protectedDelay
-          }, void 0, this.context());
-        }
-      }
-      this.updateStatus();
-    }
-    snapshot() {
-      const video = this.video;
-      let facts;
-      if (video !== void 0) {
-        try {
-          facts = readMediaFacts(video);
-        } catch (error) {
-          this.diagnostics?.log("extension.observer_error", { reason: "snapshot-media-facts" }, error, this.context());
-        }
-      }
-      const status = this.diagnostics?.getStatus() || { sessionId: UNKNOWN, persistence: UNKNOWN };
-      const resolution = Number.isFinite(facts?.resolution?.width) && Number.isFinite(facts?.resolution?.height) ? `${facts.resolution.width}×${facts.resolution.height}` : UNKNOWN;
-      return {
-        mode: "直播",
-        paused: typeof video?.paused === "boolean" ? video.paused ? "是" : "否" : UNKNOWN,
-        recentFrame: this.lastDecodedAtMilliseconds === void 0 ? UNKNOWN : nowMilliseconds(this.runtimeObject) - this.lastDecodedAtMilliseconds <= 1e3 ? "是" : "否",
-        buffered: video === void 0 ? UNKNOWN : (() => {
-          try {
-            return continuousBuffer(video);
-          } catch (error) {
-            this.diagnostics?.log("extension.observer_error", { reason: "snapshot-buffered" }, error, this.context());
-            return UNKNOWN;
-          }
-        })(),
-        delay: video === void 0 ? UNKNOWN : (() => {
-          try {
-            return delayFromSeekable(video);
-          } catch (error) {
-            this.diagnostics?.log("extension.observer_error", { reason: "snapshot-seekable" }, error, this.context());
-            return UNKNOWN;
-          }
-        })(),
-        effective: video === void 0 ? UNKNOWN : (() => {
-          try {
-            const delay = delayFromSeekable(video);
-            if (!Number.isFinite(delay)) return "失活(seekable 不可读)";
-            if (this.activeStall !== void 0 || this.delayProtection !== void 0) {
-              return `保护中(实测延迟${Math.round(delay)}s)`;
-            }
-            return `监测中(延迟${Math.round(delay)}s)`;
-          } catch {
-            return "失活(seekable 不可读)";
-          }
-        })(),
-        resolution,
-        quality: UNKNOWN,
-        speed: Number.isFinite(video?.playbackRate) ? `${video.playbackRate}×` : UNKNOWN,
-        videoReplacements: this.videoReplacements,
-        sourceReplacements: this.sourceReplacements,
-        recentEvent: this.recentEvent,
-        error: this.recentError,
-        sessionId: status.sessionId,
-        persistence: status.persistence,
-        videoInstance: this.videoInstance || UNKNOWN,
-        sourceInstance: this.sourceInstance || UNKNOWN
-      };
-    }
-    updateStatus() {
-      if (this.destroyed || !this.started) return;
-      const snapshot = this.snapshot();
-      this.panel.setModel(snapshot);
-    }
-    refreshStatus() {
-      this.updateStatus();
-    }
-    cancelProtection(reason) {
-      if (this.activeStall === void 0 && this.delayProtection === void 0) return;
-      this.diagnostics?.log("live.delay_protection.cancelled", {
-        reason,
-        status: "cancelled",
-        currentTime: this.video?.currentTime
-      }, void 0, this.context());
-      this.activeStall = void 0;
-      this.delayProtection = void 0;
-      this.replacementNeedsCorrection = false;
-      this.hideOverlay();
-    }
-    cancelUserSeek() {
-      this.userSeekAuthorization = void 0;
-      this.lastCorrection = void 0;
-      this.cancelProtection("user_seek");
-      this.awaitingUserSeekFrame = true;
-      this.hasDecodedFrame = false;
-      this.frameCanvas = void 0;
-    }
-    clearDelayUnavailableTimer() {
-      if (this.delayUnavailableTimer !== void 0) {
-        this.runtimeObject.clearTimeout(this.delayUnavailableTimer);
-        this.delayUnavailableTimer = void 0;
-      }
-    }
-    scheduleDelayUnavailableCheck() {
-      if (this.delayUnavailableEmitted || this.delayUnavailableTimer !== void 0) return;
-      this.delayUnavailableTimer = this.runtimeObject.setTimeout(() => {
-        this.delayUnavailableTimer = void 0;
-        if (this.destroyed || this.video === void 0) return;
-        const delay = delayOrUnknown(this.video, this.diagnostics, "delay-unavailable-check", this.context());
-        if (Number.isFinite(delay)) return;
-        this.delayUnavailableEmitted = true;
-        this.diagnostics?.log("live.delay.unavailable", {
-          reason: "seekable_unreadable",
-          waitedSeconds: this.config.delayUnavailableCheckMilliseconds / 1e3,
-          status: "unavailable"
-        }, void 0, this.context());
-      }, this.config.delayUnavailableCheckMilliseconds);
-    }
-    destroy() {
-      if (this.destroyed) return;
-      this.diagnostics?.log("video.destroyed", { reason: "live_observer_destroyed" }, void 0, this.context());
-      this.destroyed = true;
-      this.mutationObserver?.disconnect();
-      this.mutationObserver = void 0;
-      this.detachIframeObservers();
-      this.documentObject.removeEventListener("pointerdown", this.boundUserInput, true);
-      this.documentObject.removeEventListener("keydown", this.boundUserInput, true);
-      this.documentObject.removeEventListener("input", this.boundUserInput, true);
-      this.recorder?.destroy();
-      this.recorder = void 0;
-      if (this.statusTimer !== void 0) this.runtimeObject.clearInterval(this.statusTimer);
-      this.statusTimer = void 0;
-      this.clearDelayUnavailableTimer();
-      this.hideOverlay();
-      this.frameCanvas = void 0;
-      this.videoParent = void 0;
-      this.activeStall = void 0;
-      this.delayProtection = void 0;
-      this.lastCorrection = void 0;
-      this.video = void 0;
-    }
-  };
-
   // src/errors.js
   var BufferScriptError = class extends Error {
     constructor(code, message, cause) {
@@ -2263,19 +1371,19 @@
         if (selectedVideo !== this.video || selectedVideo !== this.getVideo()) {
           return;
         }
-        const currentSource3 = currentVideoSource(this.video);
-        if (currentSource3 === "" || currentSource3 !== core.snapshot.source) {
+        const currentSource2 = currentVideoSource(this.video);
+        if (currentSource2 === "" || currentSource2 !== core.snapshot.source) {
           this.hintState = "WAITING";
           this.message = WAITING_MESSAGE;
           this.updateStatus();
           return;
         }
-        const generationChanged = core !== this.currentCore || currentSource3 !== this.currentSource;
+        const generationChanged = core !== this.currentCore || currentSource2 !== this.currentSource;
         if (generationChanged) {
           const coreChanged = core !== this.currentCore;
-          const sourceChanged = currentSource3 !== this.currentSource;
+          const sourceChanged = currentSource2 !== this.currentSource;
           this.currentCore = core;
-          this.currentSource = currentSource3;
+          this.currentSource = currentSource2;
           if (this.videoInstance === 0) this.videoInstance = 1;
           if (this.sourceInstance === 0 || sourceChanged) this.sourceInstance += 1;
           if (this.coreInstance === 0 || coreChanged) this.coreInstance += 1;
@@ -2286,13 +1394,13 @@
           this.onGeneration(this.generationContext(sourceChanged ? "source_replaced" : "core_replaced"));
           if (sourceChanged) {
             this.diagnostics?.log("video.source_replaced", {
-              source: currentSource3,
+              source: currentSource2,
               reason: "source_replaced"
             }, void 0, this.generationContext("source_replaced"));
           }
           if (coreChanged) {
             this.diagnostics?.log("video.core_replaced", {
-              source: currentSource3,
+              source: currentSource2,
               reason: "core_replaced"
             }, void 0, this.generationContext("core_replaced"));
           }
@@ -2491,7 +1599,7 @@
 
   // src/ui/panel.js
   var STATUS_MESSAGE_VERSION = 2;
-  var MODE_LABELS = Object.freeze({ live: "直播", video: "视频" });
+  var MODE_LABELS = Object.freeze({ video: "视频" });
   var VIDEO_FIELDS = Object.freeze([
     "mode",
     "state",
@@ -2499,23 +1607,6 @@
     "target",
     "effective",
     "error"
-  ]);
-  var LIVE_FIELDS = Object.freeze([
-    "mode",
-    "paused",
-    "recentFrame",
-    "buffered",
-    "delay",
-    "effective",
-    "resolution",
-    "quality",
-    "speed",
-    "videoReplacements",
-    "sourceReplacements",
-    "recentEvent",
-    "error",
-    "sessionId",
-    "persistence"
   ]);
   var VIDEO_STATE_LABELS = Object.freeze({
     WAITING: "等待",
@@ -2529,7 +1620,6 @@
   }
   function fieldsForMode(mode) {
     if (mode === "video") return VIDEO_FIELDS;
-    if (mode === "live") return LIVE_FIELDS;
     fail("UI_MODE_INVALID", `状态 surface 模式未允许: ${mode}`);
   }
   function createSurfaceId() {
@@ -2601,7 +1691,7 @@
     return currentSurface;
   }
   function createUnavailableStatusSnapshot(routeMode) {
-    const mode = routeMode === "live" ? "live" : routeMode === "video" || routeMode === "vod" ? "video" : void 0;
+    const mode = routeMode === "video" || routeMode === "vod" ? "video" : void 0;
     const fields = mode === void 0 ? ["mode"] : fieldsForMode(mode);
     return {
       version: STATUS_MESSAGE_VERSION,
@@ -2704,15 +1794,6 @@
       if (!CORE_SNAPSHOT_FIELDS.includes(field) || !isSerializable(value)) {
         fail("BRIDGE_SNAPSHOT_INVALID", `桥接内核快照字段无效: ${field}`);
       }
-    }
-    return snapshot;
-  }
-  function validateLiveCapabilitySnapshot(snapshot) {
-    if (!isObject(snapshot) || !isObject(snapshot.live) || typeof snapshot.live.disableAutoCatchup !== "boolean") {
-      fail("BRIDGE_LIVE_SNAPSHOT_INVALID", "桥接直播能力快照格式无效");
-    }
-    if (Object.keys(snapshot).some((field) => field !== "live") || Object.keys(snapshot.live).some((field) => field !== "disableAutoCatchup")) {
-      fail("BRIDGE_LIVE_SNAPSHOT_INVALID", "桥接直播能力快照包含未允许字段");
     }
     return snapshot;
   }
@@ -2920,24 +2001,6 @@
       return this.callCoreSync("setStableBufferTime", [seconds]);
     }
   };
-  var LiveCapabilities = class {
-    constructor(client, snapshot) {
-      validateLiveCapabilitySnapshot(snapshot);
-      this.client = client;
-      this.snapshot = snapshot;
-      this.used = false;
-    }
-    supportsDisableAutoCatchup() {
-      return this.snapshot.live.disableAutoCatchup === true;
-    }
-    async disableAutoCatchup() {
-      if (this.used) {
-        fail("LIVE_AUTO_CATCHUP_ALREADY_ATTEMPTED", "关闭自动追赶能力只能尝试一次");
-      }
-      this.used = true;
-      return this.client.callAsync("disableLiveAutoCatchup", []);
-    }
-  };
   function createPageWindowAdapter(client, windowObject = window) {
     const state = { core: void 0 };
     let refreshPromise;
@@ -2956,10 +2019,6 @@
     };
     return {
       pageWindow,
-      async refreshLiveCapabilities() {
-        const snapshot = await client.callAsync("getLiveCapabilitySnapshot", []);
-        return new LiveCapabilities(client, snapshot);
-      },
       async refreshCore() {
         if (refreshPromise === void 0) {
           refreshPromise = client.callAsync("getCoreSnapshot", []).then((snapshot) => {
@@ -3002,19 +2061,15 @@
   }
 
   // src/extension/controller.js
-  function isLivePage(locationObject) {
-    return locationObject.hostname === "live.bilibili.com";
-  }
   function isVideoPage(locationObject) {
     return isVideoLocation(locationObject);
   }
   var isVodPage = isVideoPage;
   function modeForLocation(locationObject) {
-    if (isLivePage(locationObject)) return "live";
     if (isVideoPage(locationObject)) return "video";
     return void 0;
   }
-  function collectSameOriginVideos2(documentObject) {
+  function collectSameOriginVideos(documentObject) {
     const videos = [...documentObject.querySelectorAll("video")];
     for (const iframe of documentObject.querySelectorAll("iframe")) {
       try {
@@ -3026,15 +2081,12 @@
     return videos;
   }
   function findLargestVideo(documentObject) {
-    const videos = collectSameOriginVideos2(documentObject).filter((video) => video.isConnected !== false);
+    const videos = collectSameOriginVideos(documentObject).filter((video) => video.isConnected !== false);
     return videos.sort((left, right) => {
       const leftArea = (left.clientWidth || 0) * (left.clientHeight || 0);
       const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);
       return rightArea - leftArea;
     })[0];
-  }
-  function preferenceKeyForMode(mode) {
-    return mode === "live" ? EXTENSION_PREFERENCES.liveEnabled : EXTENSION_PREFERENCES.vodEnabled;
   }
   function logger() {
     return {
@@ -3058,17 +2110,17 @@
       }
     };
   }
-  function setBootError(panel, error, mode) {
+  function setBootError(panel, error) {
     const normalized = toBufferScriptError(error, "BOOT_FAILED", "扩展控制器启动失败");
     panel.setModel({
-      mode: mode === "live" ? "直播" : "视频",
+      mode: "视频",
       state: "FAILED",
       error: `${normalized.code}: ${normalized.message}`,
       target: "120 秒"
     });
   }
   function readPreferences(storage) {
-    return storage.get([EXTENSION_PREFERENCES.liveEnabled, EXTENSION_PREFERENCES.vodEnabled]);
+    return storage.get([EXTENSION_PREFERENCES.vodEnabled]);
   }
   function popupError(error) {
     return {
@@ -3143,42 +2195,14 @@
       this.routeAbort = void 0;
       this.routeTimer = void 0;
       this.destroyed = false;
-      this.shimMutationObserver = void 0;
-      this.shimLastSequence = 0;
     }
     async start() {
       if (this.routeTimer !== void 0) throw new Error("扩展路由协调器已经启动");
-      if (typeof MutationObserver === "function" && this.documentObject.documentElement !== null) {
-        this.shimMutationObserver = new MutationObserver(() => {
-          const root = this.documentObject.documentElement;
-          if (root === null) return;
-          const seq = Number.parseInt(root.getAttribute(SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE) || "0", 10);
-          if (!Number.isInteger(seq) || seq <= this.shimLastSequence) return;
-          this.shimLastSequence = seq;
-          const raw = root.getAttribute(SHIM_OBSERVATION_ATTRIBUTE);
-          if (raw === null) return;
-          try {
-            const detail = JSON.parse(raw);
-            if (detail !== null && typeof detail === "object") {
-              this.diagnostics?.log("live.buffer.retained", detail);
-            }
-          } catch {
-          }
-        });
-        this.shimMutationObserver.observe(this.documentObject.documentElement, {
-          attributes: true,
-          attributeFilter: [SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE]
-        });
-      }
       this.diagnostics?.log("extension.started", { action: "coordinator" });
       this.preferences = await readPreferences(this.storage);
       if (this.windowObject.location.hostname === "www.bilibili.com") {
         postBankControl(this.windowObject, this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false);
       }
-      this.diagnostics?.log("preference.read", {
-        name: EXTENSION_PREFERENCES.liveEnabled,
-        enabled: this.preferences[EXTENSION_PREFERENCES.liveEnabled] !== false
-      });
       this.diagnostics?.log("preference.read", {
         name: EXTENSION_PREFERENCES.vodEnabled,
         enabled: this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false
@@ -3195,8 +2219,8 @@
       }, 250);
       await this.syncRoute();
     }
-    enabledFor(mode) {
-      return this.preferences[preferenceKeyForMode(mode)] !== false;
+    enabledFor() {
+      return this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false;
     }
     syncRoute() {
       if (this.syncPromise !== void 0) {
@@ -3232,9 +2256,9 @@
         this.finishRoute(routeAbort);
         return;
       }
-      if (!this.enabledFor(mode)) {
+      if (!this.enabledFor()) {
         this.diagnostics?.log("preference.disabled", {
-          name: preferenceKeyForMode(mode),
+          name: EXTENSION_PREFERENCES.vodEnabled,
           enabled: false
         });
         this.active = {
@@ -3268,55 +2292,29 @@
       };
       panel.setFreshnessCheck(() => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && this.active?.panel === panel && this.routeKey === href && this.windowObject.location.href === href && modeForLocation(this.windowObject.location) === mode);
       panel.setModel({
-        mode: mode === "live" ? "直播" : "视频",
-        ...mode === "live" ? {
-          paused: "未提供",
-          recentFrame: "未提供",
-          buffered: "未提供",
-          delay: "未提供",
-          sessionId: this.diagnostics?.getStatus?.().sessionId,
-          persistence: this.diagnostics?.getStatus?.().persistence
-        } : {
-          state: "WAITING",
-          buffered: "未提供",
-          target: "120 秒",
-          error: "等待原生 video、媒体 source 和播放器内核"
-        }
+        mode: "视频",
+        state: "WAITING",
+        buffered: "未提供",
+        target: "120 秒",
+        error: "等待原生 video、媒体 source 和播放器内核"
       });
-      this.diagnostics?.log("preference.changed", { name: preferenceKeyForMode(mode), enabled: true });
+      this.diagnostics?.log("preference.changed", { name: EXTENSION_PREFERENCES.vodEnabled, enabled: true });
       const routeStillCurrent = () => generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted && href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location) && this.active?.panel === panel;
       try {
         const pageAdapter = createPageWindowAdapter(this.bridgeClient, this.windowObject);
-        if (mode === "live") {
-          const controller = new LiveObserver({
-            windowObject: this.windowObject,
-            documentObject: this.documentObject,
-            runtimeObject: this.runtimeObject,
-            initialVideo: this.active.video,
-            panel,
-            pageAdapter,
-            diagnostics: this.diagnostics,
-            logger: this.logger
-          });
-          this.active.controller = controller;
-          panel.setSnapshotRefresh(() => controller.refreshStatus());
-          controller.start();
-          this.active.controllerStarted = true;
-        } else {
-          const controller = new VodBufferController({
-            video: this.active.video,
-            getVideo: () => findLargestVideo(this.documentObject),
-            panel,
-            runtimeObject: this.runtimeObject,
-            logger: this.logger,
-            diagnostics: this.diagnostics,
-            refreshCore: () => pageAdapter.refreshCore()
-          });
-          this.active.controller = controller;
-          panel.setSnapshotRefresh(() => controller.refreshStatus());
-          controller.start();
-          this.active.controllerStarted = true;
-        }
+        const controller = new VodBufferController({
+          video: this.active.video,
+          getVideo: () => findLargestVideo(this.documentObject),
+          panel,
+          runtimeObject: this.runtimeObject,
+          logger: this.logger,
+          diagnostics: this.diagnostics,
+          refreshCore: () => pageAdapter.refreshCore()
+        });
+        this.active.controller = controller;
+        panel.setSnapshotRefresh(() => controller.refreshStatus());
+        controller.start();
+        this.active.controllerStarted = true;
         if (!routeStillCurrent()) {
           await this.teardownActive();
         }
@@ -3340,7 +2338,7 @@
             this.diagnostics?.log("extension.boot_error", { action: `${mode}_passive` }, passiveError);
           }
         }
-        setBootError(panel, error, mode);
+        setBootError(panel, error);
         this.diagnostics?.log("extension.boot_error", { action: mode }, error);
       } finally {
         this.finishRoute(routeAbort);
@@ -3379,10 +2377,6 @@
       this.routeAbort?.abort();
       if (this.routeTimer !== void 0) this.runtimeObject.clearInterval(this.routeTimer);
       this.routeTimer = void 0;
-      if (this.shimMutationObserver !== void 0) {
-        this.shimMutationObserver.disconnect();
-        this.shimMutationObserver = void 0;
-      }
       await this.teardownActive();
       this.diagnostics?.log("extension.destroyed", { action: "coordinator" });
       this.destroyed = true;

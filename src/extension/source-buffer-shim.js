@@ -1,60 +1,12 @@
-import { LIVE_CONFIG } from '../constants.js';
-import {
-  SHIM_DIAGNOSTIC_ATTRIBUTE,
-  SHIM_OBSERVATION_ATTRIBUTE,
-  SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE,
-} from './bridge-contract.js';
-import { computeRetentionAction } from '../live/buffer-retention.js';
+import { SHIM_DIAGNOSTIC_ATTRIBUTE } from './bridge-contract.js';
 
-const RETAIN_SECONDS = LIVE_CONFIG.liveRetainSeconds;
 let installed = false;
-let observationSequence = 0;
 const stats = {
   removeCalls: 0,
-  intercepted: 0,
-  lastReason: null,
-  lastCurrentTime: null,
-  lastRemoveStart: null,
-  lastRemoveEnd: null,
-  lastOriginalEnd: null,
 };
 const sourceBufferTracks = new WeakMap();
 const appendErrors = Object.create(null);
 let activeSource;
-
-function findMaxVideoCurrentTime() {
-  const videos = [...document.querySelectorAll('video')];
-  for (const iframe of document.querySelectorAll('iframe')) {
-    try {
-      const iframeDocument = iframe.contentDocument;
-      if (iframeDocument !== null) {
-        videos.push(...iframeDocument.querySelectorAll('video'));
-      }
-    } catch { /* cross-origin iframe */ }
-  }
-  let latest = undefined;
-  for (const video of videos) {
-    if (video !== null && Number.isFinite(video.currentTime) && video.currentTime > 0) {
-      if (latest === undefined || video.currentTime > latest) latest = video.currentTime;
-    }
-  }
-  return latest;
-}
-
-function dispatchObservation(detail) {
-  try {
-    observationSequence += 1;
-    const seq = String(observationSequence);
-    const payload = JSON.stringify(detail);
-    const target = (window !== window.top && window.parent !== window)
-      ? (window.parent?.document?.documentElement ?? document.documentElement)
-      : document.documentElement;
-    if (target !== null) {
-      target.setAttribute(SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE, seq);
-      target.setAttribute(SHIM_OBSERVATION_ATTRIBUTE, payload);
-    }
-  } catch { /* page tearing down or cross-origin parent */ }
-}
 
 function readSourceBufferRanges(sourceBuffer) {
   const ranges = [];
@@ -86,7 +38,6 @@ function publishDiagnostics() {
       appendErrors: { ...appendErrors },
       removeStats: {
         removeCalls: stats.removeCalls,
-        intercepted: stats.intercepted,
       },
     }));
   } catch (error) {
@@ -156,36 +107,10 @@ if (typeof SourceBuffer !== 'undefined' && SourceBuffer.prototype && typeof Sour
   const originalRemove = SourceBuffer.prototype.remove;
   SourceBuffer.prototype.remove = function smoothRemove(start, end) {
     stats.removeCalls += 1;
-    if (window.location.hostname !== 'live.bilibili.com') {
-      return originalRemove.call(this, start, end);
-    }
-    const currentTime = findMaxVideoCurrentTime();
-    const action = computeRetentionAction(currentTime, start, end, RETAIN_SECONDS);
-    if (action === null) {
-      return originalRemove.call(this, start, end);
-    }
-    stats.intercepted += 1;
-    stats.lastCurrentTime = currentTime;
-    stats.lastRemoveStart = start;
-    stats.lastOriginalEnd = end;
-    dispatchDiagnostics();
-    if (action.action === 'skipped') {
-      stats.lastReason = 'skipped';
-      stats.lastRemoveEnd = end;
-      dispatchObservation({ reason: 'skipped', currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
-      const buffer = this;
-      setTimeout(() => {
-        try { buffer.dispatchEvent(new Event('updateend')); } catch { /* tearing down */ }
-      }, 0);
-      return;
-    }
-    stats.lastReason = 'truncated';
-    stats.lastRemoveEnd = action.adjustedEnd;
-    dispatchObservation({ reason: 'truncated', targetTime: action.adjustedEnd, currentTime, retainSeconds: RETAIN_SECONDS, originalEnd: end });
-    return originalRemove.call(this, start, action.adjustedEnd);
+    return originalRemove.call(this, start, end);
   };
   installed = true;
 }
 
-window.__smoothBufferShim = { retainSeconds: RETAIN_SECONDS, installed, stats };
+window.__smoothBufferShim = { installed, stats };
 dispatchDiagnostics();

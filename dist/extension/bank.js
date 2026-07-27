@@ -4,13 +4,11 @@
     manifestVersion: 3,
     minimumChromeVersion: "120",
     matches: Object.freeze([
-      "https://live.bilibili.com/*",
       "https://www.bilibili.com/*"
     ]),
     hostPermissions: Object.freeze([])
   });
   var EXTENSION_PREFERENCES = Object.freeze({
-    liveEnabled: "liveEnabled",
     vodEnabled: "vodEnabled"
   });
   var VOD_CONFIG = Object.freeze({
@@ -24,14 +22,6 @@
     foregroundDeadlineMs: 5e3,
     prefetchDeadlineMs: 2e4,
     latencyAlarmCount: 3
-  });
-  var LIVE_CONFIG = Object.freeze({
-    noDecodedFrameStallMilliseconds: 2e3,
-    userSeekAuthorizationMilliseconds: 1e3,
-    correctionToleranceSeconds: 2.5,
-    statusRefreshMilliseconds: 500,
-    delayUnavailableCheckMilliseconds: 5e3,
-    liveRetainSeconds: 30
   });
 
   // src/diagnostics/catalog.js
@@ -83,18 +73,6 @@
     "video.buffer_hint.unsupported",
     "video.buffer_hint.failed",
     "video.buffer_observed",
-    "live.stall.detected",
-    "live.stall.recovered",
-    "live.delay.observed",
-    "live.delay.corrected",
-    "live.delay.unavailable",
-    "live.buffer.retained",
-    "live.source_replaced",
-    "live.delay_protection.capability",
-    "live.delay_protection.applied",
-    "live.delay_protection.unsupported",
-    "live.delay_protection.failed",
-    "live.delay_protection.cancelled",
     "bridge.request",
     "bridge.response",
     "bridge.error",
@@ -168,25 +146,6 @@
       "encodedBodySize",
       "decodedBodySize"
     ]),
-    live: Object.freeze([
-      "reason",
-      "delayBeforeStall",
-      "stallDuration",
-      "targetDelay",
-      "protectedDelay",
-      "targetTime",
-      "currentTime",
-      "estimatedDelay",
-      "previousSource",
-      "source",
-      "videoInstance",
-      "sourceInstance",
-      "capability",
-      "status",
-      "waitedSeconds",
-      "retainSeconds",
-      "originalEnd"
-    ]),
     bridge: Object.freeze(["operation", "direction", "status"]),
     bank: Object.freeze([
       "source",
@@ -209,7 +168,6 @@
     if (code.startsWith("video.buffer_hint.") || code.startsWith("video.")) return DATA_ALLOWLIST.video;
     if (code.startsWith("media.")) return DATA_ALLOWLIST.media;
     if (code.startsWith("resource.")) return DATA_ALLOWLIST.resource;
-    if (code.startsWith("live.")) return DATA_ALLOWLIST.live;
     if (code.startsWith("bridge.")) return DATA_ALLOWLIST.bridge;
     if (code.startsWith("bank.")) return DATA_ALLOWLIST.bank;
     if (code.startsWith("extension.")) return DATA_ALLOWLIST.extension;

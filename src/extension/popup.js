@@ -4,23 +4,6 @@ import { logSessionFragment } from '../diagnostics/log-session.js';
 const MESSAGE_VERSION = 2;
 const PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
 const VIDEO_FIELDS = Object.freeze(['mode', 'state', 'buffered', 'target', 'effective', 'error']);
-const LIVE_FIELDS = Object.freeze([
-  'mode',
-  'paused',
-  'recentFrame',
-  'buffered',
-  'delay',
-  'effective',
-  'resolution',
-  'quality',
-  'speed',
-  'videoReplacements',
-  'sourceReplacements',
-  'recentEvent',
-  'error',
-  'sessionId',
-  'persistence',
-]);
 
 const statusElement = document.querySelector('[data-status]');
 const inputs = new Map(
@@ -33,19 +16,13 @@ function displayValue(value) {
 }
 
 function fieldsForSnapshot(snapshot) {
-  return snapshot?.mode === '直播' ? LIVE_FIELDS : VIDEO_FIELDS;
+  return VIDEO_FIELDS;
 }
 
 function renderSnapshot(snapshot) {
   const values = snapshot || {};
   const fields = fieldsForSnapshot(values);
-  const live = values.mode === '直播';
-  for (const row of document.querySelectorAll('[data-mode-only]')) {
-    row.hidden = row.dataset.modeOnly !== (live ? 'live' : values.mode === '视频' ? 'video' : 'none');
-  }
-  for (const row of document.querySelectorAll('[data-live-only="true"]')) row.hidden = !live;
-  for (const row of document.querySelectorAll('[data-video-only="true"]')) row.hidden = live;
-  for (const field of new Set([...VIDEO_FIELDS, ...LIVE_FIELDS])) {
+  for (const field of VIDEO_FIELDS) {
     const element = document.querySelector(`[data-status-field="${field}"]`);
     if (element !== null) element.textContent = fields.includes(field) ? displayValue(values[field]) : '未提供';
   }

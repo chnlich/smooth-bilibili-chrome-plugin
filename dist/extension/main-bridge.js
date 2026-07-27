@@ -6,16 +6,8 @@
   var BRIDGE_RESPONSE_ATTRIBUTE = "data-bilibili-buffer-bridge-response-v1";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
-    "callCoreSync",
-    "getLiveCapabilitySnapshot",
-    "disableLiveAutoCatchup"
+    "callCoreSync"
   ]);
-  var BRIDGE_LIVE_METHODS = Object.freeze([
-    "setChasingFrameThreshold"
-  ]);
-  var BRIDGE_LIVE_DISABLE_ARGS = Object.freeze({
-    setChasingFrameThreshold: 600
-  });
   var BRIDGE_CORE_SYNC_METHODS = Object.freeze(["setStableBufferTime"]);
   function encodeMessage(message) {
     return JSON.stringify(message);
@@ -191,60 +183,6 @@
     }
     return args;
   }
-  function livePlayerCandidates() {
-    const windows = [globalThis];
-    for (const iframe of document.querySelectorAll("iframe")) {
-      try {
-        const contentWindow = iframe.contentWindow;
-        if (contentWindow !== null) windows.push(contentWindow);
-      } catch {
-      }
-    }
-    const candidates = [];
-    for (const windowObject of windows) {
-      candidates.push(
-        windowObject.__PLAYER_GLOBAL_INSTANCE__,
-        windowObject.EmbedPlayer?.instance,
-        windowObject.livePlayer,
-        windowObject.player
-      );
-    }
-    return candidates.filter((candidate) => candidate !== void 0 && candidate !== null);
-  }
-  function liveAutoCatchupCandidate() {
-    return livePlayerCandidates().find((candidate) => BRIDGE_LIVE_METHODS.some((method) => typeof candidate?.[method] === "function"));
-  }
-  function getLiveCapabilitySnapshot() {
-    const candidate = liveAutoCatchupCandidate();
-    return {
-      live: {
-        disableAutoCatchup: candidate !== void 0
-      }
-    };
-  }
-  async function disableLiveAutoCatchup() {
-    const candidate = liveAutoCatchupCandidate();
-    if (candidate === void 0) {
-      throw Object.assign(new Error("页面播放器没有关闭自动追赶能力"), {
-        code: "LIVE_AUTO_CATCHUP_UNAVAILABLE"
-      });
-    }
-    const applied = [];
-    for (const method of BRIDGE_LIVE_METHODS) {
-      if (typeof candidate[method] !== "function") continue;
-      const args = BRIDGE_LIVE_DISABLE_ARGS[method];
-      try {
-        await candidate[method](args);
-        applied.push(method);
-      } catch (error) {
-        throw Object.assign(new Error(`关闭自动追赶方法 ${method} 调用失败: ${error?.message || error}`), {
-          code: "LIVE_AUTO_CATCHUP_FAILED",
-          cause: error
-        });
-      }
-    }
-    return { applied };
-  }
   function callCoreSync(args) {
     const [coreId, method, methodArgs, source] = requireArguments(args, 4);
     if (!Number.isInteger(coreId) || typeof source !== "string" || !BRIDGE_CORE_SYNC_METHODS.includes(method)) {
@@ -271,12 +209,6 @@
         return getCoreSnapshot();
       case "callCoreSync":
         return callCoreSync(request.args);
-      case "getLiveCapabilitySnapshot":
-        requireArguments(request.args, 0);
-        return getLiveCapabilitySnapshot();
-      case "disableLiveAutoCatchup":
-        requireArguments(request.args, 0);
-        return disableLiveAutoCatchup();
       default:
         throw new Error(`未处理的桥接操作: ${request.operation}`);
     }

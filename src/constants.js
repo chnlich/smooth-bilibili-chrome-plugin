@@ -4,14 +4,12 @@ export const EXTENSION_MANIFEST = Object.freeze({
   manifestVersion: 3,
   minimumChromeVersion: '120',
   matches: Object.freeze([
-    'https://live.bilibili.com/*',
     'https://www.bilibili.com/*',
   ]),
   hostPermissions: Object.freeze([]),
 });
 
 export const EXTENSION_PREFERENCES = Object.freeze({
-  liveEnabled: 'liveEnabled',
   vodEnabled: 'vodEnabled',
 });
 
@@ -27,15 +25,6 @@ export const BANK_CONFIG = Object.freeze({
   foregroundDeadlineMs: 5000,
   prefetchDeadlineMs: 20000,
   latencyAlarmCount: 3,
-});
-
-export const LIVE_CONFIG = Object.freeze({
-  noDecodedFrameStallMilliseconds: 2000,
-  userSeekAuthorizationMilliseconds: 1000,
-  correctionToleranceSeconds: 2.5,
-  statusRefreshMilliseconds: 500,
-  delayUnavailableCheckMilliseconds: 5000,
-  liveRetainSeconds: 30,
 });
 
 export const DIAGNOSTIC_MESSAGE_VERSION = 1;

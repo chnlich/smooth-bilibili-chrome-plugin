@@ -39,9 +39,6 @@ function eventNow() {
 function routeIdentity(locationObject) {
   const pathname = locationObject.pathname || '/';
   const part = new URLSearchParams(locationObject.search || '').get('p') || undefined;
-  if (locationObject.hostname === 'live.bilibili.com') {
-    return { routeKind: 'live', roomId: pathname.split('/')[1] || undefined, part };
-  }
   if (locationObject.hostname === 'www.bilibili.com' && pathname.startsWith('/video/')) {
     return { routeKind: 'video', bvid: pathname.split('/')[2] || undefined, part };
   }

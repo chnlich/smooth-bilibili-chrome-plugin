@@ -126,21 +126,6 @@ function validateCoreSnapshot(snapshot) {
   return snapshot;
 }
 
-function validateLiveCapabilitySnapshot(snapshot) {
-  if (
-    !isObject(snapshot) ||
-    !isObject(snapshot.live) ||
-    typeof snapshot.live.disableAutoCatchup !== 'boolean'
-  ) {
-    fail('BRIDGE_LIVE_SNAPSHOT_INVALID', '桥接直播能力快照格式无效');
-  }
-  if (Object.keys(snapshot).some((field) => field !== 'live') ||
-    Object.keys(snapshot.live).some((field) => field !== 'disableAutoCatchup')) {
-    fail('BRIDGE_LIVE_SNAPSHOT_INVALID', '桥接直播能力快照包含未允许字段');
-  }
-  return snapshot;
-}
-
 function responseError(response) {
   const error = new BufferScriptError(
     response.error?.code || 'BRIDGE_CALL_FAILED',
@@ -364,27 +349,6 @@ export class BridgeCore {
   }
 }
 
-export class LiveCapabilities {
-  constructor(client, snapshot) {
-    validateLiveCapabilitySnapshot(snapshot);
-    this.client = client;
-    this.snapshot = snapshot;
-    this.used = false;
-  }
-
-  supportsDisableAutoCatchup() {
-    return this.snapshot.live.disableAutoCatchup === true;
-  }
-
-  async disableAutoCatchup() {
-    if (this.used) {
-      fail('LIVE_AUTO_CATCHUP_ALREADY_ATTEMPTED', '关闭自动追赶能力只能尝试一次');
-    }
-    this.used = true;
-    return this.client.callAsync('disableLiveAutoCatchup', []);
-  }
-}
-
 export function createPageWindowAdapter(client, windowObject = window) {
   const state = { core: undefined };
   let refreshPromise;
@@ -403,10 +367,6 @@ export function createPageWindowAdapter(client, windowObject = window) {
   };
   return {
     pageWindow,
-    async refreshLiveCapabilities() {
-      const snapshot = await client.callAsync('getLiveCapabilitySnapshot', []);
-      return new LiveCapabilities(client, snapshot);
-    },
     async refreshCore() {
       if (refreshPromise === undefined) {
         refreshPromise = client

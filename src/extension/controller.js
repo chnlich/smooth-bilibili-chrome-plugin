@@ -1,7 +1,6 @@
 import { EXTENSION_PREFERENCES } from '../constants.js';
 import { DiagnosticsClient, createRouteIdentity } from '../diagnostics/client.js';
 import { PassiveMediaObserver } from '../diagnostics/passive-media-observer.js';
-import { LiveObserver } from '../live/observer.js';
 import { VodBufferController } from '../vod/controller.js';
 import { fail, toBufferScriptError } from '../errors.js';
 import {
@@ -11,16 +10,11 @@ import {
   getCurrentStatusSurface,
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
-import { SHIM_OBSERVATION_ATTRIBUTE, SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE } from './bridge-contract.js';
 import {
   isBankDiagnosticMessage,
   postBankControl,
 } from '../bank/contract.js';
 import { isVideoLocation } from '../bank/logic.js';
-
-export function isLivePage(locationObject) {
-  return locationObject.hostname === 'live.bilibili.com';
-}
 
 export function isVideoPage(locationObject) {
   return isVideoLocation(locationObject);
@@ -29,7 +23,6 @@ export function isVideoPage(locationObject) {
 export const isVodPage = isVideoPage;
 
 export function modeForLocation(locationObject) {
-  if (isLivePage(locationObject)) return 'live';
   if (isVideoPage(locationObject)) return 'video';
   return undefined;
 }
@@ -52,10 +45,6 @@ export function findLargestVideo(documentObject) {
     const rightArea = (right.clientWidth || 0) * (right.clientHeight || 0);
     return rightArea - leftArea;
   })[0];
-}
-
-function preferenceKeyForMode(mode) {
-  return mode === 'live' ? EXTENSION_PREFERENCES.liveEnabled : EXTENSION_PREFERENCES.vodEnabled;
 }
 
 function logger() {
@@ -82,10 +71,10 @@ export function installBankDiagnostics({ windowObject = window, diagnostics } = 
   };
 }
 
-function setBootError(panel, error, mode) {
+function setBootError(panel, error) {
   const normalized = toBufferScriptError(error, 'BOOT_FAILED', '扩展控制器启动失败');
   panel.setModel({
-    mode: mode === 'live' ? '直播' : '视频',
+    mode: '视频',
     state: 'FAILED',
     error: `${normalized.code}: ${normalized.message}`,
     target: '120 秒',
@@ -93,7 +82,7 @@ function setBootError(panel, error, mode) {
 }
 
 function readPreferences(storage) {
-  return storage.get([EXTENSION_PREFERENCES.liveEnabled, EXTENSION_PREFERENCES.vodEnabled]);
+  return storage.get([EXTENSION_PREFERENCES.vodEnabled]);
 }
 
 function popupError(error) {
@@ -175,42 +164,15 @@ export class ExtensionCoordinator {
     this.routeAbort = undefined;
     this.routeTimer = undefined;
     this.destroyed = false;
-    this.shimMutationObserver = undefined;
-    this.shimLastSequence = 0;
   }
 
   async start() {
     if (this.routeTimer !== undefined) throw new Error('扩展路由协调器已经启动');
-    if (typeof MutationObserver === 'function' && this.documentObject.documentElement !== null) {
-      this.shimMutationObserver = new MutationObserver(() => {
-        const root = this.documentObject.documentElement;
-        if (root === null) return;
-        const seq = Number.parseInt(root.getAttribute(SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE) || '0', 10);
-        if (!Number.isInteger(seq) || seq <= this.shimLastSequence) return;
-        this.shimLastSequence = seq;
-        const raw = root.getAttribute(SHIM_OBSERVATION_ATTRIBUTE);
-        if (raw === null) return;
-        try {
-          const detail = JSON.parse(raw);
-          if (detail !== null && typeof detail === 'object') {
-            this.diagnostics?.log('live.buffer.retained', detail);
-          }
-        } catch { /* malformed observation payload */ }
-      });
-      this.shimMutationObserver.observe(this.documentObject.documentElement, {
-        attributes: true,
-        attributeFilter: [SHIM_OBSERVATION_SEQUENCE_ATTRIBUTE],
-      });
-    }
     this.diagnostics?.log('extension.started', { action: 'coordinator' });
     this.preferences = await readPreferences(this.storage);
     if (this.windowObject.location.hostname === 'www.bilibili.com') {
       postBankControl(this.windowObject, this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false);
     }
-    this.diagnostics?.log('preference.read', {
-      name: EXTENSION_PREFERENCES.liveEnabled,
-      enabled: this.preferences[EXTENSION_PREFERENCES.liveEnabled] !== false,
-    });
     this.diagnostics?.log('preference.read', {
       name: EXTENSION_PREFERENCES.vodEnabled,
       enabled: this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false,
@@ -228,8 +190,8 @@ export class ExtensionCoordinator {
     await this.syncRoute();
   }
 
-  enabledFor(mode) {
-    return this.preferences[preferenceKeyForMode(mode)] !== false;
+  enabledFor() {
+    return this.preferences[EXTENSION_PREFERENCES.vodEnabled] !== false;
   }
 
   syncRoute() {
@@ -267,9 +229,9 @@ export class ExtensionCoordinator {
       this.finishRoute(routeAbort);
       return;
     }
-    if (!this.enabledFor(mode)) {
+    if (!this.enabledFor()) {
       this.diagnostics?.log('preference.disabled', {
-        name: preferenceKeyForMode(mode),
+        name: EXTENSION_PREFERENCES.vodEnabled,
         enabled: false,
       });
       this.active = {
@@ -310,60 +272,32 @@ export class ExtensionCoordinator {
       this.windowObject.location.href === href &&
       modeForLocation(this.windowObject.location) === mode);
     panel.setModel({
-      mode: mode === 'live' ? '直播' : '视频',
-      ...(mode === 'live'
-        ? {
-          paused: '未提供',
-          recentFrame: '未提供',
-          buffered: '未提供',
-          delay: '未提供',
-          sessionId: this.diagnostics?.getStatus?.().sessionId,
-          persistence: this.diagnostics?.getStatus?.().persistence,
-        }
-        : {
-          state: 'WAITING',
-          buffered: '未提供',
-          target: '120 秒',
-          error: '等待原生 video、媒体 source 和播放器内核',
-        }),
+      mode: '视频',
+      state: 'WAITING',
+      buffered: '未提供',
+      target: '120 秒',
+      error: '等待原生 video、媒体 source 和播放器内核',
     });
-    this.diagnostics?.log('preference.changed', { name: preferenceKeyForMode(mode), enabled: true });
+    this.diagnostics?.log('preference.changed', { name: EXTENSION_PREFERENCES.vodEnabled, enabled: true });
     const routeStillCurrent = () =>
       generation === this.routeGeneration && !this.destroyed && !routeAbort.signal.aborted &&
       href === this.windowObject.location.href && mode === modeForLocation(this.windowObject.location) &&
       this.active?.panel === panel;
     try {
       const pageAdapter = createPageWindowAdapter(this.bridgeClient, this.windowObject);
-      if (mode === 'live') {
-        const controller = new LiveObserver({
-          windowObject: this.windowObject,
-          documentObject: this.documentObject,
-          runtimeObject: this.runtimeObject,
-          initialVideo: this.active.video,
-          panel,
-          pageAdapter,
-          diagnostics: this.diagnostics,
-          logger: this.logger,
-        });
-        this.active.controller = controller;
-        panel.setSnapshotRefresh(() => controller.refreshStatus());
-        controller.start();
-        this.active.controllerStarted = true;
-      } else {
-        const controller = new VodBufferController({
-          video: this.active.video,
-          getVideo: () => findLargestVideo(this.documentObject),
-          panel,
-          runtimeObject: this.runtimeObject,
-          logger: this.logger,
-          diagnostics: this.diagnostics,
-          refreshCore: () => pageAdapter.refreshCore(),
-        });
-        this.active.controller = controller;
-        panel.setSnapshotRefresh(() => controller.refreshStatus());
-        controller.start();
-        this.active.controllerStarted = true;
-      }
+      const controller = new VodBufferController({
+        video: this.active.video,
+        getVideo: () => findLargestVideo(this.documentObject),
+        panel,
+        runtimeObject: this.runtimeObject,
+        logger: this.logger,
+        diagnostics: this.diagnostics,
+        refreshCore: () => pageAdapter.refreshCore(),
+      });
+      this.active.controller = controller;
+      panel.setSnapshotRefresh(() => controller.refreshStatus());
+      controller.start();
+      this.active.controllerStarted = true;
       if (!routeStillCurrent()) {
         await this.teardownActive();
       }
@@ -386,7 +320,7 @@ export class ExtensionCoordinator {
           this.diagnostics?.log('extension.boot_error', { action: `${mode}_passive` }, passiveError);
         }
       }
-      setBootError(panel, error, mode);
+      setBootError(panel, error);
       this.diagnostics?.log('extension.boot_error', { action: mode }, error);
     } finally {
       this.finishRoute(routeAbort);
@@ -433,10 +367,6 @@ export class ExtensionCoordinator {
     this.routeAbort?.abort();
     if (this.routeTimer !== undefined) this.runtimeObject.clearInterval(this.routeTimer);
     this.routeTimer = undefined;
-    if (this.shimMutationObserver !== undefined) {
-      this.shimMutationObserver.disconnect();
-      this.shimMutationObserver = undefined;
-    }
     await this.teardownActive();
     this.diagnostics?.log('extension.destroyed', { action: 'coordinator' });
     this.destroyed = true;

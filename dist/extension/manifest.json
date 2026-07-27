@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Bilibili 桌面网页抗卡",
   "version": "1.0.0",
-  "description": "直播原生播放延迟连续性与视频原生 120 秒缓存提示增强",
+  "description": "视频原生 120 秒缓存提示增强",
   "minimum_chrome_version": "120",
   "permissions": [
     "storage",
@@ -19,7 +19,6 @@
   "content_scripts": [
     {
       "matches": [
-        "https://live.bilibili.com/*",
         "https://www.bilibili.com/*"
       ],
       "js": [
@@ -31,7 +30,6 @@
     },
     {
       "matches": [
-        "https://live.bilibili.com/*",
         "https://www.bilibili.com/*"
       ],
       "js": [
@@ -43,7 +41,6 @@
     },
     {
       "matches": [
-        "https://live.bilibili.com/*",
         "https://www.bilibili.com/*"
       ],
       "js": [
@@ -55,7 +52,6 @@
     },
     {
       "matches": [
-        "https://live.bilibili.com/*",
         "https://www.bilibili.com/*"
       ],
       "js": [
