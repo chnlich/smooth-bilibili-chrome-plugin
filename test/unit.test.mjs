@@ -584,6 +584,19 @@ test('diagnostic catalog covers all required media events and preserves browser-
     pathname: '/video/BVprivacy',
     bvid: 'BVprivacy',
   });
+  const persistedFailure = normalizeEventForStorage({
+    sessionId: 'session-persist-code',
+    sequence: 1,
+    wallTime: '2026-07-20T00:00:00.000Z',
+    elapsedMs: 0,
+    code: 'log.persist.degraded',
+    data: { status: 'DEGRADED', code: 'IDB_EVENT_WRITE_FAILED' },
+  });
+  assert.equal(persistedFailure.data.code, 'IDB_EVENT_WRITE_FAILED');
+  assert.equal(
+    sanitizeEventData('log.persist.degraded', { code: 'free text with secret' }).code,
+    '未提供',
+  );
 });
 
 test('media attribution fields pass through the existing privacy path', () => {
@@ -845,6 +858,112 @@ test('diagnostics pagehide drains queued batches after an in-flight commit', asy
   assert.ok(sent[0].events.some((event) => event.code === 'route.session_started'));
   assert.ok(sent[1].events.some((event) => event.code === 'video.attached'));
   assert.ok(sent[1].events.some((event) => event.code === 'route.changed'));
+});
+
+test('diagnostic persistence retries the failed head with bounded backoff without reordering batches', async () => {
+  const sent = [];
+  const timers = [];
+  const locationObject = {
+    origin: 'https://www.bilibili.com',
+    hostname: 'www.bilibili.com',
+    pathname: '/video/BVretry',
+  };
+  const windowObject = {
+    location: locationObject,
+    setTimeout(callback, milliseconds) {
+      const timer = { milliseconds, cleared: false, fired: false };
+      timer.callback = () => {
+        timer.fired = true;
+        callback();
+      };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) { timer.cleared = true; },
+  };
+  const client = new DiagnosticsClient({
+    documentObject: { defaultView: { addEventListener() {} } },
+    windowObject,
+    runtimeObject: {
+      sendMessage(message, callback) {
+        sent.push(message);
+        if (sent.length === 1) {
+          callback({ ok: false, error: { code: 'IDB_EVENT_WRITE_FAILED', message: 'synthetic failure' } });
+          return;
+        }
+        callback({ ok: true, status: 'PERSISTED', eventCount: message.events.length });
+      },
+    },
+    locationObject,
+    loggerObject: { log() {}, warn() {}, error() {} },
+  });
+  await client.flush();
+  client.log('route.changed', { reason: 'spa_media_change' });
+  const retryTimer = timers.find((timer) => timer.milliseconds === 100 && timer.cleared === false);
+  assert.notEqual(retryTimer, undefined);
+  retryTimer.callback();
+  await tick();
+  await client.flush();
+  assert.deepEqual(sent.slice(0, 2).map((message) => message.events.map((event) => event.sequence)), [[1], [1]]);
+  assert.deepEqual(sent.slice(2).flatMap((message) => message.events.map((event) => event.sequence)), [2, 3, 4]);
+  assert.ok(sent.slice(2).every((message) => message.events[0].sequence >= 2));
+  const degradedEvent = sent.slice(2).flatMap((message) => message.events)
+    .find((event) => event.code === 'log.persist.degraded');
+  assert.equal(degradedEvent.data.code, 'IDB_EVENT_WRITE_FAILED');
+  assert.equal(client.outbox.length, 0);
+  client.destroy();
+});
+
+test('diagnostic persistence stops automatic retries at the bound and keeps the failed head', async () => {
+  const timers = [];
+  const locationObject = {
+    origin: 'https://www.bilibili.com',
+    hostname: 'www.bilibili.com',
+    pathname: '/video/BVretry-cap',
+  };
+  const windowObject = {
+    location: locationObject,
+    setTimeout(callback, milliseconds) {
+      const timer = { milliseconds, cleared: false, fired: false };
+      timer.callback = () => {
+        timer.fired = true;
+        callback();
+      };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) { timer.cleared = true; },
+  };
+  const client = new DiagnosticsClient({
+    documentObject: { defaultView: { addEventListener() {} } },
+    windowObject,
+    runtimeObject: {
+      sendMessage(message, callback) {
+        callback({ ok: false, error: { code: 'IDB_EVENT_WRITE_FAILED', message: 'synthetic failure' } });
+      },
+    },
+    locationObject,
+    loggerObject: { log() {}, warn() {}, error() {} },
+  });
+  await client.flush();
+  for (const delay of [100, 200, 400, 800, 1600]) {
+    const retryTimer = timers.find((timer) => timer.milliseconds === delay
+      && timer.cleared === false && timer.fired === false);
+    assert.notEqual(retryTimer, undefined);
+    retryTimer.callback();
+    await tick();
+  }
+  assert.equal(client.outbox.length, 2);
+  assert.equal(client.outbox[0].batch[0].sequence, 1);
+  assert.equal(timers.some((timer) => timer.milliseconds > 0 && timer.milliseconds <= 5000
+    && timer.cleared === false && timer.fired === false), false);
+  client.log('route.changed', { reason: 'next_event_retries_head' });
+  await client.flush();
+  assert.equal(client.outbox.length, 3);
+  assert.equal(client.outbox[0].batch[0].sequence, 1);
+  assert.equal(timers.some((timer) => timer.milliseconds > 0 && timer.milliseconds <= 5000
+    && timer.cleared === false && timer.fired === false), false);
+  client.destroy();
 });
 
 test('resource timing observer snapshots prototype fields before privacy filtering', async () => {

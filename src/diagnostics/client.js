@@ -1,7 +1,16 @@
-import { DIAGNOSTIC_MESSAGE_VERSION } from './catalog.js';
+import { DIAGNOSTIC_MESSAGE_VERSION, isSafePersistErrorCode } from './catalog.js';
 import { normalizeEventForStorage, resourceTimingFields } from './privacy.js';
 import { createSessionIdentity } from './session.js';
 import { serializeError } from '../extension/bridge-contract.js';
+
+const PERSIST_RETRY_BASE_DELAY_MS = 100;
+const PERSIST_RETRY_MAX_DELAY_MS = 5000;
+const PERSIST_RETRY_MAX_ATTEMPTS = 5;
+
+function persistenceErrorCode(value) {
+  const code = typeof value === 'string' ? value : value?.code;
+  return isSafePersistErrorCode(code) ? code : 'LOG_PERSIST_FAILED';
+}
 
 function runtimeSendMessage(runtimeObject, message) {
   if (runtimeObject === undefined || typeof runtimeObject.sendMessage !== 'function') {
@@ -78,6 +87,8 @@ export class DiagnosticsClient {
     this.outbox = [];
     this.flushScheduled = false;
     this.flushPromise = undefined;
+    this.retryTimer = undefined;
+    this.retryItem = undefined;
     this.destroyed = false;
     this.tearingDown = false;
     this.persistence = '未提供';
@@ -227,13 +238,20 @@ export class DiagnosticsClient {
 
   enqueuePendingBatch() {
     if (this.pending.length === 0 || this.session === undefined) return;
-    this.outbox.push({ session: this.session, batch: this.pending.splice(0, this.pending.length), failed: false });
+    this.outbox.push({
+      session: this.session,
+      batch: this.pending.splice(0, this.pending.length),
+      failed: false,
+      retryCount: 0,
+      retryScheduled: false,
+    });
   }
 
   flushOutbox() {
     if (this.flushPromise !== undefined) return this.flushPromise;
     if (this.outbox.length === 0) return undefined;
     const item = this.outbox.shift();
+    this.cancelScheduledRetry(item);
     item.failed = false;
     const { batch, session } = item;
     this.flushPromise = runtimeSendMessage(this.runtimeObject, {
@@ -244,7 +262,7 @@ export class DiagnosticsClient {
     }).then((response) => {
       if (response?.ok !== true || !['PERSISTED', 'DUPLICATE'].includes(response.status)) {
         throw Object.assign(new Error(response?.error?.message || '日志事务没有提交'), {
-          code: response?.error?.code || 'LOG_PERSIST_FAILED',
+          code: persistenceErrorCode(response?.error),
         });
       }
       this.persistence = response.status;
@@ -257,17 +275,20 @@ export class DiagnosticsClient {
     }).catch((error) => {
       this.persistence = 'DEGRADED';
       item.failed = true;
+      item.retryCount += 1;
       this.outbox.unshift(item);
       this.pendingPersistResult = {
         status: 'DEGRADED',
         batchSize: batch.length,
         message: error.message || String(error),
+        code: persistenceErrorCode(error),
       };
       try {
         this.logger.error?.('[BilibiliBuffer] diagnostic persistence degraded', serializeError(error));
       } catch (consoleError) {
         this.logger.warn?.('[BilibiliBuffer] diagnostic degraded mirror failed', serializeError(consoleError));
       }
+      this.scheduleHeadRetry(item);
       return { status: 'DEGRADED', error: serializeError(error) };
     }).finally(() => {
       this.flushPromise = undefined;
@@ -276,6 +297,31 @@ export class DiagnosticsClient {
       }
     });
     return this.flushPromise;
+  }
+
+  cancelScheduledRetry(item) {
+    if (this.retryItem !== item) return;
+    this.windowObject.clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    this.retryItem = undefined;
+    item.retryScheduled = false;
+  }
+
+  scheduleHeadRetry(item) {
+    if (this.destroyed || this.tearingDown || this.outbox[0] !== item
+      || item.retryCount > PERSIST_RETRY_MAX_ATTEMPTS || item.retryScheduled === true) return;
+    const delay = Math.min(
+      PERSIST_RETRY_BASE_DELAY_MS * (2 ** (item.retryCount - 1)),
+      PERSIST_RETRY_MAX_DELAY_MS,
+    );
+    item.retryScheduled = true;
+    this.retryItem = item;
+    this.retryTimer = this.windowObject.setTimeout(() => {
+      this.retryTimer = undefined;
+      this.retryItem = undefined;
+      item.retryScheduled = false;
+      if (!this.destroyed && !this.tearingDown && this.outbox[0] === item) void this.flushOutbox();
+    }, delay);
   }
 
   getStatus() {
@@ -288,6 +334,7 @@ export class DiagnosticsClient {
   beginTeardown() {
     if (this.tearingDown) return;
     this.tearingDown = true;
+    if (this.retryItem !== undefined) this.cancelScheduledRetry(this.retryItem);
     if (this.noVideoTimer !== undefined) this.windowObject.clearTimeout(this.noVideoTimer);
     this.resourceObserver?.disconnect?.();
   }

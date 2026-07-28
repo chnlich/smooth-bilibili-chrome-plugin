@@ -156,7 +156,7 @@
       "reason"
     ]),
     extension: Object.freeze(["action", "reason", "status"]),
-    persist: Object.freeze(["status", "batchSize", "eventCount", "message"])
+    persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
   });
   function allowedDataFields(code) {
     if (code.startsWith("route.")) return DATA_ALLOWLIST.route;
