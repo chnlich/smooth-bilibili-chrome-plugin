@@ -631,6 +631,7 @@
         this._timedOut = false;
         this._suppressNativeLoadstart = false;
         this._generation = 0;
+        this._nativeContentRangeTap = void 0;
         for (const eventName of EVENT_NAMES) {
           this._native.addEventListener(eventName, (event) => {
             if (!this._intercepted) {
@@ -687,6 +688,7 @@
         this._native.withCredentials = value;
       }
       open(...args) {
+        this.clearNativeContentRangeTap();
         this._abortController?.abort();
         this.clearTimer();
         this._generation += 1;
@@ -805,13 +807,24 @@
         void this.serve(served, url, body, generation);
       }
       tapNativeContentRange(url) {
+        this.clearNativeContentRangeTap();
         const onReadyStateChange = () => {
           if (this._native.readyState < 2) return;
-          this._native.removeEventListener("readystatechange", onReadyStateChange);
+          this.clearNativeContentRangeTap();
           const contentRange = parseContentRange(this._native.getResponseHeader("Content-Range"));
           if (contentRange !== void 0) bank.recordTotalSize(url, contentRange.totalSize);
         };
+        const onLoadEnd = () => this.clearNativeContentRangeTap();
+        this._nativeContentRangeTap = { onReadyStateChange, onLoadEnd };
         this._native.addEventListener("readystatechange", onReadyStateChange);
+        this._native.addEventListener("loadend", onLoadEnd);
+      }
+      clearNativeContentRangeTap() {
+        if (this._nativeContentRangeTap === void 0) return;
+        const { onReadyStateChange, onLoadEnd } = this._nativeContentRangeTap;
+        this._native.removeEventListener("readystatechange", onReadyStateChange);
+        this._native.removeEventListener("loadend", onLoadEnd);
+        this._nativeContentRangeTap = void 0;
       }
       async serve(result, url, body, generation) {
         try {

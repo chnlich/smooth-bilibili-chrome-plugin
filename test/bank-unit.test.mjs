@@ -912,6 +912,31 @@ test('XHR cache miss sends the native request without interception state or load
   assert.equal(xhr._native.abortCalls, 1);
 });
 
+test('XHR Content-Range tap is removed when a native request ends before headers', () => {
+  const { bank, windowObject } = createBank({
+    nativeFetch: async () => { throw new Error('bank network must not run'); },
+  });
+  windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({ windowObject, nativeConstructor: NativeXHR, bank });
+  const xhr = new windowObject.XMLHttpRequest();
+  xhr.open('GET', MEDIA_URL);
+  xhr.setRequestHeader('Range', 'bytes=0-2');
+  xhr.send();
+  assert.equal(xhr._native.listeners.get('readystatechange').size, 2);
+
+  xhr._native.emit('loadend');
+  assert.equal(xhr._native.listeners.get('readystatechange').size, 1);
+
+  const nextUrl = 'https://upos-sz-mirrorcosov.bilivideo.com/video/next.m4s';
+  xhr.open('GET', nextUrl);
+  xhr.setRequestHeader('Range', 'bytes=0-2');
+  xhr.send();
+  xhr._native.responseHeaders = { 'Content-Range': 'bytes 0-2/200' };
+  xhr._native.readyState = 2;
+  xhr._native.emit('readystatechange');
+  assert.equal(bank.stateFor(MEDIA_KEY).totalSize, undefined);
+  assert.equal(bank.stateFor('/video/next.m4s').totalSize, 200);
+});
+
 test('XHR BankFallbackError returns the request to the native XHR unchanged', async () => {
   const windowObject = windowFixture();
   const bank = {

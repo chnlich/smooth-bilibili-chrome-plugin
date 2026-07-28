@@ -77,6 +77,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._timedOut = false;
       this._suppressNativeLoadstart = false;
       this._generation = 0;
+      this._nativeContentRangeTap = undefined;
       for (const eventName of EVENT_NAMES) {
         this._native.addEventListener(eventName, (event) => {
           if (!this._intercepted) {
@@ -126,6 +127,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
     set withCredentials(value) { this._native.withCredentials = value; }
 
     open(...args) {
+      this.clearNativeContentRangeTap();
       this._abortController?.abort();
       this.clearTimer();
       this._generation += 1;
@@ -251,13 +253,25 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
     }
 
     tapNativeContentRange(url) {
+      this.clearNativeContentRangeTap();
       const onReadyStateChange = () => {
         if (this._native.readyState < 2) return;
-        this._native.removeEventListener('readystatechange', onReadyStateChange);
+        this.clearNativeContentRangeTap();
         const contentRange = parseContentRange(this._native.getResponseHeader('Content-Range'));
         if (contentRange !== undefined) bank.recordTotalSize(url, contentRange.totalSize);
       };
+      const onLoadEnd = () => this.clearNativeContentRangeTap();
+      this._nativeContentRangeTap = { onReadyStateChange, onLoadEnd };
       this._native.addEventListener('readystatechange', onReadyStateChange);
+      this._native.addEventListener('loadend', onLoadEnd);
+    }
+
+    clearNativeContentRangeTap() {
+      if (this._nativeContentRangeTap === undefined) return;
+      const { onReadyStateChange, onLoadEnd } = this._nativeContentRangeTap;
+      this._native.removeEventListener('readystatechange', onReadyStateChange);
+      this._native.removeEventListener('loadend', onLoadEnd);
+      this._nativeContentRangeTap = undefined;
     }
 
     async serve(result, url, body, generation) {
