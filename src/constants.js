@@ -21,10 +21,7 @@ export const BANK_CONFIG = Object.freeze({
   chunkBytes: 4 * 1024 ** 2,
   prefetchAheadSeconds: 900,
   maxBankBytes: 512 * 1024 ** 2,
-  refetchAlarmCount: 3,
-  foregroundDeadlineMs: 5000,
   prefetchDeadlineMs: 20000,
-  latencyAlarmCount: 3,
 });
 
 export const DIAGNOSTIC_MESSAGE_VERSION = 1;

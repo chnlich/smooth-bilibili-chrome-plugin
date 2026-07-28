@@ -19,10 +19,7 @@
     chunkBytes: 4 * 1024 ** 2,
     prefetchAheadSeconds: 900,
     maxBankBytes: 512 * 1024 ** 2,
-    refetchAlarmCount: 3,
-    foregroundDeadlineMs: 5e3,
-    prefetchDeadlineMs: 2e4,
-    latencyAlarmCount: 3
+    prefetchDeadlineMs: 2e4
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -451,7 +448,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-a3e9e4a1a26344d555f00edf" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-1c125a20f96da56a7b07c25f" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }

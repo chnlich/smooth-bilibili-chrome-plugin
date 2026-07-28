@@ -1,6 +1,6 @@
-import { BankFallbackError, BankNetworkError } from './errors.js';
+import { BankFallbackError } from './errors.js';
 import { scrubUrl } from '../diagnostics/privacy.js';
-import { classifyRequest, headerValue } from './logic.js';
+import { classifyRequest, parseContentRange } from './logic.js';
 
 const EVENT_NAMES = Object.freeze([
   'readystatechange',
@@ -20,10 +20,6 @@ function eventFor(windowObject, type, init = {}) {
     Object.defineProperty(event, field, { configurable: true, value });
   }
   return event;
-}
-
-function responseBytes(response) {
-  return response.arrayBuffer();
 }
 
 function decodeText(bytes) {
@@ -206,6 +202,29 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       if (!asyncFlag || !classification.intercepted) {
         return this._native.send(body);
       }
+      let served;
+      try {
+        served = bank.serveRequest({
+          url,
+          method,
+          headers: this._headers,
+          credentials: this.withCredentials ? 'include' : 'same-origin',
+        });
+      } catch (error) {
+        if (!(error instanceof BankFallbackError)) throw error;
+        bank.emitDiagnostic('bank.serve', {
+          source: scrubUrl(url),
+          ...this._range,
+          result: 'pass',
+          reason: 'internal_fallback',
+        });
+        this.tapNativeContentRange(url);
+        return this._native.send(body);
+      }
+      if (!served.intercepted) {
+        this.tapNativeContentRange(url);
+        return this._native.send(body);
+      }
       this._intercepted = true;
       this._state = 1;
       this._abortController = new AbortController();
@@ -228,27 +247,23 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
           this.dispatchEvent(eventFor(windowObject, 'loadend'));
         }, this.timeout);
       }
-      void this.serve(url, method, this._headers, body, generation);
+      void this.serve(served, url, body, generation);
     }
 
-    async serve(url, method, headers, body, generation) {
+    tapNativeContentRange(url) {
+      const onReadyStateChange = () => {
+        if (this._native.readyState < 2) return;
+        this._native.removeEventListener('readystatechange', onReadyStateChange);
+        const contentRange = parseContentRange(this._native.getResponseHeader('Content-Range'));
+        if (contentRange !== undefined) bank.recordTotalSize(url, contentRange.totalSize);
+      };
+      this._native.addEventListener('readystatechange', onReadyStateChange);
+    }
+
+    async serve(result, url, body, generation) {
       try {
-        const result = await bank.serveRequest({
-          url,
-          method,
-          headers,
-          credentials: this.withCredentials ? 'include' : 'same-origin',
-          signal: this._abortController.signal,
-          body,
-        });
+        await Promise.resolve();
         if (this._done || generation !== this._generation) return;
-        if (!result.intercepted) {
-          this.clearTimer();
-          this._suppressNativeLoadstart = true;
-          this._intercepted = false;
-          this._native.send(body);
-          return;
-        }
         await this.finishResponse(result.response, result.bytes, url, generation);
       } catch (error) {
         if (this._done || generation !== this._generation) return;
@@ -263,10 +278,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
           this._suppressNativeLoadstart = true;
           this._intercepted = false;
           this._native.send(body);
-          return;
-        }
-        if (error instanceof BankNetworkError) {
-          this.finishError(error.cause, generation);
           return;
         }
         if (error?.name === 'AbortError') {
@@ -287,7 +298,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
     }
 
     async finishResponse(response, knownBytes, requestUrl, generation) {
-      const bytes = knownBytes || await responseBytes(response);
+      const bytes = knownBytes;
       if (this._done || generation !== this._generation) return;
       this._status = response.status;
       this._statusText = response.statusText;

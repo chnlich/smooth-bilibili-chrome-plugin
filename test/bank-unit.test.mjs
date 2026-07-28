@@ -19,7 +19,7 @@ import {
   prefetchRange,
   selectEvictions,
 } from '../src/bank/logic.js';
-import { BankFallbackError, BankNetworkError } from '../src/bank/errors.js';
+import { BankFallbackError } from '../src/bank/errors.js';
 import {
   enforceMemoryLimit,
   readMemoryRange,
@@ -308,85 +308,120 @@ test('memory hit returns exact bytes and canonical response fields without netwo
   assert.deepEqual(calls, []);
 });
 
-test('a foreground miss fetches the original Range once and never stores it', async () => {
+test('a cache miss makes no bank network request and passes the original fetch arguments', async () => {
   const config = configFor();
   const { bank, calls } = createBank({ config });
-  const response = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=4-11' } });
-  assert.deepEqual(calls.map((call) => call.range), [{ start: 4, end: 11 }]);
+  const input = new Request(MEDIA_URL, { method: 'POST', body: 'request body' });
+  const init = { headers: { Range: 'bytes=4-11', 'X-Test': 'keep' } };
+  let received;
+  const response = await fetchThrough(bank, input, init, async (...args) => {
+    received = args;
+    return responseFor(4, 11, 100, bytesFor(4, 11));
+  });
+  assert.deepEqual(calls, []);
+  assert.equal(received[0], input);
+  assert.equal(received[1], init);
+  assert.equal(input.bodyUsed, false);
   assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytesFor(4, 11)]);
   assert.equal(bank.chunks.size, 0);
   assert.equal(bank.fetchedChunks.size, 0);
-  assert.equal(bank.activeForeground.size, 0);
-});
-
-test('one foreground request produces one network request even when it spans two MiB', async () => {
-  const config = configFor({ chunkBytes: 4 * 1024 ** 2 });
-  const { bank, calls } = createBank({
-    config,
-    nativeFetch: async (_url, init) => {
-      const range = rangeFromInit(init);
-      calls.push({ range });
-      return responseFor(range.start, range.end, 8 * 1024 ** 2, bytesFor(range.start, range.end));
+  const state = bank.stateFor(MEDIA_KEY);
+  assert.equal(state.videoKey, '/video/BVbank');
+  assert.equal(state.latestUrl, new URL(MEDIA_URL).href);
+  assert.equal(state.credentials, 'same-origin');
+  assert.equal(state.lastForegroundEnd, 11);
+  assert.equal(state.prefetchEnd, undefined);
+  const serve = bank.windowObject.messages.find((message) => message.code === 'bank.serve');
+  assert.deepEqual(
+    {
+      source: serve.data.source,
+      start: serve.data.start,
+      end: serve.data.end,
+      result: serve.data.result,
+      reason: serve.data.reason,
     },
-  });
-  const start = 123;
-  const end = 2 * 1024 ** 2 + 123;
-  const response = await fetchThrough(bank, MEDIA_URL, {
-    headers: { Range: `bytes=${start}-${end}` },
-  });
-  assert.deepEqual(calls.map(({ range }) => range), [{ start, end }]);
-  assert.equal((await response.arrayBuffer()).byteLength, end - start + 1);
-  assert.equal(bank.chunks.size, 0);
-  assert.equal(bank.fetchedChunks.size, 0);
+    {
+      source: 'https://upos-sz-mirrorcosov.bilivideo.com/video/track.m4s',
+      start: 4,
+      end: 11,
+      result: 'pass',
+      reason: 'miss',
+    },
+  );
 });
 
-test('a foreground request at an unknown resource tail keeps its original Range', async () => {
+test('a cache miss keeps a Range spanning multiple chunks intact', async () => {
   const config = configFor();
   const { bank, calls } = createBank({
     config,
-    nativeFetch: async (_url, init) => {
-      const range = rangeFromInit(init);
-      const end = Math.min(range.end, 59);
-      calls.push({ range });
-      return responseFor(range.start, end, 60, bytesFor(range.start, end));
-    },
   });
-  let fallbackCalls = 0;
+  let received;
   const response = await fetchThrough(
     bank,
     MEDIA_URL,
-    { headers: { Range: 'bytes=44-59' } },
-    async () => {
-      fallbackCalls += 1;
-      return responseFor(44, 59, 60, bytesFor(44, 59));
+    { headers: { Range: 'bytes=4-20' } },
+    async (...args) => {
+      received = args;
+      return responseFor(4, 20, 64, bytesFor(4, 20));
     },
   );
-  assert.deepEqual(calls.map(({ range }) => range), [{ start: 44, end: 59 }]);
-  assert.equal(fallbackCalls, 0);
-  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytesFor(44, 59)]);
+  assert.deepEqual(calls, []);
+  assert.equal(received[1].headers.Range, 'bytes=4-20');
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytesFor(4, 20)]);
   assert.equal(bank.chunks.size, 0);
   assert.equal(bank.fetchedChunks.size, 0);
 });
 
-test('a foreground request spanning stored and missing chunks still uses one original Range', async () => {
+test('a cache miss does not replace a stored chunk or split the original Range', async () => {
   const config = configFor();
   const { bank, calls } = createBank({ config });
   putChunk(bank, 0, config, 64);
   bank.fetchedChunks.set(`${MEDIA_KEY}#0`, { fetchedAt: 1 });
-  const response = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=4-20' } });
-  assert.deepEqual(calls.map((call) => call.range), [{ start: 4, end: 20 }]);
+  let received;
+  const response = await fetchThrough(
+    bank,
+    MEDIA_URL,
+    { headers: { Range: 'bytes=4-20' } },
+    async (...args) => {
+      received = args;
+      return responseFor(4, 20, 64, bytesFor(4, 20));
+    },
+  );
+  assert.deepEqual(calls, []);
+  assert.equal(received[1].headers.Range, 'bytes=4-20');
   assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytesFor(4, 20)]);
   assert.equal(bank.fetchedChunks.has(`${MEDIA_KEY}#1`), false);
 });
 
-test('a foreground direct request keeps its original Range and never enters either table', async () => {
+test('fetch let-through learns totalSize from Content-Range without consuming the Response', async () => {
   const config = configFor();
   const { bank, calls } = createBank({ config });
-  const response = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-3' } });
-  assert.deepEqual(calls.map((call) => call.range), [{ start: 0, end: 3 }]);
-  assert.equal((await response.arrayBuffer()).byteLength, 4);
-  assert.equal(bank.chunks.size, 0);
-  assert.equal(bank.fetchedChunks.size, 0);
+  const originalResponse = responseFor(4, 11, 100, bytesFor(4, 11));
+  const response = await fetchThrough(
+    bank,
+    MEDIA_URL,
+    { headers: { Range: 'bytes=4-11' } },
+    async () => originalResponse,
+  );
+  assert.equal(response, originalResponse);
+  assert.equal(response.bodyUsed, false);
+  assert.equal(bank.stateFor(MEDIA_KEY).totalSize, 100);
+  assert.deepEqual(calls, []);
+});
+
+test('fetch let-through leaves totalSize unknown without Content-Range', async () => {
+  const config = configFor();
+  const { bank } = createBank({ config });
+  const originalResponse = new Response(bytesFor(4, 11), { status: 200 });
+  const response = await fetchThrough(
+    bank,
+    MEDIA_URL,
+    { headers: { Range: 'bytes=4-11' } },
+    async () => originalResponse,
+  );
+  assert.equal(response, originalResponse);
+  assert.equal(response.bodyUsed, false);
+  assert.equal(bank.stateFor(MEDIA_KEY).totalSize, undefined);
 });
 
 test('open, multi-range, no-range and non-media fetches pass the original arguments before body consumption', async () => {
@@ -416,84 +451,23 @@ test('open, multi-range, no-range and non-media fetches pass the original argume
   ]);
 });
 
-test('same cacheKey deduplicates in-flight foreground fetches', async () => {
-  const config = configFor();
+test('a cache miss does not abort an in-flight prefetch, which still stores its chunk', async () => {
+  const config = configFor({ prefetchDeadlineMs: 1000 });
   let release;
-  let networkCalls = 0;
-  const network = new Promise((resolve) => { release = resolve; });
-  const { bank } = createBank({
+  let prefetchSignal;
+  let prefetchCalls = 0;
+  const { bank, calls } = createBank({
     config,
     nativeFetch: async (_url, init) => {
-      networkCalls += 1;
-      await network;
-      const range = rangeFromInit(init);
-      return responseFor(range.start, range.end, 64, bytesFor(range.start, range.end));
-    },
-  });
-  const first = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=4-11' } });
-  const second = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=4-11' } });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(networkCalls, 1);
-  release();
-  assert.equal((await first).status, 206);
-  assert.equal((await second).status, 206);
-});
-
-test('two hanging prefetches do not block an immediate foreground request', async () => {
-  const config = configFor({ prefetchDeadlineMs: 1000 });
-  const pending = new Map();
-  const { bank } = createBank({
-    config,
-    nativeFetch: async (_url, init) => {
-      const range = rangeFromInit(init);
-      if (range.start >= 48) return responseFor(range.start, range.end, 100, bytesFor(range.start, range.end));
+      prefetchCalls += 1;
+      prefetchSignal = init.signal;
       return new Promise((resolve, reject) => {
-        pending.set(`${range.start}-${range.end}`, { resolve, reject });
+        release = () => resolve(responseFor(0, 15, 64, bytesFor(0, 15)));
         init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
       });
     },
   });
-  const prefetches = [0, 16, 32].map((start) => bank.getTask({
-    start,
-    end: start + 15,
-    chunkIndex: start / 16,
-    cacheKey: `${MEDIA_KEY}#${start / 16}`,
-    cacheable: true,
-  }, {
-    kind: 'prefetch',
-    url: MEDIA_URL,
-    credentials: 'same-origin',
-    videoKey: '/video/BVbank',
-  }));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(pending.size, 2);
-  assert.equal(bank.activePrefetch.size, 2);
-  assert.equal(bank.queue.length, 1);
-
-  const response = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=48-55' } });
-  assert.equal(response.status, 206);
-  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytesFor(48, 55)]);
-  assert.deepEqual([...pending.keys()], ['0-15', '16-31']);
-
-  bank.destroy();
-  const results = await Promise.allSettled(prefetches);
-  assert.equal(results.every((result) => result.status === 'rejected' && result.reason.name === 'AbortError'), true);
-});
-
-test('a foreground task blocks new prefetches and settlement resumes the queue', async () => {
-  const config = configFor({ prefetchDeadlineMs: 1000 });
-  const pending = new Map();
-  const { bank } = createBank({
-    config,
-    nativeFetch: async (_url, init) => {
-      const range = rangeFromInit(init);
-      return new Promise((resolve, reject) => {
-        pending.set(`${range.start}-${range.end}`, { resolve, reject });
-        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-      });
-    },
-  });
-  const firstPrefetch = bank.getTask({
+  const prefetch = bank.getTask({
     start: 0,
     end: 15,
     chunkIndex: 0,
@@ -506,45 +480,26 @@ test('a foreground task blocks new prefetches and settlement resumes the queue',
     videoKey: '/video/BVbank',
   });
   await new Promise((resolve) => setImmediate(resolve));
-  const foreground = bank.getTask({
-    start: 32,
-    end: 35,
-    chunkIndex: 2,
-    cacheKey: `${MEDIA_KEY}#2`,
-    cacheable: false,
-  }, {
-    kind: 'foreground',
-    url: MEDIA_URL,
-    credentials: 'same-origin',
-    videoKey: '/video/BVbank',
-  });
-  const queuedPrefetch = bank.getTask({
-    start: 16,
-    end: 31,
-    chunkIndex: 1,
-    cacheKey: `${MEDIA_KEY}#1`,
-    cacheable: true,
-  }, {
-    kind: 'prefetch',
-    url: MEDIA_URL,
-    credentials: 'same-origin',
-    videoKey: '/video/BVbank',
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(bank.activeForeground.size, 1);
-  assert.equal(pending.has('16-31'), false);
-  assert.equal(bank.queue.length, 1);
-
-  pending.get('32-35').resolve(responseFor(32, 35, 64, bytesFor(32, 35)));
-  await foreground;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(pending.has('16-31'), true);
-  assert.equal(bank.activeForeground.size, 0);
-  assert.equal(bank.activePrefetch.size, 2);
-
-  pending.get('0-15').resolve(responseFor(0, 15, 64, bytesFor(0, 15)));
-  pending.get('16-31').resolve(responseFor(16, 31, 64, bytesFor(16, 31)));
-  await Promise.all([firstPrefetch, queuedPrefetch]);
+  assert.equal(bank.activePrefetch.size, 1);
+  let originalCalls = 0;
+  const response = await fetchThrough(
+    bank,
+    MEDIA_URL,
+    { headers: { Range: 'bytes=4-7' } },
+    async () => {
+      originalCalls += 1;
+      return responseFor(4, 7, 64, bytesFor(4, 7));
+    },
+  );
+  assert.equal(response.status, 206);
+  assert.equal(originalCalls, 1);
+  assert.equal(prefetchCalls, 1);
+  assert.deepEqual(calls, []);
+  assert.equal(prefetchSignal.aborted, false);
+  release();
+  await prefetch;
+  assert.equal(prefetchSignal.aborted, false);
+  assert.equal(bank.chunks.has(`${MEDIA_KEY}#0`), true);
 });
 
 test('prefetch concurrency never exceeds two active tasks', async () => {
@@ -729,40 +684,6 @@ test('a memory write failure disables the bank and lets subsequent requests pass
   assert.equal(passCalls, 1);
 });
 
-test('refetch alarm closes the bank on the configured count', async () => {
-  const config = configFor({ refetchAlarmCount: 3 });
-  let calls = 0;
-  const { bank, windowObject } = createBank({
-    config,
-    nativeFetch: async (_url, init) => {
-      calls += 1;
-      const range = rangeFromInit(init);
-      return responseFor(range.start, range.end, 64, bytesFor(range.start, range.end));
-    },
-  });
-  const plan = {
-    start: 0,
-    end: 15,
-    chunkIndex: 0,
-    cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
-  };
-  bank.fetchedChunks.set(plan.cacheKey, { fetchedAt: 1 });
-  for (let index = 0; index < 3; index += 1) {
-    bank.chunks.clear();
-    await bank.getTask(plan, {
-      kind: 'foreground',
-      url: MEDIA_URL,
-      credentials: 'same-origin',
-      videoKey: '/video/BVbank',
-    });
-  }
-  assert.equal(calls, 3);
-  assert.equal(bank.disabled, true);
-  assert.equal(windowObject.messages.filter((message) => message.code === 'bank.disabled').length, 1);
-  assert.equal(windowObject.messages.find((message) => message.code === 'bank.disabled').data.reason, 'refetch_alarm');
-});
-
 test('non-2xx responses preserve the CDN result and network errors preserve identity', async () => {
   const networkResponse = new Response('failed', {
     status: 503,
@@ -781,243 +702,23 @@ test('non-2xx responses preserve the CDN result and network errors preserve iden
   await assert.rejects(fetchThrough(failedBank), (error) => error === networkError);
 });
 
-test('AbortSignal rejects with AbortError and aborts the in-flight bank fetch', async () => {
-  let signalSeen;
-  const { bank } = createBank({
-    nativeFetch: (_url, init) => new Promise((_resolve, reject) => {
-      signalSeen = init.signal;
-      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-    }),
-  });
+test('pass-through preserves the caller AbortSignal without creating a bank task', async () => {
+  const { bank } = createBank({ nativeFetch: async () => { throw new Error('bank network must not run'); } });
   const controller = new AbortController();
-  const pending = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-9' }, signal: controller.signal });
-  await new Promise((resolve) => setImmediate(resolve));
-  controller.abort();
-  await assert.rejects(pending, (error) => error.name === 'AbortError');
-  assert.equal(signalSeen.aborted, true);
-  assert.equal(bank.chunks.size, 0);
-});
-
-test('a foreground deadline falls back unchanged instead of exposing AbortError', async () => {
-  const config = configFor({ foregroundDeadlineMs: 5, prefetchDeadlineMs: 20 });
-  const timers = manualTimers();
-  const { bank, windowObject } = createBank({
-    config,
-    timers,
-    nativeFetch: (_url, init) => new Promise((_resolve, reject) => {
-      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-    }),
-  });
-  let fallbackCalls = 0;
-  const pending = fetchThrough(
+  let signalSeen;
+  const response = await fetchThrough(
     bank,
     MEDIA_URL,
-    { headers: { Range: 'bytes=0-9' } },
-    async () => {
-      fallbackCalls += 1;
+    { headers: { Range: 'bytes=0-9' }, signal: controller.signal },
+    async (_url, init) => {
+      signalSeen = init.signal;
       return new Response('native', { status: 200 });
     },
   );
-  await new Promise((resolve) => setImmediate(resolve));
-  timers.fire(config.foregroundDeadlineMs);
-  const response = await pending;
   assert.equal(await response.text(), 'native');
-  assert.equal(fallbackCalls, 1);
-  assert.equal(windowObject.messages.filter(
-    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'deadline',
-  ).length, 1);
-  assert.equal(bank.activeForeground.size, 0);
+  assert.equal(signalSeen, controller.signal);
   assert.equal(bank.inflight.size, 0);
-});
-
-test('foreground deadline counts every waiter and noncovering fallback preserves the latency streak', async () => {
-  const config = configFor({ foregroundDeadlineMs: 5, prefetchDeadlineMs: 20 });
-  const timers = manualTimers();
-  let releasePrefetch;
-  const { bank } = createBank({
-    config,
-    timers,
-    nativeFetch: (_url, init) => {
-      const range = rangeFromInit(init);
-      if (range.end === 3) {
-        return new Promise((_resolve, reject) => {
-          init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-        });
-      }
-      if (range.end === 15) {
-        return new Promise((resolve) => {
-          releasePrefetch = resolve;
-        });
-      }
-      throw new Error(`unexpected range ${range.start}-${range.end}`);
-    },
-  });
-  let fallbackCalls = 0;
-  const fallback = async () => {
-    fallbackCalls += 1;
-    return new Response('native', { status: 200 });
-  };
-  const first = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-3' } }, fallback);
-  await new Promise((resolve) => setImmediate(resolve));
-  const second = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-3' } }, fallback);
-  await new Promise((resolve) => setImmediate(resolve));
-  const foregroundTask = bank.inflight.get(`${MEDIA_KEY}#0`);
-  const deadline = timers.pending.get(foregroundTask.deadlineTimer);
-  timers.pending.delete(foregroundTask.deadlineTimer);
-  deadline.callback();
-  const [firstResponse, secondResponse] = await Promise.all([first, second]);
-  assert.equal(await firstResponse.text(), 'native');
-  assert.equal(await secondResponse.text(), 'native');
-  assert.equal(fallbackCalls, 2);
-  assert.equal(bank.foregroundLatencyCount, 2);
-
-  await new Promise((resolve) => setImmediate(resolve));
-  const prefetch = bank.getTask({
-    start: 0,
-    end: 15,
-    chunkIndex: 0,
-    cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
-  }, {
-    kind: 'prefetch',
-    url: MEDIA_URL,
-    credentials: 'same-origin',
-    videoKey: '/video/BVbank',
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  const noncovering = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-31' } }, fallback);
-  await new Promise((resolve) => setImmediate(resolve));
-  releasePrefetch(responseFor(0, 15, 100, bytesFor(0, 15)));
-  assert.equal(await (await noncovering).text(), 'native');
-  await prefetch;
-  assert.equal(fallbackCalls, 3);
-  assert.equal(bank.foregroundLatencyCount, 2);
-});
-
-test('coverage and noncoverage foreground attachments both have wait deadlines', async () => {
-  const config = configFor({ foregroundDeadlineMs: 5, prefetchDeadlineMs: 20 });
-  const timers = manualTimers();
-  const { bank } = createBank({
-    config,
-    timers,
-    nativeFetch: (_url, init) => new Promise((_resolve, reject) => {
-      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-    }),
-  });
-  const prefetch = bank.getTask({
-    start: 0,
-    end: 15,
-    chunkIndex: 0,
-    cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
-  }, {
-    kind: 'prefetch',
-    url: MEDIA_URL,
-    credentials: 'same-origin',
-    videoKey: '/video/BVbank',
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  let fallbackCalls = 0;
-  const original = async () => {
-    fallbackCalls += 1;
-    return new Response('native', { status: 200 });
-  };
-  const covered = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=4-7' } }, original);
-  timers.fire(config.foregroundDeadlineMs);
-  assert.equal(await (await covered).text(), 'native');
-  const noncovered = fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-31' } }, original);
-  timers.fire(config.foregroundDeadlineMs);
-  assert.equal(await (await noncovered).text(), 'native');
-  assert.equal(fallbackCalls, 2);
-  assert.equal(bank.inflight.get(`${MEDIA_KEY}#0`).controller.signal.aborted, false);
-  assert.equal(bank.activeForeground.size, 0);
-  bank.destroy();
-  await assert.rejects(prefetch, (error) => error.name === 'AbortError');
-});
-
-test('a foreground waiter falls back when the attached prefetch hits its own deadline', async () => {
-  const config = configFor({ foregroundDeadlineMs: 50, prefetchDeadlineMs: 20 });
-  const timers = manualTimers();
-  const { bank, windowObject } = createBank({
-    config,
-    timers,
-    nativeFetch: (_url, init) => new Promise((_resolve, reject) => {
-      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-    }),
-  });
-  const prefetch = bank.getTask({
-    start: 0,
-    end: 15,
-    chunkIndex: 0,
-    cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
-  }, {
-    kind: 'prefetch',
-    url: MEDIA_URL,
-    credentials: 'same-origin',
-    videoKey: '/video/BVbank',
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  let fallbackCalls = 0;
-  const foreground = fetchThrough(
-    bank,
-    MEDIA_URL,
-    { headers: { Range: 'bytes=4-7' } },
-    async () => {
-      fallbackCalls += 1;
-      return new Response('native', { status: 200 });
-    },
-  );
-  timers.fire(config.prefetchDeadlineMs);
-  assert.equal(await (await foreground).text(), 'native');
-  assert.equal(fallbackCalls, 1);
-  assert.equal(windowObject.messages.some(
-    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'deadline',
-  ), true);
-  await assert.rejects(prefetch, (error) => error.name === 'AbortError');
-  bank.destroy();
-});
-
-test('three latency fallbacks disable the bank, while one success clears the streak', async () => {
-  const config = configFor({ foregroundDeadlineMs: 5, prefetchDeadlineMs: 20 });
-  const timers = manualTimers();
-  let networkCalls = 0;
-  const { bank, windowObject } = createBank({
-    config,
-    timers,
-    nativeFetch: async (_url, init) => {
-      networkCalls += 1;
-      const range = rangeFromInit(init);
-      if (networkCalls === 3) return responseFor(range.start, range.end, 100, bytesFor(range.start, range.end));
-      return new Promise((_resolve, reject) => {
-        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-      });
-    },
-  });
-  const fallbackRequest = async (index) => {
-    const start = index * 10;
-    const pending = fetchThrough(
-      bank,
-      MEDIA_URL,
-      { headers: { Range: `bytes=${start}-${start + 3}` } },
-      async () => new Response('native', { status: 200 }),
-    );
-    await new Promise((resolve) => setImmediate(resolve));
-    timers.fire(config.foregroundDeadlineMs);
-    await pending;
-  };
-  await fallbackRequest(0);
-  await fallbackRequest(1);
-  const successful = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=20-23' } });
-  assert.equal(successful.status, 206);
-  assert.equal(bank.foregroundLatencyCount, 0);
-  await fallbackRequest(3);
-  await fallbackRequest(4);
-  assert.equal(bank.disabled, false);
-  await fallbackRequest(5);
-  assert.equal(bank.disabled, true);
-  assert.equal(windowObject.messages.filter((message) => message.code === 'bank.disabled').length, 1);
-  assert.equal(windowObject.messages.find((message) => message.code === 'bank.disabled').data.reason, 'foreground_latency');
+  controller.abort();
 });
 
 test('a prefetch deadline leaves fetchedChunks empty', async () => {
@@ -1101,6 +802,8 @@ class NativeXHR {
     this.withCredentials = false;
     this.listeners = new Map();
     this.sendCalls = [];
+    this.requestHeaders = [];
+    this.responseHeaders = {};
   }
 
   open(...args) {
@@ -1108,7 +811,7 @@ class NativeXHR {
     this.readyState = 1;
   }
 
-  setRequestHeader() {}
+  setRequestHeader(name, value) { this.requestHeaders.push([name, value]); }
 
   addEventListener(type, listener) {
     const set = this.listeners.get(type) || new Set();
@@ -1116,13 +819,21 @@ class NativeXHR {
     this.listeners.set(type, set);
   }
 
-  removeEventListener() {}
+  removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+
+  emit(type) {
+    for (const listener of this.listeners.get(type) || []) listener({ type });
+  }
 
   send(body) { this.sendCalls.push(body); }
 
   abort() { this.abortCalls = (this.abortCalls || 0) + 1; }
 
-  getResponseHeader() { return null; }
+  getResponseHeader(name) {
+    const wanted = name.toLowerCase();
+    const entry = Object.entries(this.responseHeaders).find(([key]) => key.toLowerCase() === wanted);
+    return entry?.[1] || null;
+  }
 
   getAllResponseHeaders() { return ''; }
 
@@ -1133,7 +844,7 @@ test('XHR preserves readyState 2→3→4 and event ordering with arraybuffer res
   const windowObject = windowFixture();
   const bank = {
     enabled: true,
-    async serveRequest() {
+    serveRequest() {
       const bytes = new Uint8Array([1, 2, 3]).buffer;
       return { intercepted: true, response: responseFor(0, 2, 3, new Uint8Array(bytes)), bytes };
     },
@@ -1168,56 +879,37 @@ test('XHR preserves readyState 2→3→4 and event ordering with arraybuffer res
   assert.equal(xhr.status, 206);
 });
 
-test('XHR abort dispatches abort then loadend and cancels its request', async () => {
-  let signalSeen;
-  const windowObject = windowFixture();
-  const bank = {
-    enabled: true,
-    serveRequest({ signal }) {
-      signalSeen = signal;
-      return new Promise((_resolve, reject) => {
-        signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
-      });
-    },
-  };
+test('XHR cache miss sends the native request without interception state or loadstart', () => {
+  const { bank, windowObject, calls } = createBank({
+    nativeFetch: async () => { throw new Error('bank network must not run'); },
+  });
   windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({ windowObject, nativeConstructor: NativeXHR, bank });
   const xhr = new windowObject.XMLHttpRequest();
   const events = [];
-  xhr.addEventListener('abort', () => events.push('abort'));
-  xhr.addEventListener('loadend', () => events.push('loadend'));
+  xhr.addEventListener('loadstart', () => events.push('loadstart'));
+  const body = { body: true };
   xhr.open('GET', MEDIA_URL);
   xhr.setRequestHeader('Range', 'bytes=0-2');
-  xhr.send();
-  await new Promise((resolve) => setImmediate(resolve));
-  xhr.abort();
-  assert.deepEqual(events, ['abort', 'loadend']);
-  assert.equal(signalSeen.aborted, true);
-});
+  xhr.send(body);
+  assert.deepEqual(xhr._native.openArgs, ['GET', MEDIA_URL]);
+  assert.deepEqual(xhr._native.requestHeaders, [['Range', 'bytes=0-2']]);
+  assert.deepEqual(xhr._native.sendCalls, [body]);
+  assert.deepEqual(events, []);
+  assert.equal(xhr._abortController, undefined);
+  assert.equal(xhr._timer, undefined);
+  assert.equal(xhr._suppressNativeLoadstart, false);
+  assert.deepEqual(calls, []);
 
-test('XHR timeout dispatches readystatechange, timeout, then loadend', async () => {
-  let signalSeen;
-  const windowObject = windowFixture();
-  const bank = {
-    enabled: true,
-    serveRequest({ signal }) {
-      signalSeen = signal;
-      return new Promise(() => {});
-    },
-  };
-  windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({ windowObject, nativeConstructor: NativeXHR, bank });
-  const xhr = new windowObject.XMLHttpRequest();
-  xhr.timeout = 1;
-  const events = [];
-  for (const name of ['readystatechange', 'timeout', 'loadend']) {
-    xhr.addEventListener(name, () => events.push(`${name}:${xhr.readyState}`));
-  }
-  const finished = new Promise((resolve) => xhr.addEventListener('loadend', resolve, { once: true }));
-  xhr.open('GET', MEDIA_URL);
-  xhr.setRequestHeader('Range', 'bytes=0-2');
-  xhr.send();
-  await finished;
-  assert.deepEqual(events, ['readystatechange:4', 'timeout:4', 'loadend:4']);
-  assert.equal(signalSeen.aborted, true);
+  xhr._native.responseHeaders = { 'Content-Range': 'bytes 0-2/100' };
+  xhr._native.readyState = 2;
+  xhr._native.emit('readystatechange');
+  assert.equal(bank.stateFor(MEDIA_KEY).totalSize, 100);
+  xhr._native.responseHeaders = { 'Content-Range': 'bytes 0-2/200' };
+  xhr._native.emit('readystatechange');
+  assert.equal(bank.stateFor(MEDIA_KEY).totalSize, 100);
+
+  xhr.abort();
+  assert.equal(xhr._native.abortCalls, 1);
 });
 
 test('XHR BankFallbackError returns the request to the native XHR unchanged', async () => {
@@ -1225,7 +917,7 @@ test('XHR BankFallbackError returns the request to the native XHR unchanged', as
   const bank = {
     enabled: true,
     emitDiagnostic() {},
-    async serveRequest() {
+    serveRequest() {
       throw new BankFallbackError('等待超过补取死线');
     },
   };
@@ -1239,43 +931,17 @@ test('XHR BankFallbackError returns the request to the native XHR unchanged', as
   assert.equal(xhr.readyState, 1);
 });
 
-test('XHR network failures dispatch readystatechange, error, then loadend', async () => {
-  const networkError = new TypeError('cdn failed');
-  const windowObject = windowFixture();
-  const bank = {
-    enabled: true,
-    async serveRequest() {
-      throw new BankNetworkError('媒体分片网络取数失败', networkError);
-    },
-  };
-  windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({ windowObject, nativeConstructor: NativeXHR, bank });
-  const xhr = new windowObject.XMLHttpRequest();
-  const events = [];
-  for (const name of ['readystatechange', 'error', 'loadend']) {
-    xhr.addEventListener(name, () => events.push(`${name}:${xhr.readyState}`));
-  }
-  const finished = new Promise((resolve) => xhr.addEventListener('loadend', resolve, { once: true }));
-  xhr.open('GET', MEDIA_URL);
-  xhr.setRequestHeader('Range', 'bytes=0-2');
-  xhr.send();
-  await finished;
-  assert.deepEqual(events, ['readystatechange:4', 'error:4', 'loadend:4']);
-  assert.equal(xhr.status, 0);
-});
-
 test('XHR ignores a cancelled prior generation after open starts a replacement request', async () => {
-  let resolveFirst;
-  let resolveSecond;
   let calls = 0;
   const windowObject = windowFixture();
   const bank = {
     enabled: true,
     serveRequest() {
       calls += 1;
-      return new Promise((resolve) => {
-        if (calls === 1) resolveFirst = resolve;
-        else resolveSecond = resolve;
-      });
+      const value = calls === 1 ? 1 : 2;
+      const bytes = new Uint8Array([value, value, value]).buffer;
+      const start = calls === 1 ? 0 : 3;
+      return { intercepted: true, response: responseFor(start, start + 2, 6, new Uint8Array(bytes)), bytes };
     },
   };
   windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({ windowObject, nativeConstructor: NativeXHR, bank });
@@ -1287,28 +953,10 @@ test('XHR ignores a cancelled prior generation after open starts a replacement r
   xhr.open('GET', MEDIA_URL);
   xhr.setRequestHeader('Range', 'bytes=0-2');
   xhr.send();
-  await new Promise((resolve) => setImmediate(resolve));
-
   xhr.open('GET', MEDIA_URL);
   xhr.setRequestHeader('Range', 'bytes=3-5');
   xhr.send();
   await new Promise((resolve) => setImmediate(resolve));
-
-  resolveFirst({
-    intercepted: true,
-    response: responseFor(0, 2, 6, new Uint8Array([1, 1, 1])),
-    bytes: new Uint8Array([1, 1, 1]).buffer,
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(loadendCount, 0);
-
-  const finished = new Promise((resolve) => xhr.addEventListener('loadend', resolve, { once: true }));
-  resolveSecond({
-    intercepted: true,
-    response: responseFor(3, 5, 6, new Uint8Array([2, 2, 2])),
-    bytes: new Uint8Array([2, 2, 2]).buffer,
-  });
-  await finished;
   assert.equal(loadendCount, 1);
   assert.deepEqual([...new Uint8Array(xhr.response)], [2, 2, 2]);
 });

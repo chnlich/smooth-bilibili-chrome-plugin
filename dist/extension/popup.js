@@ -18,10 +18,7 @@
     chunkBytes: 4 * 1024 ** 2,
     prefetchAheadSeconds: 900,
     maxBankBytes: 512 * 1024 ** 2,
-    refetchAlarmCount: 3,
-    foregroundDeadlineMs: 5e3,
-    prefetchDeadlineMs: 2e4,
-    latencyAlarmCount: 3
+    prefetchDeadlineMs: 2e4
   });
 
   // src/diagnostics/log-session.js

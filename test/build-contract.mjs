@@ -296,19 +296,13 @@ assert.deepEqual(Object.keys(BANK_CONFIG), [
   'chunkBytes',
   'prefetchAheadSeconds',
   'maxBankBytes',
-  'refetchAlarmCount',
-  'foregroundDeadlineMs',
   'prefetchDeadlineMs',
-  'latencyAlarmCount',
 ]);
 assert.deepEqual(BANK_CONFIG, {
   chunkBytes: 4 * 1024 ** 2,
   prefetchAheadSeconds: 900,
   maxBankBytes: 512 * 1024 ** 2,
-  refetchAlarmCount: 3,
-  foregroundDeadlineMs: 5000,
   prefetchDeadlineMs: 20000,
-  latencyAlarmCount: 3,
 });
 assert.equal(EVENT_CODES.includes('log.persist.result'), true);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
