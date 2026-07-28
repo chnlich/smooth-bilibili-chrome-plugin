@@ -68,6 +68,11 @@ export const EVENT_CODES = Object.freeze([
 ]);
 
 const EXACT_CODES = new Set(EVENT_CODES);
+export const PERSIST_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+export function isSafePersistErrorCode(code) {
+  return typeof code === 'string' && PERSIST_ERROR_CODE_PATTERN.test(code);
+}
 
 export function assertEventCode(code) {
   if (typeof code !== 'string' || !EXACT_CODES.has(code)) {
@@ -146,7 +151,7 @@ export const DATA_ALLOWLIST = Object.freeze({
     'reason',
   ]),
   extension: Object.freeze(['action', 'reason', 'status']),
-  persist: Object.freeze(['status', 'batchSize', 'eventCount', 'message']),
+  persist: Object.freeze(['status', 'batchSize', 'eventCount', 'message', 'code']),
 });
 
 export function allowedDataFields(code) {

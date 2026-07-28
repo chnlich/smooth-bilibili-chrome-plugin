@@ -88,6 +88,10 @@
     "log.persist.degraded"
   ]);
   var EXACT_CODES = new Set(EVENT_CODES);
+  var PERSIST_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+  function isSafePersistErrorCode(code) {
+    return typeof code === "string" && PERSIST_ERROR_CODE_PATTERN.test(code);
+  }
   function assertEventCode(code) {
     if (typeof code !== "string" || !EXACT_CODES.has(code)) {
       throw new Error(`未允许的诊断事件代码: ${code}`);
@@ -164,7 +168,7 @@
       "reason"
     ]),
     extension: Object.freeze(["action", "reason", "status"]),
-    persist: Object.freeze(["status", "batchSize", "eventCount", "message"])
+    persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
   });
   function allowedDataFields(code) {
     if (code.startsWith("route.")) return DATA_ALLOWLIST.route;
@@ -310,6 +314,7 @@
       return browserMetric(value);
     }
     if (field === "enabled") return value === true || value === false ? value : UNKNOWN_VALUE;
+    if (field === "code") return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
     if (field === "message") return scrubErrorText(value);
     if (field === "samples") return safeSampleList(value);
     return safeScalar(value);
@@ -448,7 +453,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-e7afbddca70728d9df3f05b6" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-bbfdbb2e2bc50270dac1c684" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -596,6 +601,13 @@
   }
 
   // src/diagnostics/client.js
+  var PERSIST_RETRY_BASE_DELAY_MS = 100;
+  var PERSIST_RETRY_MAX_DELAY_MS = 5e3;
+  var PERSIST_RETRY_MAX_ATTEMPTS = 5;
+  function persistenceErrorCode(value) {
+    const code = typeof value === "string" ? value : value?.code;
+    return isSafePersistErrorCode(code) ? code : "LOG_PERSIST_FAILED";
+  }
   function runtimeSendMessage(runtimeObject, message) {
     if (runtimeObject === void 0 || typeof runtimeObject.sendMessage !== "function") {
       throw new Error("日志 runtime.sendMessage 不可用");
@@ -667,6 +679,8 @@
       this.outbox = [];
       this.flushScheduled = false;
       this.flushPromise = void 0;
+      this.retryTimer = void 0;
+      this.retryItem = void 0;
       this.destroyed = false;
       this.tearingDown = false;
       this.persistence = "未提供";
@@ -806,12 +820,19 @@
     }
     enqueuePendingBatch() {
       if (this.pending.length === 0 || this.session === void 0) return;
-      this.outbox.push({ session: this.session, batch: this.pending.splice(0, this.pending.length), failed: false });
+      this.outbox.push({
+        session: this.session,
+        batch: this.pending.splice(0, this.pending.length),
+        failed: false,
+        retryCount: 0,
+        retryScheduled: false
+      });
     }
     flushOutbox() {
       if (this.flushPromise !== void 0) return this.flushPromise;
       if (this.outbox.length === 0) return void 0;
       const item = this.outbox.shift();
+      this.cancelScheduledRetry(item);
       item.failed = false;
       const { batch, session } = item;
       this.flushPromise = runtimeSendMessage(this.runtimeObject, {
@@ -822,7 +843,7 @@
       }).then((response) => {
         if (response?.ok !== true || !["PERSISTED", "DUPLICATE"].includes(response.status)) {
           throw Object.assign(new Error(response?.error?.message || "日志事务没有提交"), {
-            code: response?.error?.code || "LOG_PERSIST_FAILED"
+            code: persistenceErrorCode(response?.error)
           });
         }
         this.persistence = response.status;
@@ -835,17 +856,20 @@
       }).catch((error) => {
         this.persistence = "DEGRADED";
         item.failed = true;
+        item.retryCount += 1;
         this.outbox.unshift(item);
         this.pendingPersistResult = {
           status: "DEGRADED",
           batchSize: batch.length,
-          message: error.message || String(error)
+          message: error.message || String(error),
+          code: persistenceErrorCode(error)
         };
         try {
           this.logger.error?.("[BilibiliBuffer] diagnostic persistence degraded", serializeError(error));
         } catch (consoleError) {
           this.logger.warn?.("[BilibiliBuffer] diagnostic degraded mirror failed", serializeError(consoleError));
         }
+        this.scheduleHeadRetry(item);
         return { status: "DEGRADED", error: serializeError(error) };
       }).finally(() => {
         this.flushPromise = void 0;
@@ -854,6 +878,28 @@
         }
       });
       return this.flushPromise;
+    }
+    cancelScheduledRetry(item) {
+      if (this.retryItem !== item) return;
+      this.windowObject.clearTimeout(this.retryTimer);
+      this.retryTimer = void 0;
+      this.retryItem = void 0;
+      item.retryScheduled = false;
+    }
+    scheduleHeadRetry(item) {
+      if (this.destroyed || this.tearingDown || this.outbox[0] !== item || item.retryCount > PERSIST_RETRY_MAX_ATTEMPTS || item.retryScheduled === true) return;
+      const delay = Math.min(
+        PERSIST_RETRY_BASE_DELAY_MS * 2 ** (item.retryCount - 1),
+        PERSIST_RETRY_MAX_DELAY_MS
+      );
+      item.retryScheduled = true;
+      this.retryItem = item;
+      this.retryTimer = this.windowObject.setTimeout(() => {
+        this.retryTimer = void 0;
+        this.retryItem = void 0;
+        item.retryScheduled = false;
+        if (!this.destroyed && !this.tearingDown && this.outbox[0] === item) void this.flushOutbox();
+      }, delay);
     }
     getStatus() {
       return {
@@ -864,6 +910,7 @@
     beginTeardown() {
       if (this.tearingDown) return;
       this.tearingDown = true;
+      if (this.retryItem !== void 0) this.cancelScheduledRetry(this.retryItem);
       if (this.noVideoTimer !== void 0) this.windowObject.clearTimeout(this.noVideoTimer);
       this.resourceObserver?.disconnect?.();
     }

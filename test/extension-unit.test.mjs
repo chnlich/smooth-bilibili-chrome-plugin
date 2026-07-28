@@ -158,7 +158,7 @@ test('BridgeCore preserves stale-generation errors', () => {
   assert.throws(() => core.setStableBufferTime(120), (error) => error.code === 'BRIDGE_CORE_STALE');
 });
 
-test('diagnostic sender policy allows only stored same-origin SPA session transitions', () => {
+test('diagnostic sender policy checks origin while allowing pathname changes in one SPA session', () => {
   const session = {
     schemaVersion: 1,
     sessionId: 'session-sender-policy',
@@ -174,10 +174,7 @@ test('diagnostic sender policy allows only stored same-origin SPA session transi
   const oldRouteSender = { tab: { id: 7 }, url: 'https://www.bilibili.com/video/BVold?from=test' };
   const newRouteSender = { tab: { id: 7 }, url: 'https://www.bilibili.com/video/BVnew?from=test' };
   assert.doesNotThrow(() => assertAppendSessionPolicy(undefined, session, oldRouteSender));
-  assert.throws(
-    () => assertAppendSessionPolicy(undefined, session, newRouteSender),
-    (error) => error.code === 'SESSION_ROUTE_CONFLICT',
-  );
+  assert.doesNotThrow(() => assertAppendSessionPolicy(undefined, session, newRouteSender));
   assert.doesNotThrow(() => assertAppendSessionPolicy({ ...session }, session, newRouteSender));
   assert.throws(
     () => assertAppendSessionPolicy({ ...session }, session, { tab: { id: 7 }, url: 'https://other.example/video/BVother' }),

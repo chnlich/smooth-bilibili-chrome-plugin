@@ -1,4 +1,4 @@
-import { allowedDataFields, assertEventCode } from './catalog.js';
+import { allowedDataFields, assertEventCode, isSafePersistErrorCode } from './catalog.js';
 
 export const UNKNOWN_VALUE = '未提供';
 
@@ -154,6 +154,7 @@ function sanitizeField(field, value) {
     return browserMetric(value);
   }
   if (field === 'enabled') return value === true || value === false ? value : UNKNOWN_VALUE;
+  if (field === 'code') return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
   if (field === 'message') return scrubErrorText(value);
   if (field === 'samples') return safeSampleList(value);
   return safeScalar(value);

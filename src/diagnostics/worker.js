@@ -45,20 +45,17 @@ function senderUrl(sender) {
   return new URL(sender.url);
 }
 
-export function assertSenderMatchesSession(session, sender, { requirePathname = true } = {}) {
+export function assertSenderMatchesSession(session, sender) {
   const pageUrl = senderUrl(sender);
-  if (pageUrl.origin !== session.origin || (requirePathname && pageUrl.pathname !== session.pathname)) {
-    throw storageError('SESSION_ROUTE_CONFLICT', 'sender URL 与 session origin/pathname 不一致');
+  if (pageUrl.origin !== session.origin) {
+    throw storageError('SESSION_ROUTE_CONFLICT', 'sender URL 与 session origin 不一致');
   }
 }
 
 export function assertAppendSessionPolicy(existingSession, session, sender) {
-  assertSenderMatchesSession(session, sender, { requirePathname: false });
+  assertSenderMatchesSession(session, sender);
   if (existingSession !== undefined && stableStringify(existingSession) !== stableStringify(session)) {
     throw storageError('SESSION_CONFLICT', '相同 sessionId 的 session 身份不一致');
-  }
-  if (existingSession === undefined) {
-    assertSenderMatchesSession(session, sender, { requirePathname: true });
   }
 }
 

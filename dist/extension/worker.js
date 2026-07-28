@@ -87,6 +87,10 @@
     "log.persist.degraded"
   ]);
   var EXACT_CODES = new Set(EVENT_CODES);
+  var PERSIST_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+  function isSafePersistErrorCode(code) {
+    return typeof code === "string" && PERSIST_ERROR_CODE_PATTERN.test(code);
+  }
   function assertEventCode(code) {
     if (typeof code !== "string" || !EXACT_CODES.has(code)) {
       throw new Error(`未允许的诊断事件代码: ${code}`);
@@ -163,7 +167,7 @@
       "reason"
     ]),
     extension: Object.freeze(["action", "reason", "status"]),
-    persist: Object.freeze(["status", "batchSize", "eventCount", "message"])
+    persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
   });
   function allowedDataFields(code) {
     if (code.startsWith("route.")) return DATA_ALLOWLIST.route;
@@ -334,6 +338,7 @@
       return browserMetric(value);
     }
     if (field === "enabled") return value === true || value === false ? value : UNKNOWN_VALUE;
+    if (field === "code") return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
     if (field === "message") return scrubErrorText(value);
     if (field === "samples") return safeSampleList(value);
     return safeScalar(value);
@@ -618,19 +623,16 @@
     }
     return new URL(sender.url);
   }
-  function assertSenderMatchesSession(session, sender, { requirePathname = true } = {}) {
+  function assertSenderMatchesSession(session, sender) {
     const pageUrl = senderUrl(sender);
-    if (pageUrl.origin !== session.origin || requirePathname && pageUrl.pathname !== session.pathname) {
-      throw storageError("SESSION_ROUTE_CONFLICT", "sender URL 与 session origin/pathname 不一致");
+    if (pageUrl.origin !== session.origin) {
+      throw storageError("SESSION_ROUTE_CONFLICT", "sender URL 与 session origin 不一致");
     }
   }
   function assertAppendSessionPolicy(existingSession, session, sender) {
-    assertSenderMatchesSession(session, sender, { requirePathname: false });
+    assertSenderMatchesSession(session, sender);
     if (existingSession !== void 0 && stableStringify(existingSession) !== stableStringify(session)) {
       throw storageError("SESSION_CONFLICT", "相同 sessionId 的 session 身份不一致");
-    }
-    if (existingSession === void 0) {
-      assertSenderMatchesSession(session, sender, { requirePathname: true });
     }
   }
   function validateBatchMessage(message) {
