@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { resolveChromeExecutablePath } from './browser-runtime.mjs';
+import { startConsoleCapture, triggerExtensionPositiveControl } from './console-capture.mjs';
 import { readStoredEvents } from './extension-log-pull.mjs';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
 
@@ -180,10 +182,6 @@ function assertNoForbiddenExtensionMediaWrites(entries) {
 
 async function openFixture(context, url, html) {
   const page = await context.newPage();
-  page.on('pageerror', (error) => console.error(`[e2e pageerror] ${error.message}`));
-  page.on('console', (message) => {
-    if (message.type() === 'error') console.error(`[e2e console] ${message.text()}`);
-  });
   await page.route('**/*', async (route) => {
     if (route.request().isNavigationRequest()) {
       await route.fulfill({ status: 200, contentType: 'text/html', body: html });
@@ -283,6 +281,7 @@ async function clickExport(page) {
   await page.locator('[data-export]').click();
 }
 
+const chromeExecutablePath = await resolveChromeExecutablePath();
 const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-e2e-profile-'));
 const scenarios = [];
 const markScenario = (name) => {
@@ -291,8 +290,10 @@ const markScenario = (name) => {
 };
 let context;
 let extensionId;
+let consoleCapture;
 try {
   const launch = (profile) => chromium.launchPersistentContext(profile, {
+    executablePath: chromeExecutablePath,
     headless: false,
     ignoreDefaultArgs: ['--disable-extensions'],
     args: [
@@ -302,6 +303,8 @@ try {
   });
   context = await launch(profileDirectory);
   extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
+  consoleCapture = await startConsoleCapture(context.browser(), extensionId);
+  await triggerExtensionPositiveControl(context, extensionId, consoleCapture);
   await context.addInitScript({ content: `(${silentAndAuditInit.toString()})()` });
   await context.addInitScript({ content: `(${autoOpenPopupLogs.toString()})()` });
 
@@ -423,6 +426,11 @@ try {
   markScenario('日志 writer failure aborts the file');
 
   await popupVideoPage.close();
+  const consoleVerdict = consoleCapture.verdict();
+  assert.equal(consoleVerdict.status, 'pass', JSON.stringify(consoleVerdict));
+  console.log(`browser e2e console verdict: ${JSON.stringify(consoleVerdict)}`);
+  await consoleCapture.close();
+  consoleCapture = undefined;
   await context.close();
   context = await launch(profileDirectory);
   await context.addInitScript({ content: `(${silentAndAuditInit.toString()})()` });
@@ -433,6 +441,7 @@ try {
   console.log(`browser e2e passed: ${scenarios.length} deterministic scenes`);
   for (const scenario of scenarios) console.log(`- ${scenario}`);
 } finally {
+  await consoleCapture?.close();
   await context?.close();
   await fs.rm(profileDirectory, { recursive: true, force: true });
 }
