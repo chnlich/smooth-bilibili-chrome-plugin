@@ -3,6 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { resolveChromeExecutablePath } from './browser-runtime.mjs';
+import { startConsoleCapture, triggerExtensionPositiveControl } from './console-capture.mjs';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
 import { readMaxEventId, readStoredEvents } from './extension-log-pull.mjs';
 
@@ -245,8 +247,10 @@ async function runPage(context, extensionId, url) {
   }
 }
 
+const chromeExecutablePath = await resolveChromeExecutablePath();
 const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-external-smoke-'));
 let context;
+let consoleCapture;
 const report = {
   generatedAt: new Date().toISOString(),
   browser: {
@@ -259,6 +263,7 @@ const report = {
 };
 try {
   context = await chromium.launchPersistentContext(profileDirectory, {
+    executablePath: chromeExecutablePath,
     headless: false,
     ignoreDefaultArgs: ['--disable-extensions'],
     args: [
@@ -268,10 +273,18 @@ try {
   });
   report.browser.browserStarted = true;
   const extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
+  consoleCapture = await startConsoleCapture(context.browser(), extensionId);
+  await triggerExtensionPositiveControl(context, extensionId, consoleCapture);
   await context.addInitScript({ content: `(${mutedInit.toString()})()` });
   const video = await runPage(context, extensionId, 'https://www.bilibili.com/video/BV1ohQVBFEsh');
+  report.console = consoleCapture.verdict();
+  if (report.console.status !== 'pass') {
+    video.result.status = report.console.status === 'INCONCLUSIVE' ? 'INCONCLUSIVE' : 'FAIL';
+    video.result.reason = `console verdict: ${report.console.failures.join('; ')}`;
+  }
   report.results.push(video.result);
 } finally {
+  await consoleCapture?.close();
   await context?.close();
   await fs.rm(profileDirectory, { recursive: true, force: true });
 }
@@ -279,3 +292,4 @@ try {
 await fs.mkdir(reportDirectory, { recursive: true });
 await fs.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
 console.log(JSON.stringify(report, null, 2));
+if (report.console?.status !== 'pass') process.exitCode = 1;

@@ -56,6 +56,8 @@ npm audit --omit=dev --json
 
 构建保持未压缩，并为每个 JavaScript bundle 生成外部 source map。`buildId` 由 `src` 内容确定性生成；源码不变时连续构建的文件内容、文件列表和 build id 相同。现有确定性浏览器测试仍使用新建的临时 profile。所有自动化浏览器都保持 `--mute-audio` 和 document-start 静音 guard；真实 Bilibili 页面受环境阻挡时只报告 `BLOCKED`，不伪造通过。
 
+浏览器脚本明确使用系统 Chrome，不回退到 Playwright Chromium。默认路径是 `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`，也可以用 `BILIBILI_E2E_CHROME` 覆盖。`npm run test:e2e` 使用临时 profile；真实播放验收使用 `npm run verify:browser -- --profile <专用登录 profile> --bv <BV号>`。验证输出目录包含 `events.json`、`console.json`、`network.json` 和 `summary.json`；`summary.json` 会记录 commit sha、buildId，以及 `pass`、`fail` 或 `INCONCLUSIVE` 和失败项。
+
 ## 自己验证
 
 1. 执行 `npm run build` 后，在 `chrome://extensions` 加载 `dist/extension`。
