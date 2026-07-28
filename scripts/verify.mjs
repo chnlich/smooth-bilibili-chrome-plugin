@@ -1,21 +1,19 @@
-import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 import { resolveChromeExecutablePath } from './browser-runtime.mjs';
 import { startConsoleCapture, triggerExtensionPositiveControl } from './console-capture.mjs';
 import { readMaxEventId, readStoredEvents } from './extension-log-pull.mjs';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
+import { readProvenance } from './provenance.mjs';
 
 // Real Chrome playback verification: npm run verify:browser -- --bv BV... --profile <signed-in-profile>
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
 const MEDIA_HOST = /(?:\.bilivideo\.com|\.akamaized\.net)$/;
-const execFileAsync = promisify(execFile);
 
 function parseArgs(argv) {
   const options = {
@@ -237,19 +235,6 @@ async function switchQuality(context, extensionId, page, startAfterEventId, path
   };
 }
 
-async function readProvenance() {
-  const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root });
-  const commitSha = stdout.trim();
-  if (!/^[0-9a-f]{40}$/.test(commitSha)) throw new Error('git rev-parse HEAD did not return a commit sha');
-  const bundles = await Promise.all([
-    fs.readFile(path.join(extensionDirectory, 'controller.js'), 'utf8'),
-    fs.readFile(path.join(extensionDirectory, 'worker.js'), 'utf8'),
-  ]);
-  const buildIds = new Set(bundles.flatMap((bundle) => bundle.match(/src-[a-f0-9]{24}/g) || []));
-  if (buildIds.size !== 1) throw new Error('dist bundles do not contain exactly one shared buildId');
-  return { commitSha, buildId: [...buildIds][0] };
-}
-
 function assertPlayback(samples) {
   const times = samples.map((sample) => sample.currentTime).filter((time) => Number.isFinite(time));
   if (times.length < 2 || times.at(-1) <= times[0]) {
@@ -262,7 +247,7 @@ function assertPlayback(samples) {
 
 const options = parseArgs(process.argv.slice(2));
 const chromeExecutablePath = await resolveChromeExecutablePath();
-const provenance = await readProvenance();
+const provenance = await readProvenance({ rootDirectory: root, extensionDirectory });
 const outputDirectory = options.outputDirectory === undefined
   ? path.join(root, 'reports', `verify-${Date.now()}`)
   : path.resolve(options.outputDirectory);
@@ -284,6 +269,7 @@ const summary = {
   failures: [],
   blocked: undefined,
   commitSha: provenance.commitSha,
+  commitShaReason: provenance.commitShaReason,
   buildId: provenance.buildId,
   options: {
     bv: options.bv,

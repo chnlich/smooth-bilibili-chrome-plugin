@@ -12,6 +12,7 @@ import {
   DEFAULT_CHROME_EXECUTABLE_PATH,
   resolveChromeExecutablePath,
 } from '../scripts/browser-runtime.mjs';
+import { readProvenance } from '../scripts/provenance.mjs';
 
 test('Chrome executable resolution uses the override and never falls back after a missing path', async () => {
   const override = await resolveChromeExecutablePath({
@@ -26,6 +27,37 @@ test('Chrome executable resolution uses the override and never falls back after 
     }),
     (error) => error.message.includes(DEFAULT_CHROME_EXECUTABLE_PATH)
       && error.message.includes('Playwright bundled Chromium is not used'),
+  );
+});
+
+test('provenance keeps verification running when git is unavailable', async () => {
+  const buildId = `src-${'a'.repeat(24)}`;
+  const provenance = await readProvenance({
+    rootDirectory: 'test-root',
+    extensionDirectory: 'test-dist',
+    executeGit: async () => {
+      throw new Error('spawn git ENOENT');
+    },
+    readFile: async () => `const buildId = '${buildId}';`,
+  });
+  assert.equal(provenance.commitSha, null);
+  assert.match(provenance.commitShaReason, /spawn git ENOENT/);
+  assert.equal(provenance.buildId, buildId);
+});
+
+test('provenance still rejects bundles with different buildIds', async () => {
+  const controllerBuildId = `src-${'a'.repeat(24)}`;
+  const workerBuildId = `src-${'b'.repeat(24)}`;
+  await assert.rejects(
+    readProvenance({
+      rootDirectory: 'test-root',
+      extensionDirectory: 'test-dist',
+      executeGit: async () => ({ stdout: `${'c'.repeat(40)}\n` }),
+      readFile: async (filePath) => filePath.endsWith('controller.js')
+        ? `const buildId = '${controllerBuildId}';`
+        : `const buildId = '${workerBuildId}';`,
+    }),
+    /dist bundles do not contain exactly one shared buildId/,
   );
 });
 
