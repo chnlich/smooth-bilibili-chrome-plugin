@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
-import { resolveChromeExecutablePath } from './browser-runtime.mjs';
+import { findAvailablePort, resolveChromeExecutablePath } from './browser-runtime.mjs';
 import { startConsoleCapture, triggerExtensionPositiveControl } from './console-capture.mjs';
 import { readMaxEventId, readStoredEvents } from './extension-log-pull.mjs';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
@@ -247,6 +247,7 @@ function assertPlayback(samples) {
 
 const options = parseArgs(process.argv.slice(2));
 const chromeExecutablePath = await resolveChromeExecutablePath();
+const cdpPort = await findAvailablePort();
 const provenance = await readProvenance({ rootDirectory: root, extensionDirectory });
 const outputDirectory = options.outputDirectory === undefined
   ? path.join(root, 'reports', `verify-${Date.now()}`)
@@ -287,6 +288,7 @@ const summary = {
 try {
   context = await chromium.launchPersistentContext(profileDirectory, {
     executablePath: chromeExecutablePath,
+    cdpPort,
     headless: false,
     args: [
       '--mute-audio',
@@ -299,7 +301,7 @@ try {
   });
   summary.browser.browserStarted = true;
   extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
-  consoleCapture = await startConsoleCapture(context.browser(), extensionId);
+  consoleCapture = await startConsoleCapture(cdpPort, extensionId);
   await triggerExtensionPositiveControl(context, extensionId, consoleCapture);
   summary.positiveControl = { captured: true };
   await context.addInitScript({ content: `(${silenceInit.toString()})()` });

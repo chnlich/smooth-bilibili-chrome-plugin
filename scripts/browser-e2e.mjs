@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
-import { resolveChromeExecutablePath } from './browser-runtime.mjs';
+import { findAvailablePort, resolveChromeExecutablePath } from './browser-runtime.mjs';
 import { startConsoleCapture, triggerExtensionPositiveControl } from './console-capture.mjs';
 import { readStoredEvents } from './extension-log-pull.mjs';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
@@ -282,6 +282,7 @@ async function clickExport(page) {
 }
 
 const chromeExecutablePath = await resolveChromeExecutablePath();
+const cdpPort = await findAvailablePort();
 const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-e2e-profile-'));
 const scenarios = [];
 const markScenario = (name) => {
@@ -294,6 +295,7 @@ let consoleCapture;
 try {
   const launch = (profile) => chromium.launchPersistentContext(profile, {
     executablePath: chromeExecutablePath,
+    cdpPort,
     headless: false,
     ignoreDefaultArgs: ['--disable-extensions'],
     args: [
@@ -303,7 +305,7 @@ try {
   });
   context = await launch(profileDirectory);
   extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
-  consoleCapture = await startConsoleCapture(context.browser(), extensionId);
+  consoleCapture = await startConsoleCapture(cdpPort, extensionId);
   await triggerExtensionPositiveControl(context, extensionId, consoleCapture);
   await context.addInitScript({ content: `(${silentAndAuditInit.toString()})()` });
   await context.addInitScript({ content: `(${autoOpenPopupLogs.toString()})()` });

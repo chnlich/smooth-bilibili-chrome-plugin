@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import {
   BrowserConsoleCapture,
   classifyConsoleEvent,
   classifyStackSource,
   hasExtensionStackFrame,
-  startConsoleCapture,
 } from '../scripts/console-capture.mjs';
 import {
   DEFAULT_CHROME_EXECUTABLE_PATH,
@@ -82,63 +80,157 @@ test('console source attribution requires an extension stack frame and ignores a
   assert.equal(forged.bilibiliBufferPrefix, true);
 });
 
-class FakeBrowserCDPSession extends EventEmitter {
-  async send(method, params) {
-    if (method === 'Target.sendMessageToTarget') {
-      const message = JSON.parse(params.message);
-      queueMicrotask(() => this.emit('Target.receivedMessageFromTarget', {
-        sessionId: params.sessionId,
-        message: JSON.stringify({ id: message.id, result: {} }),
-      }));
-    }
+class FakeFlatCdpTransport {
+  constructor() {
+    this.commands = [];
+    this.messageHandler = undefined;
+    this.closeHandler = undefined;
+    this.open = true;
+  }
+
+  get isOpen() {
+    return this.open;
+  }
+
+  onMessage(handler) {
+    this.messageHandler = handler;
+  }
+
+  onClose(handler) {
+    this.closeHandler = handler;
+  }
+
+  emitMessage(message) {
+    this.messageHandler(message);
+  }
+
+  async send(method, params, sessionId) {
+    this.commands.push({ method, params, sessionId });
+    if (method === 'Target.getTargets') return { targetInfos: [] };
     return {};
   }
 
-  async detach() {}
+  async close() {
+    this.open = false;
+  }
 }
 
-test('browser-level CDP attaches page and service worker targets through one Runtime path', async () => {
-  const session = new FakeBrowserCDPSession();
-  const browser = { newBrowserCDPSession: async () => session };
+test('browser-level CDP uses flatten routing for page and service worker Runtime events', async () => {
+  const transport = new FakeFlatCdpTransport();
   const extensionId = 'extension-test-id';
-  const capture = await startConsoleCapture(browser, extensionId);
-  session.emit('Target.attachedToTarget', {
-    sessionId: 'page-session',
-    targetInfo: { type: 'page', url: 'https://www.bilibili.com/video/BVtest' },
+  const capture = await new BrowserConsoleCapture(transport, extensionId).start();
+  transport.emitMessage({
+    method: 'Target.attachedToTarget',
+    params: {
+      sessionId: 'page-session',
+      targetInfo: { targetId: 'page-target', type: 'page', url: 'about:blank' },
+    },
   });
-  session.emit('Target.attachedToTarget', {
-    sessionId: 'worker-session',
-    targetInfo: { type: 'service_worker', url: `chrome-extension://${extensionId}/worker.js` },
+  transport.emitMessage({
+    method: 'Target.attachedToTarget',
+    params: {
+      sessionId: 'worker-session',
+      targetInfo: {
+        targetId: 'worker-target',
+        type: 'service_worker',
+        url: `chrome-extension://${extensionId}/worker.js`,
+      },
+    },
   });
   await new Promise((resolve) => setImmediate(resolve));
-  session.emit('Target.receivedMessageFromTarget', {
+  transport.emitMessage({
+    method: 'Target.targetInfoChanged',
+    params: {
+      targetInfo: { targetId: 'page-target', type: 'page', url: 'https://www.bilibili.com/video/BVtest' },
+    },
+  });
+  transport.emitMessage({
     sessionId: 'page-session',
-    message: JSON.stringify({
-      method: 'Runtime.consoleAPICalled',
-      params: {
-        type: 'error',
-        args: [{ value: 'page error' }],
+    method: 'Runtime.consoleAPICalled',
+    params: {
+      type: 'error',
+      args: [{ value: 'page error' }],
+      stackTrace: { callFrames: [{ url: 'https://www.bilibili.com/video/BVtest' }] },
+    },
+  });
+  transport.emitMessage({
+    sessionId: 'page-session',
+    method: 'Runtime.exceptionThrown',
+    params: {
+      exceptionDetails: {
+        uncaught: true,
+        text: 'page uncaught error',
         stackTrace: { callFrames: [{ url: 'https://www.bilibili.com/video/BVtest' }] },
       },
-    }),
+    },
   });
-  session.emit('Target.receivedMessageFromTarget', {
+  transport.emitMessage({
     sessionId: 'worker-session',
-    message: JSON.stringify({
-      method: 'Runtime.exceptionThrown',
-      params: {
-        exceptionDetails: {
-          uncaught: true,
-          text: 'worker error',
-          stackTrace: { callFrames: [{ url: `chrome-extension://${extensionId}/worker.js` }] },
-        },
-      },
-    }),
+    method: 'Runtime.consoleAPICalled',
+    params: {
+      type: 'error',
+      args: [{ value: 'worker error' }],
+      stackTrace: { callFrames: [{ url: `chrome-extension://${extensionId}/worker.js` }] },
+    },
   });
-  assert.deepEqual(capture.events.map(({ targetType, kind, source }) => ({ targetType, kind, source })), [
-    { targetType: 'page', kind: 'console', source: 'page' },
-    { targetType: 'service_worker', kind: 'exception', source: 'extension' },
+  transport.emitMessage({
+    sessionId: 'worker-session',
+    method: 'Runtime.exceptionThrown',
+    params: {
+      exceptionDetails: {
+        uncaught: true,
+        text: 'worker uncaught error',
+        stackTrace: { callFrames: [{ url: `chrome-extension://${extensionId}/worker.js` }] },
+      },
+    },
+  });
+  assert.deepEqual(capture.events.map(({ targetType, targetUrl, kind, source }) => ({
+    targetType,
+    targetUrl,
+    kind,
+    source,
+  })), [
+    {
+      targetType: 'page',
+      targetUrl: 'https://www.bilibili.com/video/BVtest',
+      kind: 'console',
+      source: 'page',
+    },
+    {
+      targetType: 'page',
+      targetUrl: 'https://www.bilibili.com/video/BVtest',
+      kind: 'exception',
+      source: 'page',
+    },
+    {
+      targetType: 'service_worker',
+      targetUrl: `chrome-extension://${extensionId}/worker.js`,
+      kind: 'console',
+      source: 'extension',
+    },
+    {
+      targetType: 'service_worker',
+      targetUrl: `chrome-extension://${extensionId}/worker.js`,
+      kind: 'exception',
+      source: 'extension',
+    },
   ]);
+  assert.deepEqual(transport.commands[0], {
+    method: 'Target.setDiscoverTargets',
+    params: { discover: true },
+    sessionId: undefined,
+  });
+  assert.deepEqual(transport.commands[1], {
+    method: 'Target.setAutoAttach',
+    params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+    sessionId: undefined,
+  });
+  assert.deepEqual(
+    transport.commands.filter(({ method }) => method === 'Runtime.enable').map(({ sessionId }) => sessionId),
+    ['page-session', 'worker-session'],
+  );
   assert.equal(capture instanceof BrowserConsoleCapture, true);
   await capture.close();
+  assert.equal(transport.commands.at(-1).params.flatten, true);
+  assert.equal(transport.open, false);
 });

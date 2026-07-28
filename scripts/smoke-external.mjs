@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
-import { resolveChromeExecutablePath } from './browser-runtime.mjs';
+import { findAvailablePort, resolveChromeExecutablePath } from './browser-runtime.mjs';
 import { startConsoleCapture, triggerExtensionPositiveControl } from './console-capture.mjs';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
 import { readMaxEventId, readStoredEvents } from './extension-log-pull.mjs';
@@ -248,6 +248,7 @@ async function runPage(context, extensionId, url) {
 }
 
 const chromeExecutablePath = await resolveChromeExecutablePath();
+const cdpPort = await findAvailablePort();
 const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-external-smoke-'));
 let context;
 let consoleCapture;
@@ -264,6 +265,7 @@ const report = {
 try {
   context = await chromium.launchPersistentContext(profileDirectory, {
     executablePath: chromeExecutablePath,
+    cdpPort,
     headless: false,
     ignoreDefaultArgs: ['--disable-extensions'],
     args: [
@@ -273,7 +275,7 @@ try {
   });
   report.browser.browserStarted = true;
   const extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
-  consoleCapture = await startConsoleCapture(context.browser(), extensionId);
+  consoleCapture = await startConsoleCapture(cdpPort, extensionId);
   await triggerExtensionPositiveControl(context, extensionId, consoleCapture);
   await context.addInitScript({ content: `(${mutedInit.toString()})()` });
   const video = await runPage(context, extensionId, 'https://www.bilibili.com/video/BV1ohQVBFEsh');
