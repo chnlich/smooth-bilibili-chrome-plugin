@@ -362,6 +362,8 @@ export class BrowserConsoleCapture {
       this.throwIfCaptureFailed();
       const event = this.events.find((candidate) => candidate.positiveControl === true
         && candidate.targetType === targetType
+        && typeof candidate.targetUrl === 'string'
+        && candidate.targetUrl.startsWith(extensionFramePrefix(this.extensionId))
         && candidate.kind === 'console'
         && candidate.level === 'error');
       if (event !== undefined) return event;
@@ -471,7 +473,9 @@ export async function triggerExtensionPositiveControl(context, extensionId, capt
     }, marker);
     const pageControl = await capture.waitForPositiveControl();
     const serviceWorkerSessionId = [...capture.targetSessions.entries()]
-      .find(([, target]) => target.targetType === 'service_worker')?.[0];
+      .find(([, target]) => target.targetType === 'service_worker'
+        && typeof target.targetUrl === 'string'
+        && target.targetUrl.startsWith(extensionFramePrefix(extensionId)))?.[0];
     if (serviceWorkerSessionId === undefined) {
       throw Object.assign(new Error('service worker target was not attached for console positive control'), {
         code: 'CONSOLE_POSITIVE_CONTROL_MISSED',

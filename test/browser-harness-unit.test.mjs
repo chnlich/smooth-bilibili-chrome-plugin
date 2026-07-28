@@ -229,6 +229,28 @@ test('browser-level CDP uses flatten routing for page and service worker Runtime
     transport.commands.filter(({ method }) => method === 'Runtime.enable').map(({ sessionId }) => sessionId),
     ['page-session', 'worker-session'],
   );
+  capture.setPositiveControlMarker('service-worker-marker');
+  capture.recordEvent({
+    targetType: 'service_worker',
+    targetUrl: 'https://www.bilibili.com/service-worker.js',
+    kind: 'console',
+    level: 'error',
+    source: 'unknown',
+    text: 'service-worker-marker',
+  });
+  await assert.rejects(
+    capture.waitForPositiveControlTarget('service_worker', 1),
+    (error) => error.code === 'CONSOLE_POSITIVE_CONTROL_MISSED',
+  );
+  capture.recordEvent({
+    targetType: 'service_worker',
+    targetUrl: `chrome-extension://${extensionId}/worker.js`,
+    kind: 'console',
+    level: 'error',
+    source: 'unknown',
+    text: 'service-worker-marker',
+  });
+  await capture.waitForPositiveControlTarget('service_worker');
   assert.equal(capture instanceof BrowserConsoleCapture, true);
   await capture.close();
   assert.equal(transport.commands.at(-1).params.flatten, true);
