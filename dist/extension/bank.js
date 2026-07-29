@@ -35,7 +35,6 @@
     "waiting",
     "stalled",
     "progress",
-    "timeupdate",
     "seeking",
     "seeked",
     "ratechange",
@@ -64,15 +63,12 @@
     "video.no_video",
     "media.sample",
     ...MEDIA_EVENT_NAMES.map((name) => `media.${name}`),
-    "resource.observed",
     "resource.observer_unavailable",
     "video.buffer_hint.attempt",
     "video.buffer_hint.applied",
     "video.buffer_hint.unsupported",
     "video.buffer_hint.failed",
     "video.buffer_observed",
-    "bridge.request",
-    "bridge.response",
     "bridge.error",
     "bank.fetch.chunk",
     "bank.serve",
@@ -83,7 +79,6 @@
     "extension.boot_error",
     "extension.observer_error",
     "extension.destroyed",
-    "log.persist.result",
     "log.persist.degraded"
   ]);
   var EXACT_CODES = new Set(EVENT_CODES);
@@ -146,6 +141,7 @@
     bridge: Object.freeze(["operation", "direction", "status"]),
     bank: Object.freeze([
       "source",
+      "mirror",
       "operation",
       "chunkIndex",
       "start",
@@ -159,22 +155,9 @@
     extension: Object.freeze(["action", "reason", "status"]),
     persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
   });
-  function allowedDataFields(code) {
-    if (code.startsWith("route.")) return DATA_ALLOWLIST.route;
-    if (code.startsWith("preference.")) return DATA_ALLOWLIST.preference;
-    if (code.startsWith("video.buffer_hint.") || code.startsWith("video.")) return DATA_ALLOWLIST.video;
-    if (code.startsWith("media.")) return DATA_ALLOWLIST.media;
-    if (code.startsWith("resource.")) return DATA_ALLOWLIST.resource;
-    if (code.startsWith("bridge.")) return DATA_ALLOWLIST.bridge;
-    if (code.startsWith("bank.")) return DATA_ALLOWLIST.bank;
-    if (code.startsWith("extension.")) return DATA_ALLOWLIST.extension;
-    if (code.startsWith("log.persist.")) return DATA_ALLOWLIST.persist;
-    throw new Error(`诊断事件代码没有字段 allowlist: ${code}`);
-  }
 
   // src/diagnostics/privacy.js
   var UNKNOWN_VALUE = "未提供";
-  var RESOURCE_FIELDS = Object.freeze([...allowedDataFields("resource.observed")]);
   function scrubUrl(value) {
     if (typeof value !== "string" || value.length === 0) {
       return UNKNOWN_VALUE;
@@ -307,19 +290,10 @@
   function planFetchRanges(start, end, {
     chunkBytes = BANK_CONFIG.chunkBytes,
     totalSize,
-    bankKeyValue = "resource",
-    aligned = false
+    bankKeyValue = "resource"
   } = {}) {
     const request = { start, end };
     rangeLength(request);
-    if (aligned !== true) {
-      return [{
-        ...request,
-        chunkIndex: chunkIndex(start, chunkBytes),
-        cacheKey: cacheKey(bankKeyValue, chunkIndex(start, chunkBytes)),
-        cacheable: false
-      }];
-    }
     const result = [];
     let current = Math.floor(start / chunkBytes) * chunkBytes;
     while (current <= end) {
@@ -584,6 +558,9 @@
   function isAbortError(error) {
     return error?.name === "AbortError";
   }
+  function mirrorForUrl(url) {
+    return new URL(url).hostname;
+  }
   function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
     return class SegmentBankXMLHttpRequest {
       static UNSENT = 0;
@@ -736,7 +713,26 @@
           locationObject: windowObject.location
         });
         this._range = classification.range;
-        if (!asyncFlag || !classification.intercepted) {
+        if (!asyncFlag) {
+          if (bankEnabled(bank)) {
+            bank.emitDiagnostic("bank.serve", {
+              source: scrubUrl(url),
+              mirror: mirrorForUrl(url),
+              result: "pass",
+              reason: "sync_xhr"
+            });
+          }
+          return this._native.send(body);
+        }
+        if (!classification.intercepted) {
+          if (bankEnabled(bank)) {
+            bank.emitDiagnostic("bank.serve", {
+              source: scrubUrl(url),
+              mirror: mirrorForUrl(url),
+              result: "pass",
+              reason: classification.reason
+            });
+          }
           return this._native.send(body);
         }
         this._intercepted = true;
@@ -781,6 +777,7 @@
         if (error instanceof BankFallbackError) {
           bank.emitDiagnostic("bank.serve", {
             source: scrubUrl(url),
+            mirror: mirrorForUrl(url),
             ...this._range,
             result: "pass",
             reason: "internal_fallback"
@@ -792,7 +789,10 @@
           return;
         }
         if (error instanceof BankNetworkError) {
-          if (!this._aborted && !this._timedOut) this.finishError(error, generation);
+          if (!this._aborted && !this._timedOut) {
+            console.error("[BilibiliBuffer] 媒体分片前台取数失败", error);
+            this.finishError(error, generation);
+          }
           return;
         }
         if (isAbortError(error)) {
@@ -801,6 +801,7 @@
         }
         bank.emitDiagnostic("bank.serve", {
           source: scrubUrl(url),
+          mirror: mirrorForUrl(url),
           ...this._range,
           result: "pass",
           reason: "internal_error"
@@ -894,6 +895,9 @@
   }
   function performanceNow(windowObject) {
     return typeof windowObject.performance?.now === "function" ? windowObject.performance.now() : Date.now();
+  }
+  function mirrorForUrl2(url) {
+    return new URL(url).hostname;
   }
   function responseTypeConstructor(windowObject, name) {
     return windowObject[name] || globalThis[name];
@@ -1067,6 +1071,7 @@
         if (this.isEnabled()) {
           this.emitDiagnostic("bank.serve", {
             source: scrubUrl(request.url),
+            mirror: mirrorForUrl2(request.url),
             result: "pass",
             reason: classification.reason
           });
@@ -1091,10 +1096,14 @@
         }
       } catch (error) {
         if (isAbortError2(error)) throw error;
-        if (error instanceof BankNetworkError) throw error;
+        if (error instanceof BankNetworkError) {
+          console.error("[BilibiliBuffer] 媒体分片前台取数失败", error);
+          throw error;
+        }
         if (error instanceof BankFallbackError) {
           this.emitDiagnostic("bank.serve", {
             source: scrubUrl(request.url),
+            mirror: mirrorForUrl2(request.url),
             start: classification.range.start,
             end: classification.range.end,
             result: "pass",
@@ -1104,6 +1113,7 @@
         }
         this.emitDiagnostic("bank.serve", {
           source: scrubUrl(request.url),
+          mirror: mirrorForUrl2(request.url),
           result: "pass",
           reason: "internal_error"
         });
@@ -1128,6 +1138,7 @@
       return response;
     }
     async serveRequest({ url, method, headers, credentials, signal }) {
+      const startedAt = performanceNow(this.windowObject);
       const classification = this.requestClassification(url, headers);
       if (!classification.intercepted) return { intercepted: false };
       if (signal?.aborted) throw abortError();
@@ -1151,16 +1162,19 @@
         }
         state.totalSize = stored.totalSize;
         this.scheduleResourceWindow(state);
+        const response = this.createResponse(stored.bytes, start, end, stored.totalSize, url);
         this.emitDiagnostic("bank.serve", {
           source: scrubUrl(url),
+          mirror: mirrorForUrl2(url),
           start,
           end,
+          durationMs: performanceNow(this.windowObject) - startedAt,
           result: "hit",
           reason: "stored_range"
         });
         return {
           intercepted: true,
-          response: this.createResponse(stored.bytes, start, end, stored.totalSize, url),
+          response,
           bytes: stored.bytes,
           totalSize: stored.totalSize
         };
@@ -1168,8 +1182,7 @@
       const requestPlans = planFetchRanges(start, end, {
         chunkBytes: this.config.chunkBytes,
         totalSize: state.totalSize,
-        bankKeyValue: resourceKey,
-        aligned: true
+        bankKeyValue: resourceKey
       });
       const missingPlans = requestPlans.filter((plan) => !this.chunks.has(plan.cacheKey));
       const gaveUpPlans = missingPlans.filter((plan) => {
@@ -1213,16 +1226,19 @@
           throw new BankFallbackError("媒体分片供数总长度无效");
         }
         state.totalSize = supplied.totalSize;
+        const response = this.createResponse(supplied.bytes, start, end, supplied.totalSize, url);
         this.emitDiagnostic("bank.serve", {
           source: scrubUrl(url),
+          mirror: mirrorForUrl2(url),
           start,
           end,
+          durationMs: performanceNow(this.windowObject) - startedAt,
           result: "hit",
           reason: "fetched_range"
         });
         return {
           intercepted: true,
-          response: this.createResponse(supplied.bytes, start, end, supplied.totalSize, url),
+          response,
           bytes: supplied.bytes,
           totalSize: supplied.totalSize,
           release: () => {
@@ -1258,8 +1274,7 @@
       return planFetchRanges(start, end, {
         chunkBytes: this.config.chunkBytes,
         totalSize: state.totalSize,
-        bankKeyValue: state.bankKey,
-        aligned: true
+        bankKeyValue: state.bankKey
       });
     }
     supersedeTasksBefore(bankKeyValue, anchorChunk) {
@@ -1289,7 +1304,8 @@
           credentials: state.credentials,
           videoKey: state.videoKey
         }).catch((error) => {
-          if (!isAbortError2(error)) console.error("[BilibiliBuffer] 媒体分片预取失败", error);
+          if (isAbortError2(error) || error instanceof BankNetworkError || error instanceof BankFallbackError) return;
+          throw error;
         });
       }
       this.pump();
@@ -1323,7 +1339,7 @@
         task.controller.abort();
         if (task.reader !== void 0) {
           void task.reader.cancel().catch((error) => {
-            console.error("[BilibiliBuffer] 停滞媒体分片读取取消失败", error);
+            if (!isAbortError2(error)) console.error("[BilibiliBuffer] 停滞媒体分片读取取消失败", error);
           });
         }
       }, this.config.stallMs);
@@ -1560,6 +1576,7 @@
         end: range.end,
         bytes,
         durationMs,
+        mirror: mirrorForUrl2(task.url),
         priority: task.kind,
         result
       });

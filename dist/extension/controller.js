@@ -37,7 +37,6 @@
     "waiting",
     "stalled",
     "progress",
-    "timeupdate",
     "seeking",
     "seeked",
     "ratechange",
@@ -66,15 +65,12 @@
     "video.no_video",
     "media.sample",
     ...MEDIA_EVENT_NAMES.map((name) => `media.${name}`),
-    "resource.observed",
     "resource.observer_unavailable",
     "video.buffer_hint.attempt",
     "video.buffer_hint.applied",
     "video.buffer_hint.unsupported",
     "video.buffer_hint.failed",
     "video.buffer_observed",
-    "bridge.request",
-    "bridge.response",
     "bridge.error",
     "bank.fetch.chunk",
     "bank.serve",
@@ -85,7 +81,6 @@
     "extension.boot_error",
     "extension.observer_error",
     "extension.destroyed",
-    "log.persist.result",
     "log.persist.degraded"
   ]);
   var EXACT_CODES = new Set(EVENT_CODES);
@@ -158,6 +153,7 @@
     bridge: Object.freeze(["operation", "direction", "status"]),
     bank: Object.freeze([
       "source",
+      "mirror",
       "operation",
       "chunkIndex",
       "start",
@@ -186,8 +182,6 @@
 
   // src/diagnostics/privacy.js
   var UNKNOWN_VALUE = "未提供";
-  var RESOURCE_FIELDS = Object.freeze([...allowedDataFields("resource.observed")]);
-  var MEDIA_RESOURCE_INITIATOR_TYPES = /* @__PURE__ */ new Set(["audio", "video"]);
   function finiteOrUnknown(value) {
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }
@@ -440,21 +434,9 @@
     }
     return root;
   }
-  function resourceTimingFields(entry) {
-    if (entry === null || typeof entry !== "object") {
-      throw new Error("PerformanceResourceTiming 条目无效");
-    }
-    const initiatorType = entry.initiatorType;
-    const fields = {};
-    for (const field of RESOURCE_FIELDS) {
-      if (field === "name" && !MEDIA_RESOURCE_INITIATOR_TYPES.has(initiatorType)) continue;
-      fields[field] = field === "initiatorType" ? initiatorType : entry[field];
-    }
-    return fields;
-  }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-e874413e7b63fb8925a847d2" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-4c920de310d4d13c43e1bdb0" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -687,9 +669,7 @@
       this.persistence = "未提供";
       this.pendingPersistResult = void 0;
       this.noVideoTimer = void 0;
-      this.resourceObserver = void 0;
       this.startSession(routeIdentity(locationObject));
-      this.installResourceObserver();
       this.documentObject?.defaultView?.addEventListener?.("pagehide", () => {
         this.beginTeardown();
         void this.flushForTeardown().catch((error) => {
@@ -740,34 +720,15 @@
         this.noVideoTimer = void 0;
       }
     }
-    installResourceObserver() {
-      const Observer = this.windowObject.PerformanceObserver;
-      if (typeof Observer !== "function") {
-        this.log("resource.observer_unavailable");
-        return;
-      }
-      try {
-        this.resourceObserver = new Observer((list) => {
-          for (const entry of list.getEntries()) {
-            try {
-              this.log("resource.observed", resourceTimingFields(entry));
-            } catch (error) {
-              this.log("extension.observer_error", { reason: "resource" }, error);
-            }
-          }
-        });
-        this.resourceObserver.observe({ type: "resource", buffered: true });
-      } catch (error) {
-        this.log("extension.observer_error", { reason: "resource-observer" }, error);
-      }
-    }
     log(code, data = {}, error, context = {}) {
       if (this.destroyed || this.tearingDown) return;
       try {
         if (this.pendingPersistResult !== void 0 && !code.startsWith("log.persist.")) {
           const result = this.pendingPersistResult;
           this.pendingPersistResult = void 0;
-          this.append(result.status === "DEGRADED" ? "log.persist.degraded" : "log.persist.result", result, void 0, {});
+          if (result.status === "DEGRADED") {
+            this.append("log.persist.degraded", result, void 0, {});
+          }
         }
         this.append(code, data, error, context);
         if (!code.startsWith("log.persist.")) this.scheduleFlush();
@@ -913,7 +874,6 @@
       this.tearingDown = true;
       if (this.retryItem !== void 0) this.cancelScheduledRetry(this.retryItem);
       if (this.noVideoTimer !== void 0) this.windowObject.clearTimeout(this.noVideoTimer);
-      this.resourceObserver?.disconnect?.();
     }
     destroy() {
       if (this.destroyed) return;
@@ -1898,7 +1858,6 @@
     }
     callSync(operation, args = []) {
       const request = this.createRequest(operation, args, "sync");
-      this.diagnostic("bridge.request", { operation, direction: "content-to-main" });
       if (this.documentObject.documentElement === null) {
         const error = new BufferScriptError("BRIDGE_DOCUMENT_UNAVAILABLE", "桥接调用时页面 documentElement 不可用");
         this.diagnostic("bridge.error", { operation, direction: "content-to-main" }, error);
@@ -1915,7 +1874,6 @@
       }
       try {
         const value = this.decodeResponse(serialized, request.id, request.operation);
-        this.diagnostic("bridge.response", { operation, direction: "main-to-content", status: "ok" });
         return value;
       } catch (error) {
         logInvalidBridgePayload("同步响应", error);
@@ -1925,7 +1883,6 @@
     }
     callAsync(operation, args = []) {
       const request = this.createRequest(operation, args, "async");
-      this.diagnostic("bridge.request", { operation, direction: "content-to-main" });
       return new Promise((resolve, reject) => {
         const timer = this.runtimeObject.setTimeout(() => {
           this.pending.delete(request.id);
@@ -1965,11 +1922,6 @@
       this.runtimeObject.clearTimeout(pending.timer);
       try {
         const value = this.decodeResponse(serialized, response.id, pending.operation);
-        this.diagnostic("bridge.response", {
-          operation: pending.operation,
-          direction: "main-to-content",
-          status: "ok"
-        });
         pending.resolve(value);
       } catch (error) {
         this.diagnostic("bridge.error", { operation: pending.operation, direction: "main-to-content" }, error);

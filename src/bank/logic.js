@@ -114,18 +114,9 @@ export function planFetchRanges(start, end, {
   chunkBytes = BANK_CONFIG.chunkBytes,
   totalSize,
   bankKeyValue = 'resource',
-  aligned = false,
 } = {}) {
   const request = { start, end };
   rangeLength(request);
-  if (aligned !== true) {
-    return [{
-      ...request,
-      chunkIndex: chunkIndex(start, chunkBytes),
-      cacheKey: cacheKey(bankKeyValue, chunkIndex(start, chunkBytes)),
-      cacheable: false,
-    }];
-  }
   const result = [];
   let current = Math.floor(start / chunkBytes) * chunkBytes;
   while (current <= end) {

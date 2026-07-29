@@ -235,7 +235,6 @@ test('response headers, content-range parser, fetch plans and bitrate estimate a
     chunkBytes: 16,
     totalSize: 100,
     bankKeyValue: MEDIA_KEY,
-    aligned: true,
   }), [
     { start: 0, end: 15, chunkIndex: 0, cacheKey: `${MEDIA_KEY}#0`, cacheable: true },
     { start: 16, end: 31, chunkIndex: 1, cacheKey: `${MEDIA_KEY}#1`, cacheable: true },
@@ -244,24 +243,12 @@ test('response headers, content-range parser, fetch plans and bitrate estimate a
     chunkBytes: 16,
     totalSize: 100,
     bankKeyValue: MEDIA_KEY,
-    aligned: true,
   }), [{
     start: 0,
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
     cacheable: true,
-  }]);
-  assert.deepEqual(planFetchRanges(4, 10, {
-    chunkBytes: 16,
-    totalSize: 100,
-    bankKeyValue: MEDIA_KEY,
-  }), [{
-    start: 4,
-    end: 10,
-    chunkIndex: 0,
-    cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: false,
   }]);
 });
 
@@ -674,6 +661,24 @@ test('non-2xx responses and network errors fail the intercepted player request',
   await assert.rejects(fetchThrough(failedBank), (error) => error.name === 'BankNetworkError');
 });
 
+test('a foreground fetch failure is written to the console', async () => {
+  const { bank } = createBank({
+    maxPrefetchConcurrency: 1,
+    nativeFetch: async () => { throw new TypeError('cdn failed'); },
+  });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    await assert.rejects(fetchThrough(bank), (error) => error.name === 'BankNetworkError');
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    bank.destroy();
+    console.error = originalError;
+  }
+  assert.equal(errors.length, 1);
+});
+
 test('an intercepted request uses the extension task signal instead of the caller signal', async () => {
   let signalSeen;
   const { bank } = createBank({
@@ -740,8 +745,16 @@ test('a stalled stream is cancelled with the real bytes already received', async
   await new Promise((resolve) => setImmediate(resolve));
   const task = bank.inflight.get(`${MEDIA_KEY}#0`);
   assert.equal(streamController !== undefined, true);
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
   timers.fire(config.stallMs);
-  await assert.rejects(pending, (error) => error.name === 'AbortError');
+  try {
+    await assert.rejects(pending, (error) => error.name === 'AbortError');
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    console.error = originalError;
+  }
   assert.equal(task.abortReason, 'stalled');
   assert.equal(bank.chunks.has(`${MEDIA_KEY}#0`), false);
   const diagnostic = windowObject.messages.find(
@@ -749,6 +762,7 @@ test('a stalled stream is cancelled with the real bytes already received', async
   );
   assert.equal(diagnostic.data.bytes, 3);
   assert.equal(state.chunkAttempts.get(0), 1);
+  assert.deepEqual(errors, []);
 });
 
 test('aborting a waiting player request removes it from outstanding without cancelling its chunk task', async () => {
@@ -854,7 +868,6 @@ test('a failed chunk is selected again by the next window without retry code', a
     chunkBytes: config.chunkBytes,
     totalSize: 64,
     bankKeyValue: MEDIA_KEY,
-    aligned: true,
   })[0];
   await assert.rejects(bank.getTask(plan, {
     kind: 'prefetch',
@@ -867,6 +880,37 @@ test('a failed chunk is selected again by the next window without retry code', a
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(ranges.filter((range) => range.start === 0).length, 2);
   assert.equal(bank.chunks.has(`${MEDIA_KEY}#0`), true);
+});
+
+test('a retry-absorbed prefetch failure records a chunk event without console output', async () => {
+  const config = configFor();
+  const { bank, windowObject } = createBank({
+    config,
+    maxPrefetchConcurrency: 1,
+    nativeFetch: async () => { throw new TypeError('temporary CDN failure'); },
+  });
+  const state = bank.stateFor(MEDIA_KEY);
+  state.latestUrl = MEDIA_URL;
+  state.lastForegroundStart = 0;
+  bank.touchResource(MEDIA_KEY);
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    await bank.prefetch();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    await bank.prefetch();
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    bank.destroy();
+    console.error = originalError;
+  }
+  assert.equal(errors.length, 0);
+  assert.equal(state.chunkAttempts.get(0), 2);
+  assert.equal(windowObject.messages.some(
+    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'network_error',
+  ), true);
 });
 
 test('a chunk at maxChunkAttempts leaves the window and reports gave_up to its player', async () => {
@@ -887,7 +931,6 @@ test('a chunk at maxChunkAttempts leaves the window and reports gave_up to its p
     chunkBytes: config.chunkBytes,
     totalSize: 64,
     bankKeyValue: MEDIA_KEY,
-    aligned: true,
   })[0];
   for (let attempt = 0; attempt < config.maxChunkAttempts; attempt += 1) {
     await assert.rejects(bank.getTask(plan, {
@@ -1050,6 +1093,88 @@ class NativeXHR {
 
   overrideMimeType() {}
 }
+
+test('XHR non-intercepted media requests record their classification reason', () => {
+  for (const [range, reason] of [[undefined, 'range_missing'], ['bytes=4-', 'range_not_closed']]) {
+    const { bank, windowObject } = createBank();
+    windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({
+      windowObject,
+      nativeConstructor: NativeXHR,
+      bank,
+    });
+    const xhr = new windowObject.XMLHttpRequest();
+    xhr.open('GET', MEDIA_URL);
+    if (range !== undefined) xhr.setRequestHeader('Range', range);
+    xhr.send();
+    const diagnostic = windowObject.messages.find((message) => message.code === 'bank.serve');
+    assert.deepEqual(diagnostic.data, {
+      source: 'https://upos-sz-mirrorcosov.bilivideo.com/video/track.m4s',
+      mirror: 'upos-sz-mirrorcosov.bilivideo.com',
+      result: 'pass',
+      reason,
+    });
+    assert.deepEqual(xhr._native.sendCalls, [undefined]);
+    bank.destroy();
+  }
+});
+
+test('synchronous XHR records a distinct pass reason', () => {
+  const { bank, windowObject } = createBank();
+  windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({
+    windowObject,
+    nativeConstructor: NativeXHR,
+    bank,
+  });
+  const xhr = new windowObject.XMLHttpRequest();
+  xhr.open('GET', MEDIA_URL, false);
+  xhr.setRequestHeader('Range', 'bytes=0-2');
+  xhr.send();
+  const diagnostic = windowObject.messages.find((message) => message.code === 'bank.serve');
+  assert.equal(diagnostic.data.result, 'pass');
+  assert.equal(diagnostic.data.reason, 'sync_xhr');
+  assert.equal(diagnostic.data.mirror, 'upos-sz-mirrorcosov.bilivideo.com');
+  assert.deepEqual(xhr._native.sendCalls, [undefined]);
+  bank.destroy();
+});
+
+test('serve and chunk hit diagnostics carry duration and mirror on both channels', async () => {
+  const fetchFixture = createBank({ config: configFor() });
+  const fetchResponse = await fetchThrough(fetchFixture.bank, MEDIA_URL, {
+    headers: { Range: 'bytes=4-11' },
+  });
+  assert.deepEqual([...new Uint8Array(await fetchResponse.arrayBuffer())], [...bytesFor(4, 11)]);
+  const fetchServe = fetchFixture.windowObject.messages.find(
+    (message) => message.code === 'bank.serve' && message.data.reason === 'fetched_range',
+  );
+  assert.equal(typeof fetchServe.data.durationMs, 'number');
+  assert.equal(fetchServe.data.durationMs >= 0, true);
+  assert.equal(fetchServe.data.mirror, 'upos-sz-mirrorcosov.bilivideo.com');
+  const chunk = fetchFixture.windowObject.messages.find((message) => message.code === 'bank.fetch.chunk');
+  assert.equal(chunk.data.mirror, 'upos-sz-mirrorcosov.bilivideo.com');
+  fetchFixture.bank.destroy();
+
+  const xhrFixture = createBank({ config: configFor() });
+  putChunk(xhrFixture.bank, 0, xhrFixture.bank.config);
+  xhrFixture.windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({
+    windowObject: xhrFixture.windowObject,
+    nativeConstructor: NativeXHR,
+    bank: xhrFixture.bank,
+  });
+  const xhr = new xhrFixture.windowObject.XMLHttpRequest();
+  await new Promise((resolve) => {
+    xhr.addEventListener('loadend', resolve);
+    xhr.open('GET', MEDIA_URL);
+    xhr.setRequestHeader('Range', 'bytes=4-11');
+    xhr.send();
+  });
+  const xhrServe = xhrFixture.windowObject.messages.find(
+    (message) => message.code === 'bank.serve' && message.data.reason === 'stored_range',
+  );
+  assert.equal(typeof xhrServe.data.durationMs, 'number');
+  assert.equal(xhrServe.data.durationMs >= 0, true);
+  assert.equal(xhrServe.data.mirror, 'upos-sz-mirrorcosov.bilivideo.com');
+  xhrFixture.bank.destroy();
+});
 
 test('XHR preserves readyState 2→3→4 and event ordering with arraybuffer response', async () => {
   const windowObject = windowFixture();

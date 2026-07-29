@@ -2,9 +2,6 @@ import { allowedDataFields, assertEventCode, isSafePersistErrorCode } from './ca
 
 export const UNKNOWN_VALUE = '未提供';
 
-const RESOURCE_FIELDS = Object.freeze([...allowedDataFields('resource.observed')]);
-const MEDIA_RESOURCE_INITIATOR_TYPES = new Set(['audio', 'video']);
-
 function finiteOrUnknown(value) {
   return Number.isFinite(value) ? value : UNKNOWN_VALUE;
 }
@@ -282,17 +279,4 @@ function sanitizeSerializedError(error) {
     source = cause;
   }
   return root;
-}
-
-export function resourceTimingFields(entry) {
-  if (entry === null || typeof entry !== 'object') {
-    throw new Error('PerformanceResourceTiming 条目无效');
-  }
-  const initiatorType = entry.initiatorType;
-  const fields = {};
-  for (const field of RESOURCE_FIELDS) {
-    if (field === 'name' && !MEDIA_RESOURCE_INITIATOR_TYPES.has(initiatorType)) continue;
-    fields[field] = field === 'initiatorType' ? initiatorType : entry[field];
-  }
-  return fields;
 }

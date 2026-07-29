@@ -51,6 +51,10 @@ function isAbortError(error) {
   return error?.name === 'AbortError';
 }
 
+function mirrorForUrl(url) {
+  return new URL(url).hostname;
+}
+
 export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
   return class SegmentBankXMLHttpRequest {
     static UNSENT = 0;
@@ -203,7 +207,26 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
         locationObject: windowObject.location,
       });
       this._range = classification.range;
-      if (!asyncFlag || !classification.intercepted) {
+      if (!asyncFlag) {
+        if (bankEnabled(bank)) {
+          bank.emitDiagnostic('bank.serve', {
+            source: scrubUrl(url),
+            mirror: mirrorForUrl(url),
+            result: 'pass',
+            reason: 'sync_xhr',
+          });
+        }
+        return this._native.send(body);
+      }
+      if (!classification.intercepted) {
+        if (bankEnabled(bank)) {
+          bank.emitDiagnostic('bank.serve', {
+            source: scrubUrl(url),
+            mirror: mirrorForUrl(url),
+            result: 'pass',
+            reason: classification.reason,
+          });
+        }
         return this._native.send(body);
       }
       this._intercepted = true;
@@ -252,6 +275,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       if (error instanceof BankFallbackError) {
         bank.emitDiagnostic('bank.serve', {
           source: scrubUrl(url),
+          mirror: mirrorForUrl(url),
           ...this._range,
           result: 'pass',
           reason: 'internal_fallback',
@@ -263,7 +287,10 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
         return;
       }
       if (error instanceof BankNetworkError) {
-        if (!this._aborted && !this._timedOut) this.finishError(error, generation);
+        if (!this._aborted && !this._timedOut) {
+          console.error('[BilibiliBuffer] 媒体分片前台取数失败', error);
+          this.finishError(error, generation);
+        }
         return;
       }
       if (isAbortError(error)) {
@@ -272,6 +299,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       }
       bank.emitDiagnostic('bank.serve', {
         source: scrubUrl(url),
+        mirror: mirrorForUrl(url),
         ...this._range,
         result: 'pass',
         reason: 'internal_error',

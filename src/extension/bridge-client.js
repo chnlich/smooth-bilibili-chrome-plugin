@@ -195,7 +195,6 @@ export class BridgeClient {
 
   callSync(operation, args = []) {
     const request = this.createRequest(operation, args, 'sync');
-    this.diagnostic('bridge.request', { operation, direction: 'content-to-main' });
     if (this.documentObject.documentElement === null) {
       const error = new BufferScriptError('BRIDGE_DOCUMENT_UNAVAILABLE', '桥接调用时页面 documentElement 不可用');
       this.diagnostic('bridge.error', { operation, direction: 'content-to-main' }, error);
@@ -212,7 +211,6 @@ export class BridgeClient {
     }
     try {
       const value = this.decodeResponse(serialized, request.id, request.operation);
-      this.diagnostic('bridge.response', { operation, direction: 'main-to-content', status: 'ok' });
       return value;
     } catch (error) {
       logInvalidBridgePayload('同步响应', error);
@@ -223,7 +221,6 @@ export class BridgeClient {
 
   callAsync(operation, args = []) {
     const request = this.createRequest(operation, args, 'async');
-    this.diagnostic('bridge.request', { operation, direction: 'content-to-main' });
     return new Promise((resolve, reject) => {
       const timer = this.runtimeObject.setTimeout(() => {
         this.pending.delete(request.id);
@@ -264,11 +261,6 @@ export class BridgeClient {
     this.runtimeObject.clearTimeout(pending.timer);
     try {
       const value = this.decodeResponse(serialized, response.id, pending.operation);
-      this.diagnostic('bridge.response', {
-        operation: pending.operation,
-        direction: 'main-to-content',
-        status: 'ok',
-      });
       pending.resolve(value);
     } catch (error) {
       this.diagnostic('bridge.error', { operation: pending.operation, direction: 'main-to-content' }, error);

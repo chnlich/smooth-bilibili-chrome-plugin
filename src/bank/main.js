@@ -40,6 +40,10 @@ function performanceNow(windowObject) {
   return typeof windowObject.performance?.now === 'function' ? windowObject.performance.now() : Date.now();
 }
 
+function mirrorForUrl(url) {
+  return new URL(url).hostname;
+}
+
 function responseTypeConstructor(windowObject, name) {
   return windowObject[name] || globalThis[name];
 }
@@ -233,6 +237,7 @@ export class SegmentBank {
       if (this.isEnabled()) {
         this.emitDiagnostic('bank.serve', {
           source: scrubUrl(request.url),
+          mirror: mirrorForUrl(request.url),
           result: 'pass',
           reason: classification.reason,
         });
@@ -257,10 +262,14 @@ export class SegmentBank {
       }
     } catch (error) {
       if (isAbortError(error)) throw error;
-      if (error instanceof BankNetworkError) throw error;
+      if (error instanceof BankNetworkError) {
+        console.error('[BilibiliBuffer] 媒体分片前台取数失败', error);
+        throw error;
+      }
       if (error instanceof BankFallbackError) {
         this.emitDiagnostic('bank.serve', {
           source: scrubUrl(request.url),
+          mirror: mirrorForUrl(request.url),
           start: classification.range.start,
           end: classification.range.end,
           result: 'pass',
@@ -270,6 +279,7 @@ export class SegmentBank {
       }
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(request.url),
+        mirror: mirrorForUrl(request.url),
         result: 'pass',
         reason: 'internal_error',
       });
@@ -298,6 +308,7 @@ export class SegmentBank {
   }
 
   async serveRequest({ url, method, headers, credentials, signal }) {
+    const startedAt = performanceNow(this.windowObject);
     const classification = this.requestClassification(url, headers);
     if (!classification.intercepted) return { intercepted: false };
     if (signal?.aborted) throw abortError();
@@ -321,16 +332,19 @@ export class SegmentBank {
       }
       state.totalSize = stored.totalSize;
       this.scheduleResourceWindow(state);
+      const response = this.createResponse(stored.bytes, start, end, stored.totalSize, url);
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(url),
+        mirror: mirrorForUrl(url),
         start,
         end,
+        durationMs: performanceNow(this.windowObject) - startedAt,
         result: 'hit',
         reason: 'stored_range',
       });
       return {
         intercepted: true,
-        response: this.createResponse(stored.bytes, start, end, stored.totalSize, url),
+        response,
         bytes: stored.bytes,
         totalSize: stored.totalSize,
       };
@@ -340,7 +354,6 @@ export class SegmentBank {
       chunkBytes: this.config.chunkBytes,
       totalSize: state.totalSize,
       bankKeyValue: resourceKey,
-      aligned: true,
     });
     const missingPlans = requestPlans.filter((plan) => !this.chunks.has(plan.cacheKey));
     const gaveUpPlans = missingPlans.filter((plan) => {
@@ -385,16 +398,19 @@ export class SegmentBank {
         throw new BankFallbackError('媒体分片供数总长度无效');
       }
       state.totalSize = supplied.totalSize;
+      const response = this.createResponse(supplied.bytes, start, end, supplied.totalSize, url);
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(url),
+        mirror: mirrorForUrl(url),
         start,
         end,
+        durationMs: performanceNow(this.windowObject) - startedAt,
         result: 'hit',
         reason: 'fetched_range',
       });
       return {
         intercepted: true,
-        response: this.createResponse(supplied.bytes, start, end, supplied.totalSize, url),
+        response,
         bytes: supplied.bytes,
         totalSize: supplied.totalSize,
         release: () => {
@@ -434,7 +450,6 @@ export class SegmentBank {
       chunkBytes: this.config.chunkBytes,
       totalSize: state.totalSize,
       bankKeyValue: state.bankKey,
-      aligned: true,
     });
   }
 
@@ -466,7 +481,8 @@ export class SegmentBank {
         credentials: state.credentials,
         videoKey: state.videoKey,
       }).catch((error) => {
-        if (!isAbortError(error)) console.error('[BilibiliBuffer] 媒体分片预取失败', error);
+        if (isAbortError(error) || error instanceof BankNetworkError || error instanceof BankFallbackError) return;
+        throw error;
       });
     }
     this.pump();
@@ -503,7 +519,7 @@ export class SegmentBank {
       task.controller.abort();
       if (task.reader !== undefined) {
         void task.reader.cancel().catch((error) => {
-          console.error('[BilibiliBuffer] 停滞媒体分片读取取消失败', error);
+          if (!isAbortError(error)) console.error('[BilibiliBuffer] 停滞媒体分片读取取消失败', error);
         });
       }
     }, this.config.stallMs);
@@ -762,6 +778,7 @@ export class SegmentBank {
       end: range.end,
       bytes,
       durationMs,
+      mirror: mirrorForUrl(task.url),
       priority: task.kind,
       result,
     });

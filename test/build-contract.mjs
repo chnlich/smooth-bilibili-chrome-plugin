@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { BANK_CONFIG, EXTENSION_MANIFEST, VOD_CONFIG } from '../src/constants.js';
 import { createManifest } from '../src/extension/manifest-source.js';
-import { EVENT_CODES, MEDIA_EVENT_NAMES } from '../src/diagnostics/catalog.js';
+import { DATA_ALLOWLIST, EVENT_CODES, MEDIA_EVENT_NAMES } from '../src/diagnostics/catalog.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
@@ -306,7 +306,13 @@ assert.deepEqual(BANK_CONFIG, {
   lookAheadChunks: 48,
   maxChunkAttempts: 3,
 });
-assert.equal(EVENT_CODES.includes('log.persist.result'), true);
+for (const removedCode of [
+  'log.persist.result',
+  'bridge.request',
+  'bridge.response',
+  'media.timeupdate',
+  'resource.observed',
+]) assert.equal(EVENT_CODES.includes(removedCode), false);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
 assert.equal(EVENT_CODES.some((code) => code.startsWith('live.')), false);
 assert.doesNotMatch(source, /\broomId\b/);
@@ -315,6 +321,19 @@ assert.equal(EVENT_CODES.includes('bank.serve'), true);
 assert.equal(EVENT_CODES.includes('bank.evict'), true);
 assert.equal(EVENT_CODES.includes('bank.store'), true);
 assert.equal(EVENT_CODES.includes('bank.disabled'), true);
+assert.deepEqual([...DATA_ALLOWLIST.bank].sort(), [
+  'bytes',
+  'chunkIndex',
+  'durationMs',
+  'end',
+  'mirror',
+  'operation',
+  'priority',
+  'reason',
+  'result',
+  'source',
+  'start',
+].sort());
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.doesNotMatch(bridgeContractSource, /BRIDGE_LIVE|setChasingFrameThreshold|getLiveCapabilitySnapshot|disableLiveAutoCatchup/);
 assert.doesNotMatch(shim, /adjustedEnd|dispatchEvent\s*\(/);

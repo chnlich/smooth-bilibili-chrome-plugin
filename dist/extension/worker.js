@@ -36,7 +36,6 @@
     "waiting",
     "stalled",
     "progress",
-    "timeupdate",
     "seeking",
     "seeked",
     "ratechange",
@@ -65,15 +64,12 @@
     "video.no_video",
     "media.sample",
     ...MEDIA_EVENT_NAMES.map((name) => `media.${name}`),
-    "resource.observed",
     "resource.observer_unavailable",
     "video.buffer_hint.attempt",
     "video.buffer_hint.applied",
     "video.buffer_hint.unsupported",
     "video.buffer_hint.failed",
     "video.buffer_observed",
-    "bridge.request",
-    "bridge.response",
     "bridge.error",
     "bank.fetch.chunk",
     "bank.serve",
@@ -84,7 +80,6 @@
     "extension.boot_error",
     "extension.observer_error",
     "extension.destroyed",
-    "log.persist.result",
     "log.persist.degraded"
   ]);
   var EXACT_CODES = new Set(EVENT_CODES);
@@ -157,6 +152,7 @@
     bridge: Object.freeze(["operation", "direction", "status"]),
     bank: Object.freeze([
       "source",
+      "mirror",
       "operation",
       "chunkIndex",
       "start",
@@ -211,7 +207,6 @@
 
   // src/diagnostics/privacy.js
   var UNKNOWN_VALUE = "未提供";
-  var RESOURCE_FIELDS = Object.freeze([...allowedDataFields("resource.observed")]);
   function finiteOrUnknown(value) {
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }

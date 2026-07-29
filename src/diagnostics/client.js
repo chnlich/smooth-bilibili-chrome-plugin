@@ -1,5 +1,5 @@
 import { DIAGNOSTIC_MESSAGE_VERSION, isSafePersistErrorCode } from './catalog.js';
-import { normalizeEventForStorage, resourceTimingFields } from './privacy.js';
+import { normalizeEventForStorage } from './privacy.js';
 import { createSessionIdentity } from './session.js';
 import { serializeError } from '../extension/bridge-contract.js';
 
@@ -94,9 +94,7 @@ export class DiagnosticsClient {
     this.persistence = '未提供';
     this.pendingPersistResult = undefined;
     this.noVideoTimer = undefined;
-    this.resourceObserver = undefined;
     this.startSession(routeIdentity(locationObject));
-    this.installResourceObserver();
     this.documentObject?.defaultView?.addEventListener?.('pagehide', () => {
       this.beginTeardown();
       void this.flushForTeardown().catch((error) => {
@@ -151,35 +149,15 @@ export class DiagnosticsClient {
     }
   }
 
-  installResourceObserver() {
-    const Observer = this.windowObject.PerformanceObserver;
-    if (typeof Observer !== 'function') {
-      this.log('resource.observer_unavailable');
-      return;
-    }
-    try {
-      this.resourceObserver = new Observer((list) => {
-        for (const entry of list.getEntries()) {
-          try {
-            this.log('resource.observed', resourceTimingFields(entry));
-          } catch (error) {
-            this.log('extension.observer_error', { reason: 'resource' }, error);
-          }
-        }
-      });
-      this.resourceObserver.observe({ type: 'resource', buffered: true });
-    } catch (error) {
-      this.log('extension.observer_error', { reason: 'resource-observer' }, error);
-    }
-  }
-
   log(code, data = {}, error, context = {}) {
     if (this.destroyed || this.tearingDown) return;
     try {
       if (this.pendingPersistResult !== undefined && !code.startsWith('log.persist.')) {
         const result = this.pendingPersistResult;
         this.pendingPersistResult = undefined;
-        this.append(result.status === 'DEGRADED' ? 'log.persist.degraded' : 'log.persist.result', result, undefined, {});
+        if (result.status === 'DEGRADED') {
+          this.append('log.persist.degraded', result, undefined, {});
+        }
       }
       this.append(code, data, error, context);
       if (!code.startsWith('log.persist.')) this.scheduleFlush();
@@ -336,7 +314,6 @@ export class DiagnosticsClient {
     this.tearingDown = true;
     if (this.retryItem !== undefined) this.cancelScheduledRetry(this.retryItem);
     if (this.noVideoTimer !== undefined) this.windowObject.clearTimeout(this.noVideoTimer);
-    this.resourceObserver?.disconnect?.();
   }
 
   destroy() {

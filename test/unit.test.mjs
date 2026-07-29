@@ -460,6 +460,8 @@ test('disabled video route passively records media without media or bridge owner
   assert.equal(diagnostics.events.filter((event) => event.code === 'media.sample').length, 1);
   fixture.video.emit('playing');
   assert.equal(diagnostics.events.filter((event) => event.code === 'media.playing').length, 1);
+  fixture.video.emit('timeupdate');
+  assert.equal(diagnostics.events.filter((event) => event.code === 'media.timeupdate').length, 0);
   assert.deepEqual(nativeOwnership(fixture.video), ownership);
 
   fixture.video.src = 'https://media.example/video-passive-2';
@@ -562,6 +564,7 @@ test('native numeric MediaError code survives media.error persistence with the f
 
 test('diagnostic catalog covers all required media events and preserves browser-reported zero', () => {
   assert.ok(MEDIA_EVENT_NAMES.includes('volumechange'));
+  assert.equal(MEDIA_EVENT_NAMES.includes('timeupdate'), false);
   for (const name of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${name}`));
   assert.deepEqual(browserMetric(0), { value: 0, reportedBy: 'browser' });
   assert.equal(scrubUrl('https://cdn.example/media.m4s?signature=secret#fragment'), 'https://cdn.example/media.m4s');
@@ -905,7 +908,7 @@ test('diagnostic persistence retries the failed head with bounded backoff withou
   await tick();
   await client.flush();
   assert.deepEqual(sent.slice(0, 2).map((message) => message.events.map((event) => event.sequence)), [[1], [1]]);
-  assert.deepEqual(sent.slice(2).flatMap((message) => message.events.map((event) => event.sequence)), [2, 3, 4]);
+  assert.deepEqual(sent.slice(2).flatMap((message) => message.events.map((event) => event.sequence)), [2, 3]);
   assert.ok(sent.slice(2).every((message) => message.events[0].sequence >= 2));
   const degradedEvent = sent.slice(2).flatMap((message) => message.events)
     .find((event) => event.code === 'log.persist.degraded');
@@ -953,105 +956,31 @@ test('diagnostic persistence stops automatic retries at the bound and keeps the 
     retryTimer.callback();
     await tick();
   }
-  assert.equal(client.outbox.length, 2);
+  assert.equal(client.outbox.length, 1);
   assert.equal(client.outbox[0].batch[0].sequence, 1);
   assert.equal(timers.some((timer) => timer.milliseconds > 0 && timer.milliseconds <= 5000
     && timer.cleared === false && timer.fired === false), false);
   client.log('route.changed', { reason: 'next_event_retries_head' });
   await client.flush();
-  assert.equal(client.outbox.length, 3);
+  assert.equal(client.outbox.length, 2);
   assert.equal(client.outbox[0].batch[0].sequence, 1);
   assert.equal(timers.some((timer) => timer.milliseconds > 0 && timer.milliseconds <= 5000
     && timer.cleared === false && timer.fired === false), false);
   client.destroy();
 });
 
-test('resource timing observer snapshots prototype fields before privacy filtering', async () => {
+test('diagnostics does not install a resource observer or emit resource observations', async () => {
   const sent = [];
-  const timers = [];
-  let resourceObserverCallback;
+  let observerCreated = false;
   class FakePerformanceObserver {
-    constructor(callback) {
-      resourceObserverCallback = callback;
+    constructor() {
+      observerCreated = true;
     }
-
-    observe() {}
-
-    disconnect() {}
   }
   const locationObject = {
     origin: 'https://www.bilibili.com',
     hostname: 'www.bilibili.com',
-    pathname: '/video/BVresource',
-  };
-  const client = new DiagnosticsClient({
-    documentObject: { defaultView: { addEventListener() {} } },
-    windowObject: {
-      location: locationObject,
-      PerformanceObserver: FakePerformanceObserver,
-      setTimeout(callback, milliseconds) {
-        const timer = { callback, milliseconds };
-        timers.push(timer);
-        return timer;
-      },
-      clearTimeout(timer) { timer.cleared = true; },
-    },
-    runtimeObject: {
-      sendMessage(message, callback) {
-        sent.push(message);
-        callback({ ok: true, status: 'PERSISTED', eventCount: message.events.length });
-      },
-    },
-    locationObject,
-    loggerObject: { log() {}, warn() {}, error() {} },
-  });
-  const entry = Object.create({
-    get name() { return 'https://cdn.example/video.m4s?token=secret#fragment'; },
-    get initiatorType() { return 'video'; },
-    get startTime() { return 0; },
-    get duration() { return 1; },
-    get responseStart() { return 0; },
-    get responseEnd() { return 2; },
-    get transferSize() { return 0; },
-    get encodedBodySize() { return 3; },
-    get decodedBodySize() { return 0; },
-  });
-  resourceObserverCallback({ getEntries() { return [entry]; } });
-  await client.flush();
-  const resourceEvent = sent.flatMap((message) => message.events).find((event) => event.code === 'resource.observed');
-  assert.deepEqual(resourceEvent.data, {
-    name: 'https://cdn.example/video.m4s',
-    initiatorType: 'video',
-    startTime: { value: 0, reportedBy: 'browser' },
-    duration: 1,
-    responseStart: { value: 0, reportedBy: 'browser' },
-    responseEnd: 2,
-    transferSize: { value: 0, reportedBy: 'browser' },
-    encodedBodySize: 3,
-    decodedBodySize: { value: 0, reportedBy: 'browser' },
-  });
-  assert.equal(JSON.stringify(resourceEvent.data).includes('token'), false);
-  assert.equal(JSON.stringify(resourceEvent.data).includes('fragment'), false);
-  client.destroy();
-  assert.ok(timers.some((timer) => timer.milliseconds === 30000));
-});
-
-test('resource timing omits non-media and unknown resource names while retaining metrics', async () => {
-  const sent = [];
-  let resourceObserverCallback;
-  class FakePerformanceObserver {
-    constructor(callback) {
-      resourceObserverCallback = callback;
-    }
-
-    observe() {}
-
-    disconnect() {}
-  }
-  const locationObject = {
-    origin: 'https://www.bilibili.com',
-    hostname: 'www.bilibili.com',
-    pathname: '/video/BVresource-privacy',
+    pathname: '/video/BVresource-removed',
   };
   const client = new DiagnosticsClient({
     documentObject: { defaultView: { addEventListener() {} } },
@@ -1070,55 +999,10 @@ test('resource timing omits non-media and unknown resource names while retaining
     locationObject,
     loggerObject: { log() {}, warn() {}, error() {} },
   });
-  const scriptEntry = Object.create({
-    get name() { return 'https://api.bilibili.com/account/private?token=secret#fragment'; },
-    get initiatorType() { return 'script'; },
-    get startTime() { return 0; },
-    get duration() { return 1; },
-    get responseStart() { return 0; },
-    get responseEnd() { return 2; },
-    get transferSize() { return 0; },
-    get encodedBodySize() { return 3; },
-    get decodedBodySize() { return 0; },
-  });
-  const unknownEntry = Object.create({
-    get name() { return 'https://api.bilibili.com/x/web-interface/nav?cookie=secret#fragment'; },
-    get initiatorType() { return 'other'; },
-    get startTime() { return 4; },
-    get duration() { return 0; },
-    get responseStart() { return 5; },
-    get responseEnd() { return 6; },
-    get transferSize() { return 7; },
-    get encodedBodySize() { return 0; },
-    get decodedBodySize() { return 8; },
-  });
-  resourceObserverCallback({ getEntries() { return [scriptEntry, unknownEntry]; } });
   await client.flush();
-  const resourceEvents = sent.flatMap((message) => message.events)
-    .filter((event) => event.code === 'resource.observed');
-  assert.deepEqual(resourceEvents.map((event) => event.data), [
-    {
-      initiatorType: 'script',
-      startTime: { value: 0, reportedBy: 'browser' },
-      duration: 1,
-      responseStart: { value: 0, reportedBy: 'browser' },
-      responseEnd: 2,
-      transferSize: { value: 0, reportedBy: 'browser' },
-      encodedBodySize: 3,
-      decodedBodySize: { value: 0, reportedBy: 'browser' },
-    },
-    {
-      initiatorType: 'other',
-      startTime: 4,
-      duration: { value: 0, reportedBy: 'browser' },
-      responseStart: 5,
-      responseEnd: 6,
-      transferSize: 7,
-      encodedBodySize: { value: 0, reportedBy: 'browser' },
-      decodedBodySize: 8,
-    },
-  ]);
-  assert.equal(JSON.stringify(resourceEvents).includes('account'), false);
-  assert.equal(JSON.stringify(resourceEvents).includes('cookie'), false);
+  assert.equal(observerCreated, false);
+  assert.equal(sent.flatMap((message) => message.events).some(
+    (event) => event.code === 'resource.observed',
+  ), false);
   client.destroy();
 });
