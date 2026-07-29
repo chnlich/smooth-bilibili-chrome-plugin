@@ -19,7 +19,9 @@
     maxBankBytes: 512 * 1024 ** 2,
     stallMs: 1e4,
     lookAheadChunks: 48,
-    maxChunkAttempts: 3
+    maxChunkAttempts: 3,
+    raceLegs: 2,
+    pairFreshnessMs: 36e5
   });
 
   // src/diagnostics/log-session.js

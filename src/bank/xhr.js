@@ -55,6 +55,11 @@ function mirrorForUrl(url) {
   return new URL(url).hostname;
 }
 
+function observePlayurlLoad(bank, native, url) {
+  if (typeof bank.isPlayurlUrl !== 'function' || !bank.isPlayurlUrl(url)) return;
+  native.addEventListener('load', () => bank.observePlayurlText(native.responseText), { once: true });
+}
+
 export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
   return class SegmentBankXMLHttpRequest {
     static UNSENT = 0;
@@ -217,6 +222,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
             reason: 'sync_xhr',
           });
         }
+        observePlayurlLoad(bank, this._native, url);
         return this._native.send(body);
       }
       if (!classification.intercepted) {
@@ -228,6 +234,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
             reason: classification.reason,
           });
         }
+        observePlayurlLoad(bank, this._native, url);
         return this._native.send(body);
       }
       this._intercepted = true;

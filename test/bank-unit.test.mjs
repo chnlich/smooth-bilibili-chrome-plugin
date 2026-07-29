@@ -30,7 +30,19 @@ import { SegmentBank } from '../src/bank/main.js';
 import { createBankXMLHttpRequestClass } from '../src/bank/xhr.js';
 
 const MEDIA_URL = 'https://upos-sz-mirrorcosov.bilivideo.com/video/track.m4s?deadline=secret&upsig=secret';
+const PAIR_URL = 'https://upos-hz-mirrorakam.akamaized.net/video/track.m4s?deadline=pair&upsig=pair';
 const MEDIA_KEY = '/video/track.m4s';
+const PLAYURL_URL = 'https://api.bilibili.com/x/player/wbi/playurl?bvid=secret';
+
+function playurlBody(baseUrl = MEDIA_URL, backupUrl = [PAIR_URL]) {
+  return {
+    data: {
+      dash: {
+        video: [{ baseUrl, backupUrl }],
+      },
+    },
+  };
+}
 
 function responseFor(start, end, totalSize = 100, body = new Uint8Array(end - start + 1), options = {}) {
   return new Response(body, {
@@ -67,6 +79,11 @@ function manualTimers() {
         pending.delete(id);
         timer.callback();
       }
+    },
+    fireId(id) {
+      const timer = pending.get(id);
+      pending.delete(id);
+      timer.callback();
     },
     pending,
   };
@@ -131,14 +148,21 @@ function bytesFor(start, end) {
   return Uint8Array.from({ length: end - start + 1 }, (_value, index) => (start + index) % 251);
 }
 
+async function tick() {
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
 function createBank({
   nativeFetch,
   config = BANK_CONFIG,
   maxPrefetchConcurrency = 2,
   chunks,
   timers,
+  now,
+  playinfo,
 } = {}) {
   const windowObject = windowFixture({ timers });
+  if (playinfo !== undefined) windowObject.__playinfo__ = playinfo;
   const calls = [];
   const fetchFunction = nativeFetch || (async (url, init) => {
     const range = rangeFromInit(init);
@@ -151,6 +175,7 @@ function createBank({
     config,
     maxPrefetchConcurrency,
     chunks,
+    now,
   });
   return { bank, windowObject, calls };
 }
@@ -702,6 +727,7 @@ test('an intercepted request uses the extension task signal instead of the calle
   assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytesFor(0, 9)]);
   assert.notEqual(signalSeen, controller.signal);
   assert.equal(originalCalls, 0);
+  await tick();
   assert.equal(bank.inflight.size, 0);
   controller.abort();
 });
@@ -754,7 +780,7 @@ test('a stalled stream is cancelled with the real bytes already received', async
   } finally {
     console.error = originalError;
   }
-  assert.equal(task.abortReason, 'stalled');
+  assert.equal(task.legs[0].abortReason, 'stalled');
   assert.equal(bank.chunks.has(`${MEDIA_KEY}#0`), false);
   const diagnostic = windowObject.messages.find(
     (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'stalled',
@@ -1066,6 +1092,320 @@ test('the window stays within the configured anchor plus lookAheadChunks', () =>
   assert.equal(plans.every((plan) => plan.chunkIndex >= anchor && plan.chunkIndex < anchor + config.lookAheadChunks), true);
 });
 
+test('a raced chunk dispatches both mirrors and stores only the first complete body', async () => {
+  const config = configFor({ raceLegs: 2 });
+  const requests = new Map();
+  const { bank, windowObject } = createBank({
+    config,
+    nativeFetch: (url, init) => new Promise((resolve, reject) => {
+      requests.set(url, { resolve, reject, signal: init.signal });
+      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    }),
+  });
+  bank.observePlayurlData(playurlBody());
+  const taskPromise = bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await tick();
+  assert.deepEqual([...requests.keys()].map((url) => new URL(url).hostname), [
+    new URL(MEDIA_URL).hostname,
+    new URL(PAIR_URL).hostname,
+  ]);
+
+  requests.get(PAIR_URL).resolve(responseFor(0, 15, 100, bytesFor(40, 55)));
+  await taskPromise;
+  await tick();
+  assert.deepEqual([...new Uint8Array(bank.chunks.get(`${MEDIA_KEY}#0`).bytes)], [...bytesFor(40, 55)]);
+  assert.equal(requests.get(MEDIA_URL).signal.aborted, true);
+  const chunkEvents = windowObject.messages.filter((message) => message.code === 'bank.fetch.chunk');
+  assert.equal(chunkEvents.length, 2);
+  assert.equal(chunkEvents.filter((message) => message.data.result === 'fetched').length, 1);
+  assert.equal(chunkEvents.filter((message) => message.data.result === 'lost_race').length, 1);
+  const winner = chunkEvents.find((message) => message.data.result === 'fetched').data;
+  const loser = chunkEvents.find((message) => message.data.result === 'lost_race').data;
+  assert.equal(winner.slot, 1);
+  assert.equal(winner.mirror, new URL(PAIR_URL).hostname);
+  assert.equal(typeof winner.ttfbMs, 'number');
+  assert.equal(loser.slot, 0);
+  assert.equal(loser.mirror, new URL(MEDIA_URL).hostname);
+  assert.equal(Object.hasOwn(loser, 'ttfbMs'), false);
+  bank.destroy();
+});
+
+test('a leg that arrives after settlement only emits lost_race and cannot store or record total size', async () => {
+  const config = configFor({ raceLegs: 2 });
+  const { bank, windowObject } = createBank({ config });
+  bank.observePlayurlData(playurlBody());
+  let releaseLateLeg;
+  let totalSizeRecords = 0;
+  bank.recordTotalSize = () => { totalSizeRecords += 1; };
+  bank.runLeg = (_task, leg) => {
+    leg.startedAt = 0;
+    leg.ttfbAt = 0;
+    leg.byteCount = 16;
+    const result = {
+      start: 0,
+      end: 15,
+      totalSize: 100,
+      bytes: (leg.slot === 0 ? bytesFor(0, 15) : bytesFor(40, 55)).buffer,
+    };
+    if (leg.slot === 0) {
+      leg.settled = true;
+      return Promise.resolve(result);
+    }
+    return new Promise((resolve) => {
+      releaseLateLeg = () => {
+        leg.settled = true;
+        resolve(result);
+      };
+    });
+  };
+  const taskPromise = bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await taskPromise;
+  assert.equal(totalSizeRecords, 1);
+  assert.deepEqual([...new Uint8Array(bank.chunks.get(`${MEDIA_KEY}#0`).bytes)], [...bytesFor(0, 15)]);
+  releaseLateLeg();
+  await tick();
+  assert.equal(totalSizeRecords, 1);
+  assert.deepEqual([...new Uint8Array(bank.chunks.get(`${MEDIA_KEY}#0`).bytes)], [...bytesFor(0, 15)]);
+  assert.equal(windowObject.messages.filter(
+    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'lost_race',
+  ).length, 1);
+  bank.destroy();
+});
+
+test('raced failure classification is order-independent and counts one chunk attempt', async () => {
+  const config = configFor({ raceLegs: 2 });
+  const stateFor = (nativeFetch) => {
+    const { bank, windowObject } = createBank({ config, nativeFetch });
+    bank.observePlayurlData(playurlBody());
+    return { bank, windowObject, state: bank.stateFor(MEDIA_KEY) };
+  };
+  const invalidResponse = () => responseFor(0, 15, 100, bytesFor(0, 15), {
+    headers: { 'Content-Range': 'bytes 1-16/100' },
+  });
+  const allInvalid = stateFor(async () => invalidResponse());
+  await assert.rejects(allInvalid.bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  }), (error) => error.name === 'BankFallbackError');
+  assert.equal(allInvalid.state.chunkAttempts.get(0), 1);
+  assert.equal(allInvalid.windowObject.messages.filter(
+    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'invalid_response',
+  ).length, 2);
+  allInvalid.bank.destroy();
+
+  const mixed = stateFor(async (url) => {
+    if (url === MEDIA_URL) return invalidResponse();
+    throw new TypeError('pair failed');
+  });
+  await assert.rejects(mixed.bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  }), (error) => error.name === 'BankNetworkError');
+  assert.equal(mixed.state.chunkAttempts.get(0), 1);
+  mixed.bank.destroy();
+
+  const abort = stateFor((_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  }));
+  const abortPromise = abort.bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await tick();
+  abort.bank.inflight.get(`${MEDIA_KEY}#0`).controller.abort();
+  await assert.rejects(abortPromise, (error) => error.name === 'AbortError');
+  assert.equal(abort.state.chunkAttempts.has(0), false);
+  abort.bank.destroy();
+});
+
+test('a stalled leg drops out while the paired leg wins the chunk', async () => {
+  const config = configFor({ raceLegs: 2, stallMs: 20 });
+  const timers = manualTimers();
+  const pending = new Map();
+  const { bank, windowObject } = createBank({
+    config,
+    timers,
+    nativeFetch: (url, init) => {
+      if (url === MEDIA_URL) {
+        const body = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+          },
+        });
+        return Promise.resolve(new Response(body, {
+          status: 206,
+          headers: { 'Content-Range': 'bytes 0-15/64' },
+        }));
+      }
+      return new Promise((resolve, reject) => {
+        pending.set(url, { resolve, reject });
+        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      });
+    },
+  });
+  bank.observePlayurlData(playurlBody());
+  const taskPromise = bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await tick();
+  const stallTimerId = Math.max(...timers.pending.keys());
+  timers.fireId(stallTimerId);
+  pending.get(PAIR_URL).resolve(responseFor(0, 15, 64, bytesFor(20, 35)));
+  await taskPromise;
+  await tick();
+  assert.equal(windowObject.messages.some(
+    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'stalled',
+  ), true);
+  assert.equal(windowObject.messages.some(
+    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'fetched',
+  ), true);
+  assert.deepEqual([...new Uint8Array(bank.chunks.get(`${MEDIA_KEY}#0`).bytes)], [...bytesFor(20, 35)]);
+  bank.destroy();
+});
+
+test('tail chunks are validated and stored when a raced response ends at totalSize minus one', async () => {
+  const config = configFor({ raceLegs: 2 });
+  const { bank } = createBank({
+    config,
+    nativeFetch: async () => responseFor(0, 9, 10, bytesFor(0, 9)),
+  });
+  bank.observePlayurlData(playurlBody());
+  await bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  assert.equal(bank.chunks.get(`${MEDIA_KEY}#0`).bytes.byteLength, 10);
+  assert.equal(bank.chunks.get(`${MEDIA_KEY}#0`).totalSize, 10);
+  bank.destroy();
+});
+
+test('empty, stale, mismatched, and race-disabled address books degrade to one leg', async () => {
+  const runSingle = async ({ config, now, observe, advance }) => {
+    const calls = [];
+    const { bank } = createBank({
+      config,
+      now,
+      nativeFetch: async (url, init) => {
+        calls.push({ url, signal: init.signal });
+        return responseFor(0, 15, 100, bytesFor(0, 15));
+      },
+    });
+    if (observe !== undefined) bank.observePlayurlData(observe);
+    advance?.();
+    await bank.getTask({
+      start: 0,
+      end: 15,
+      chunkIndex: 0,
+      cacheKey: `${MEDIA_KEY}#0`,
+    }, {
+      kind: 'prefetch',
+      url: MEDIA_URL,
+      credentials: 'same-origin',
+      videoKey: '/video/BVbank',
+    });
+    assert.equal(calls.length, 1);
+    bank.destroy();
+  };
+  await runSingle({ config: configFor({ raceLegs: 2 }), observe: playurlBody(MEDIA_URL, []) });
+  let now = 1000;
+  await runSingle({
+    config: configFor({ raceLegs: 2, pairFreshnessMs: 10 }),
+    now: () => now,
+    observe: playurlBody(),
+    advance: () => { now += 11; },
+  });
+  await runSingle({
+    config: configFor({ raceLegs: 2 }),
+    observe: playurlBody(MEDIA_URL, ['https://upos-hz-mirrorakam.akamaized.net/video/other.m4s']),
+  });
+  await runSingle({ config: configFor({ raceLegs: 1 }), observe: playurlBody() });
+});
+
+test('video identity changes release the address book and pass fetch observes the original playurl response', async () => {
+  const { bank, windowObject } = createBank({ playinfo: playurlBody() });
+  assert.equal(bank.addressBook.has(MEDIA_KEY), true);
+  const extraUrls = [
+    PAIR_URL,
+    'https://mirror-three.example/video/track.m4s',
+    'https://mirror-four.example/video/track.m4s',
+    'https://mirror-five.example/video/track.m4s',
+  ];
+  bank.observePlayurlData(playurlBody(MEDIA_URL, extraUrls));
+  assert.deepEqual(bank.addressBook.get(MEDIA_KEY).urls, [MEDIA_URL, ...extraUrls.slice(0, 3)]);
+  bank.observePlayurlData(playurlBody(MEDIA_URL, []));
+  assert.deepEqual(bank.addressBook.get(MEDIA_KEY).urls, [MEDIA_URL]);
+  windowObject.location = new URL('https://www.bilibili.com/video/BVother');
+  assert.equal(bank.syncRouteLifecycle(), true);
+  assert.equal(bank.addressBook.size, 0);
+
+  const response = new Response(JSON.stringify(playurlBody()), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const returned = await fetchThrough(bank, PLAYURL_URL, {}, async () => response);
+  assert.equal(returned, response);
+  assert.equal(response.bodyUsed, false);
+  await tick();
+  assert.equal(bank.addressBook.has(MEDIA_KEY), true);
+  bank.destroy();
+});
+
 class NativeXHR {
   constructor() {
     this.readyState = 0;
@@ -1111,6 +1451,26 @@ class NativeXHR {
 
   overrideMimeType() {}
 }
+
+test('XHR pass observation reads responseText without changing native XHR state', async () => {
+  const { bank, windowObject } = createBank();
+  windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({
+    windowObject,
+    nativeConstructor: NativeXHR,
+    bank,
+  });
+  const xhr = new windowObject.XMLHttpRequest();
+  xhr.open('GET', PLAYURL_URL);
+  xhr.send();
+  assert.equal(xhr._intercepted, false);
+  xhr._native.responseText = JSON.stringify(playurlBody());
+  xhr._native.emit('load');
+  await tick();
+  assert.equal(bank.addressBook.has(MEDIA_KEY), true);
+  assert.equal(xhr._intercepted, false);
+  assert.equal(xhr.readyState, xhr._native.readyState);
+  bank.destroy();
+});
 
 test('XHR non-intercepted media requests record their classification reason', () => {
   for (const [range, reason] of [[undefined, 'range_missing'], ['bytes=4-', 'range_not_closed']]) {

@@ -20,7 +20,9 @@
     maxBankBytes: 512 * 1024 ** 2,
     stallMs: 1e4,
     lookAheadChunks: 48,
-    maxChunkAttempts: 3
+    maxChunkAttempts: 3,
+    raceLegs: 2,
+    pairFreshnessMs: 36e5
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -160,6 +162,8 @@
       "end",
       "bytes",
       "durationMs",
+      "slot",
+      "ttfbMs",
       "priority",
       "result",
       "reason"
@@ -436,7 +440,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-c50be558587fdd888cf7364c" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-b50bac4f658e6f39392b13b7" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }

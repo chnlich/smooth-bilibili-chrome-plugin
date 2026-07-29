@@ -142,6 +142,8 @@ export const DATA_ALLOWLIST = Object.freeze({
     'end',
     'bytes',
     'durationMs',
+    'slot',
+    'ttfbMs',
     'priority',
     'result',
     'reason',

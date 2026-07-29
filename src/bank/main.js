@@ -44,6 +44,26 @@ function mirrorForUrl(url) {
   return new URL(url).hostname;
 }
 
+function videoIdentityFor(locationObject) {
+  if (locationObject === undefined) return undefined;
+  return `${locationObject.pathname}${locationObject.search || ''}`;
+}
+
+function playurlRepresentationUrls(value) {
+  if (value === null || typeof value !== 'object' || typeof value.baseUrl !== 'string') return undefined;
+  const backupUrls = Array.isArray(value.backupUrl)
+    ? value.backupUrl.filter((url) => typeof url === 'string')
+    : [];
+  return [value.baseUrl, ...backupUrls].slice(0, 4);
+}
+
+function visitPlayurlRepresentations(value, callback) {
+  if (value === null || typeof value !== 'object') return;
+  const urls = playurlRepresentationUrls(value);
+  if (urls !== undefined) callback(urls);
+  for (const child of Object.values(value)) visitPlayurlRepresentations(child, callback);
+}
+
 function responseTypeConstructor(windowObject, name) {
   return windowObject[name] || globalThis[name];
 }
@@ -99,9 +119,12 @@ export class SegmentBank {
     this.sessionGeneration = 0;
     this.resourceState = new Map();
     this.recentResourceKeys = [];
+    this.addressBook = new Map();
+    this.videoIdentity = videoIdentityFor(this.windowObject.location);
     this.chunks = chunks;
     this.lastRouteWasVideo = this.windowObject.location === undefined
       || isVideoLocation(this.windowObject.location);
+    this.observePlayurlData(this.windowObject.__playinfo__);
     this.prefetchTimer = this.windowObject.setInterval?.(() => {
       void this.prefetch().catch((error) => {
         console.error('[BilibiliBuffer] 媒体分片预取失败', error);
@@ -177,6 +200,7 @@ export class SegmentBank {
     clearMemory(this.chunks);
     this.resourceState.clear();
     this.recentResourceKeys = [];
+    this.addressBook.clear();
   }
 
   syncRouteLifecycle() {
@@ -185,8 +209,12 @@ export class SegmentBank {
     if (!currentIsVideo) {
       if (this.lastRouteWasVideo) this.releaseSession();
       this.lastRouteWasVideo = false;
+      this.videoIdentity = undefined;
       return false;
     }
+    const currentVideoIdentity = videoIdentityFor(this.windowObject.location);
+    if (this.lastRouteWasVideo && this.videoIdentity !== currentVideoIdentity) this.releaseSession();
+    this.videoIdentity = currentVideoIdentity;
     this.lastRouteWasVideo = true;
     return true;
   }
@@ -217,6 +245,89 @@ export class SegmentBank {
     });
   }
 
+  isPlayurlUrl(url) {
+    return new URL(url).pathname.endsWith('/playurl');
+  }
+
+  async observePlayurlResponse(response) {
+    const clone = response.clone();
+    const data = await clone.json();
+    this.observePlayurlData(data);
+  }
+
+  observePlayurlText(responseText) {
+    try {
+      this.observePlayurlData(JSON.parse(responseText));
+    } catch (error) {
+      console.error('[BilibiliBuffer] playurl 地址簿解析失败');
+    }
+  }
+
+  observePlayurlData(data) {
+    if (data === undefined || data === null) return;
+    if (typeof data === 'string') {
+      try {
+        data = JSON.parse(data);
+      } catch (error) {
+        console.error('[BilibiliBuffer] __playinfo__ 地址簿解析失败');
+        return;
+      }
+    }
+    const observedAt = this.now();
+    visitPlayurlRepresentations(data, (urls) => {
+      try {
+        const parsedUrls = urls.map((url) => new URL(url));
+        const pathname = parsedUrls[0].pathname;
+        this.addressBook.set(pathname, { urls, observedAt });
+      } catch (error) {
+        console.error('[BilibiliBuffer] playurl 地址簿 URL 无效');
+      }
+    });
+  }
+
+  pairUrlFor(url) {
+    const playerUrl = new URL(url);
+    const entry = this.addressBook.get(playerUrl.pathname);
+    if (entry === undefined || this.now() - entry.observedAt > this.config.pairFreshnessMs) return undefined;
+    for (const candidateUrl of entry.urls) {
+      const candidate = new URL(candidateUrl);
+      if (candidate.hostname === playerUrl.hostname) continue;
+      if (candidate.pathname !== playerUrl.pathname) return undefined;
+      return candidateUrl;
+    }
+    return undefined;
+  }
+
+  createTaskLeg(task, slot, url) {
+    return {
+      slot,
+      url,
+      mirror: mirrorForUrl(url),
+      reader: undefined,
+      stallTimer: undefined,
+      startedAt: undefined,
+      ttfbAt: undefined,
+      byteCount: 0,
+      abortReported: false,
+      outcome: undefined,
+      controller: new AbortController(),
+      settled: false,
+      abortReason: undefined,
+    };
+  }
+
+  buildTaskLegs(task) {
+    const urls = [task.url];
+    if (this.config.raceLegs > 1) {
+      const pairUrl = this.pairUrlFor(task.url);
+      if (pairUrl !== undefined) urls.push(pairUrl);
+    }
+    task.legs = urls.map((url, slot) => this.createTaskLeg(task, slot, url));
+    if (task.controller.signal.aborted) {
+      for (const leg of task.legs) leg.controller.abort();
+    }
+  }
+
   async handleFetch(thisArg, args, originalFetch) {
     if (!this.syncRouteLifecycle()) {
       return originalFetch.apply(thisArg, args);
@@ -242,7 +353,13 @@ export class SegmentBank {
           reason: classification.reason,
         });
       }
-      return originalFetch.apply(thisArg, args);
+      const response = await originalFetch.apply(thisArg, args);
+      if (this.isPlayurlUrl(request.url)) {
+        void this.observePlayurlResponse(response).catch((error) => {
+          console.error('[BilibiliBuffer] playurl 地址簿读取失败');
+        });
+      }
+      return response;
     }
     try {
       const served = await this.serveRequest({
@@ -368,7 +485,7 @@ export class SegmentBank {
     try {
       if (gaveUpPlans.length > 0) {
         for (const plan of gaveUpPlans) {
-          this.emitChunkDiagnostic(
+          this.emitTaskChunkDiagnostic(
             { ...plan, url, kind: 'foreground' },
             0,
             0,
@@ -460,7 +577,7 @@ export class SegmentBank {
       task.abortReason = 'superseded';
       this.clearTaskStall(task);
       task.controller.abort();
-      if (!task.started) this.emitTaskAbortDiagnostic(task, 0, 0, 'superseded');
+      if (!task.started) this.emitTaskChunkDiagnostic(task, 0, 0, 'superseded');
     }
   }
 
@@ -504,46 +621,57 @@ export class SegmentBank {
     this.emitDiagnostic('bank.disabled', { reason });
   }
 
-  clearTaskStall(task) {
-    if (task.stallTimer !== undefined) {
-      this.windowObject.clearTimeout(task.stallTimer);
-      task.stallTimer = undefined;
+  clearLegStall(leg) {
+    if (leg.stallTimer !== undefined) {
+      this.windowObject.clearTimeout(leg.stallTimer);
+      leg.stallTimer = undefined;
     }
-    task.reader = undefined;
+    leg.reader = undefined;
   }
 
-  armTaskStall(task) {
-    if (task.stallTimer !== undefined) this.windowObject.clearTimeout(task.stallTimer);
-    task.stallTimer = this.windowObject.setTimeout(() => {
-      if (task.settled || task.controller.signal.aborted) return;
-      task.abortReason = 'stalled';
-      task.controller.abort();
-      if (task.reader !== undefined) {
-        void task.reader.cancel().catch((error) => {
+  clearTaskStall(task) {
+    for (const leg of task.legs) this.clearLegStall(leg);
+  }
+
+  armLegStall(task, leg) {
+    if (leg.stallTimer !== undefined) this.windowObject.clearTimeout(leg.stallTimer);
+    leg.stallTimer = this.windowObject.setTimeout(() => {
+      if (task.settled || leg.settled || leg.controller.signal.aborted) return;
+      leg.abortReason = 'stalled';
+      leg.controller.abort();
+      if (leg.reader !== undefined) {
+        void leg.reader.cancel().catch((error) => {
           if (!isAbortError(error)) console.error('[BilibiliBuffer] 停滞媒体分片读取取消失败', error);
         });
       }
     }, this.config.stallMs);
   }
 
-  emitTaskAbortDiagnostic(task, bytes, durationMs, result) {
-    if (task.abortReported === true) return;
-    task.abortReported = true;
-    this.emitChunkDiagnostic(task, bytes, durationMs, result);
+  emitTaskAbortDiagnostic(task, leg, bytes, durationMs, result) {
+    if (leg.abortReported === true) return;
+    leg.abortReported = true;
+    this.emitChunkDiagnostic(task, leg, bytes, durationMs, result);
   }
 
-  taskAbortError(task, bytes, startedAt, error) {
+  taskAbortError(task, leg, error) {
     const result = task.abortReason === 'superseded'
       ? 'superseded'
-      : task.abortReason === 'stalled' ? 'stalled' : 'aborted';
-    this.emitTaskAbortDiagnostic(task, bytes, performanceNow(this.windowObject) - startedAt, result);
+      : leg.abortReason === 'stalled' ? 'stalled' : 'aborted';
+    this.emitTaskAbortDiagnostic(
+      task,
+      leg,
+      leg.byteCount,
+      performanceNow(this.windowObject) - leg.startedAt,
+      result,
+    );
     return error;
   }
 
   recordTaskFailure(task, error) {
     if (task.sessionGeneration !== this.sessionGeneration) return;
     if (task.abortReason !== undefined && task.abortReason !== 'stalled') return;
-    if (isAbortError(error) && task.abortReason !== 'stalled') return;
+    if (isAbortError(error) && task.abortReason !== 'stalled'
+      && !task.legs.some((leg) => leg.outcome === 'stalled')) return;
     const state = this.resourceState.get(task.bankKey);
     if (state === undefined) return;
     const attempts = state.chunkAttempts.get(task.chunkIndex) || 0;
@@ -558,14 +686,15 @@ export class SegmentBank {
 
   startTask(task) {
     task.started = true;
-    task.startedAt = performanceNow(this.windowObject);
     this.activePrefetch.add(task);
     let succeeded = false;
     void this.runTask(task)
       .then((result) => {
         succeeded = true;
-        task.settled = true;
-        task.resolve(result);
+        if (!task.settled) {
+          task.settled = true;
+          task.resolve(result);
+        }
       }, (error) => {
         this.recordTaskFailure(task, error);
         task.settled = true;
@@ -595,7 +724,7 @@ export class SegmentBank {
       const state = this.stateFor(plan.cacheKey.slice(0, plan.cacheKey.lastIndexOf('#')));
       const attempts = state.chunkAttempts.get(plan.chunkIndex) || 0;
       if (attempts >= this.config.maxChunkAttempts) {
-        this.emitChunkDiagnostic({ ...plan, url, kind }, 0, 0, 'gave_up');
+        this.emitTaskChunkDiagnostic({ ...plan, url, kind }, 0, 0, 'gave_up');
         return Promise.reject(new BankNetworkError('媒体分片连续取数失败，已达到尝试上限'));
       }
     }
@@ -610,16 +739,16 @@ export class SegmentBank {
       sessionGeneration: this.sessionGeneration,
       controller,
       started: false,
-      startedAt: undefined,
-      stallTimer: undefined,
-      reader: undefined,
-      abortReported: false,
       abortReason: undefined,
       settled: false,
+      legs: [],
       promise: undefined,
       resolve: undefined,
       reject: undefined,
     };
+    controller.signal.addEventListener('abort', () => {
+      for (const leg of task.legs) leg.controller.abort();
+    }, { once: true });
     task.promise = new Promise((resolve, reject) => {
       task.resolve = resolve;
       task.reject = reject;
@@ -635,7 +764,7 @@ export class SegmentBank {
       && this.queue.length > 0) {
       const task = this.queue.shift();
       if (task.controller.signal.aborted) {
-        if (task.abortReason === 'superseded') this.emitTaskAbortDiagnostic(task, 0, 0, 'superseded');
+        if (task.abortReason === 'superseded') this.emitTaskChunkDiagnostic(task, 0, 0, 'superseded');
         task.settled = true;
         task.reject(abortError());
         if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
@@ -645,143 +774,216 @@ export class SegmentBank {
     }
   }
 
-  async runTask(task) {
-    const startedAt = performanceNow(this.windowObject);
-    let response;
-    this.armTaskStall(task);
+  async runLeg(task, leg) {
+    leg.startedAt = performanceNow(this.windowObject);
+    this.armLegStall(task, leg);
     try {
-      response = await this.nativeFetch.call(this.windowObject, task.url, {
-        headers: { Range: `bytes=${task.start}-${task.end}` },
-        credentials: task.credentials,
-        signal: task.controller.signal,
-      });
-    } catch (error) {
-      this.clearTaskStall(task);
-      const result = isAbortError(error) ? 'aborted' : 'network_error';
-      if (isAbortError(error)) throw this.taskAbortError(task, 0, startedAt, error);
-      this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, result);
-      throw new BankNetworkError('媒体分片网络取数失败', error);
-    }
-    if (task.controller.signal.aborted) {
-      this.clearTaskStall(task);
-      throw this.taskAbortError(task, 0, startedAt, abortError());
-    }
-    if (response.status < 200 || response.status >= 300) {
-      this.clearTaskStall(task);
-      this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, 'http_error');
-      throw new BankNetworkError(`媒体分片网络响应状态无效: ${response.status}`);
-    }
-    let bytes;
-    let byteCount = 0;
-    try {
-      const reader = response.body.getReader();
-      task.reader = reader;
-      const bodyChunks = [];
-      this.armTaskStall(task);
-      while (true) {
-        const read = await reader.read();
-        if (read.done) break;
-        const chunk = read.value.slice();
-        if (chunk.byteLength > 0) {
-          bodyChunks.push(chunk);
-          byteCount += chunk.byteLength;
-          this.armTaskStall(task);
-        }
-        if (task.controller.signal.aborted) throw abortError();
+      let response;
+      try {
+        response = await this.nativeFetch.call(this.windowObject, leg.url, {
+          headers: { Range: `bytes=${task.start}-${task.end}` },
+          credentials: task.credentials,
+          signal: leg.controller.signal,
+        });
+      } catch (error) {
+        if (isAbortError(error) || leg.controller.signal.aborted) throw error;
+        leg.outcome = 'network_error';
+        throw new BankNetworkError('媒体分片网络取数失败', error);
       }
-      if (task.controller.signal.aborted) throw abortError();
-      const body = new Uint8Array(byteCount);
+      if (leg.controller.signal.aborted) throw abortError();
+      if (response.status < 200 || response.status >= 300) {
+        leg.outcome = 'http_error';
+        throw new BankNetworkError(`媒体分片网络响应状态无效: ${response.status}`);
+      }
+      const bodyChunks = [];
+      try {
+        const reader = response.body.getReader();
+        leg.reader = reader;
+        this.armLegStall(task, leg);
+        while (true) {
+          const read = await reader.read();
+          if (read.done) break;
+          const chunk = read.value.slice();
+          if (chunk.byteLength > 0) {
+            if (leg.ttfbAt === undefined) leg.ttfbAt = performanceNow(this.windowObject);
+            bodyChunks.push(chunk);
+            leg.byteCount += chunk.byteLength;
+            this.armLegStall(task, leg);
+          }
+          if (leg.controller.signal.aborted) throw abortError();
+        }
+        if (leg.controller.signal.aborted) throw abortError();
+      } catch (error) {
+        if (isAbortError(error) || leg.controller.signal.aborted) throw error;
+        leg.outcome = 'network_error';
+        throw new BankNetworkError('媒体分片响应读取失败', error);
+      }
+      if (leg.controller.signal.aborted) throw abortError();
+      const body = new Uint8Array(leg.byteCount);
       let offset = 0;
       for (const chunk of bodyChunks) {
         body.set(chunk, offset);
         offset += chunk.byteLength;
       }
-      bytes = body.buffer;
-    } catch (error) {
-      if (isAbortError(error) || task.controller.signal.aborted) {
-        throw this.taskAbortError(task, byteCount, startedAt, error);
+      const bytes = body.buffer;
+      const contentRange = parseContentRange(headerValue(response.headers, 'Content-Range'));
+      const isCompleteTailChunk = contentRange !== undefined
+        && contentRange.start === task.start
+        && contentRange.end < task.end
+        && contentRange.end === contentRange.totalSize - 1;
+      if (contentRange === undefined || contentRange.start !== task.start
+        || (contentRange.end !== task.end && !isCompleteTailChunk)) {
+        leg.outcome = 'invalid_response';
+        throw new BankFallbackError('媒体分片网络 Content-Range 不匹配');
       }
-      this.emitChunkDiagnostic(task, byteCount, performanceNow(this.windowObject) - startedAt, 'network_error');
-      throw new BankNetworkError('媒体分片响应读取失败', error);
+      const resultRange = { start: contentRange.start, end: contentRange.end };
+      if (leg.byteCount !== rangeLength(resultRange)) {
+        leg.outcome = 'invalid_response';
+        throw new BankFallbackError('媒体分片网络字节长度不匹配');
+      }
+      if (leg.controller.signal.aborted) throw abortError();
+      return {
+        ...resultRange,
+        bytes,
+        totalSize: contentRange.totalSize,
+      };
     } finally {
-      this.clearTaskStall(task);
+      this.clearLegStall(leg);
+      leg.settled = true;
     }
-    if (task.controller.signal.aborted) {
-      throw this.taskAbortError(task, byteCount, startedAt, abortError());
-    }
-    const contentRange = parseContentRange(headerValue(response.headers, 'Content-Range'));
-    const isCompleteTailChunk = contentRange !== undefined
-      && contentRange.start === task.start
-      && contentRange.end < task.end
-      && contentRange.end === contentRange.totalSize - 1;
-    if (contentRange === undefined || contentRange.start !== task.start
-      || (contentRange.end !== task.end && !isCompleteTailChunk)) {
-      this.emitChunkDiagnostic(
-        task,
-        byteCount,
-        performanceNow(this.windowObject) - startedAt,
-        'invalid_response',
-      );
-      throw new BankFallbackError('媒体分片网络 Content-Range 不匹配');
-    }
-    const resultRange = { start: contentRange.start, end: contentRange.end };
-    if (byteCount !== rangeLength(resultRange)) {
-      this.emitChunkDiagnostic(
-        task,
-        byteCount,
-        performanceNow(this.windowObject) - startedAt,
-        'invalid_response',
-      );
-      throw new BankFallbackError('媒体分片网络字节长度不匹配');
-    }
-    if (task.controller.signal.aborted) {
-      throw this.taskAbortError(task, byteCount, startedAt, abortError());
-    }
-    this.recordTotalSize(task.url, contentRange.totalSize);
-    const result = {
-      ...resultRange,
-      bytes,
-      totalSize: contentRange.totalSize,
-    };
-    if (task.sessionGeneration === this.sessionGeneration
-      && this.enabled === true && this.disabled === false) {
-      try {
-        this.storeTask(task, result);
-      } catch (error) {
-        this.emitDiagnostic('bank.store', {
-          operation: 'write',
-          chunkIndex: task.chunkIndex,
-          bytes: bytes.byteLength,
-          result: 'failed',
-          reason: 'write_error',
-        });
-        console.error('[BilibiliBuffer] 媒体分片内存写入失败', error);
-        this.disable('store_write_failed');
-      }
-      this.resetTaskAttempts(task);
-    }
-    this.emitChunkDiagnostic(
-      task,
-      byteCount,
-      performanceNow(this.windowObject) - startedAt,
-      'fetched',
-      resultRange,
-    );
-    return result;
   }
 
-  emitChunkDiagnostic(task, bytes, durationMs, result, range = task) {
-    this.emitDiagnostic('bank.fetch.chunk', {
-      source: scrubUrl(task.url),
+  classifyTaskFailure(task) {
+    if (task.controller.signal.aborted) return abortError();
+    // Preserve the single-leg stall error contract while a raced task keeps stalls leg-local.
+    if (task.legs.length === 1 && task.legs[0].outcome === 'stalled') return abortError();
+    if (task.legs.every((leg) => leg.outcome === 'invalid_response')) {
+      return new BankFallbackError('媒体分片所有网络响应均无效');
+    }
+    return new BankNetworkError('媒体分片网络取数失败');
+  }
+
+  emitTaskChunkDiagnostic(task, bytes, durationMs, result, range = task) {
+    this.emitChunkDiagnostic(task, {
+      slot: 0,
+      url: task.url,
       mirror: mirrorForUrl(task.url),
+      byteCount: bytes,
+      ttfbAt: undefined,
+      startedAt: undefined,
+      abortReported: false,
+    }, bytes, durationMs, result, range);
+  }
+
+  async runTask(task) {
+    this.buildTaskLegs(task);
+    return new Promise((resolve, reject) => {
+      let remaining = task.legs.length;
+      for (const leg of task.legs) {
+        const legPromise = this.runLeg(task, leg);
+        void legPromise.catch(() => {});
+        legPromise.then((result) => {
+          if (task.settled) {
+            leg.outcome = 'lost_race';
+            this.emitChunkDiagnostic(
+              task,
+              leg,
+              leg.byteCount,
+              performanceNow(this.windowObject) - leg.startedAt,
+              'lost_race',
+              result,
+            );
+            return;
+          }
+          task.settled = true;
+          for (const loser of task.legs) {
+            if (loser === leg) continue;
+            loser.abortReason = 'lost_race';
+            loser.controller.abort();
+          }
+          for (const loser of task.legs) {
+            if (loser === leg || loser.reader === undefined) continue;
+            void loser.reader.cancel().catch((error) => {
+              if (!isAbortError(error)) console.error('[BilibiliBuffer] 败选媒体分片读取取消失败', error);
+            });
+          }
+          leg.outcome = 'fetched';
+          if (task.sessionGeneration === this.sessionGeneration) {
+            this.recordTotalSize(leg.url, result.totalSize);
+            if (this.enabled === true && this.disabled === false) {
+              try {
+                this.storeTask(task, result);
+              } catch (error) {
+                this.emitDiagnostic('bank.store', {
+                  operation: 'write',
+                  chunkIndex: task.chunkIndex,
+                  bytes: result.bytes.byteLength,
+                  result: 'failed',
+                  reason: 'write_error',
+                });
+                console.error('[BilibiliBuffer] 媒体分片内存写入失败', error);
+                this.disable('store_write_failed');
+              }
+              this.resetTaskAttempts(task);
+            }
+          }
+          this.emitChunkDiagnostic(
+            task,
+            leg,
+            leg.byteCount,
+            performanceNow(this.windowObject) - leg.startedAt,
+            'fetched',
+            result,
+          );
+          task.resolve(result);
+          resolve(result);
+        }, (error) => {
+          if (task.settled) {
+            leg.outcome = 'lost_race';
+            this.emitChunkDiagnostic(
+              task,
+              leg,
+              leg.byteCount,
+              performanceNow(this.windowObject) - leg.startedAt,
+              'lost_race',
+            );
+            return;
+          }
+          if (leg.abortReason === 'stalled' || task.controller.signal.aborted || isAbortError(error)) {
+            leg.outcome = leg.abortReason === 'stalled' ? 'stalled' : 'aborted';
+            this.taskAbortError(task, leg, error);
+          } else {
+            const result = leg.outcome || 'network_error';
+            this.emitChunkDiagnostic(
+              task,
+              leg,
+              leg.byteCount,
+              performanceNow(this.windowObject) - leg.startedAt,
+              result,
+            );
+          }
+          remaining -= 1;
+          if (remaining === 0) reject(this.classifyTaskFailure(task));
+        });
+      }
+    });
+  }
+
+  emitChunkDiagnostic(task, leg, bytes, durationMs, result, range = task) {
+    const data = {
+      source: scrubUrl(leg.url),
+      mirror: mirrorForUrl(leg.url),
       chunkIndex: task.chunkIndex,
       start: range.start,
       end: range.end,
       bytes,
       durationMs,
+      slot: leg.slot,
       priority: task.kind,
       result,
-    });
+    };
+    if (leg.byteCount > 0) data.ttfbMs = leg.ttfbAt - leg.startedAt;
+    this.emitDiagnostic('bank.fetch.chunk', data);
   }
 
   storeTask(task, result) {

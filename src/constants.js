@@ -23,6 +23,8 @@ export const BANK_CONFIG = Object.freeze({
   stallMs: 10000,
   lookAheadChunks: 48,
   maxChunkAttempts: 3,
+  raceLegs: 2,
+  pairFreshnessMs: 3600000,
 });
 
 export const DIAGNOSTIC_MESSAGE_VERSION = 1;

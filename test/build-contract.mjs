@@ -298,6 +298,8 @@ assert.deepEqual(Object.keys(BANK_CONFIG), [
   'stallMs',
   'lookAheadChunks',
   'maxChunkAttempts',
+  'raceLegs',
+  'pairFreshnessMs',
 ]);
 assert.deepEqual(BANK_CONFIG, {
   chunkBytes: 1024 ** 2,
@@ -305,6 +307,8 @@ assert.deepEqual(BANK_CONFIG, {
   stallMs: 10000,
   lookAheadChunks: 48,
   maxChunkAttempts: 3,
+  raceLegs: 2,
+  pairFreshnessMs: 3600000,
 });
 for (const removedCode of [
   'log.persist.result',
@@ -334,6 +338,8 @@ assert.deepEqual([...DATA_ALLOWLIST.bank].sort(), [
   'result',
   'source',
   'start',
+  'slot',
+  'ttfbMs',
 ].sort());
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.doesNotMatch(bridgeContractSource, /BRIDGE_LIVE|setChasingFrameThreshold|getLiveCapabilitySnapshot|disableLiveAutoCatchup/);

@@ -603,6 +603,29 @@ test('diagnostic catalog covers all required media events and preserves browser-
   );
 });
 
+test('bank race diagnostic slot and ttfb fields survive allowlist sanitisation', () => {
+  assert.deepEqual(sanitizeEventData('bank.fetch.chunk', {
+    slot: 1,
+    ttfbMs: 12.5,
+    bytes: 16,
+    result: 'fetched',
+  }), {
+    slot: 1,
+    ttfbMs: 12.5,
+    bytes: 16,
+    result: 'fetched',
+  });
+  assert.deepEqual(sanitizeEventData('bank.fetch.chunk', {
+    slot: 0,
+    bytes: 0,
+    result: 'aborted',
+  }), {
+    slot: 0,
+    bytes: 0,
+    result: 'aborted',
+  });
+});
+
 test('media attribution fields pass through the existing privacy path', () => {
   const video = mediaVideo('https://media.example/attribution');
   video.getVideoPlaybackQuality = () => ({
