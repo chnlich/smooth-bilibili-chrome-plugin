@@ -292,11 +292,10 @@ test('control stays in the DOM boundary and diagnostic messages carry no binary 
   }), false);
 });
 
-test('memory hit returns exact bytes and canonical response fields without network', async () => {
+test('memory hit returns exact bytes and canonical response fields while refilling the window', async () => {
   const config = configFor();
   const { bank, calls } = createBank({ config });
   putChunk(bank, 0, config);
-  bank.fetchedChunks.set(`${MEDIA_KEY}#0`, { fetchedAt: 1 });
   const response = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=4-6' } });
   assert.equal(response.status, 206);
   assert.equal(response.statusText, 'Partial Content');
@@ -307,7 +306,10 @@ test('memory hit returns exact bytes and canonical response fields without netwo
   assert.equal(response.headers.get('Content-Length'), '3');
   assert.equal(response.headers.get('Accept-Ranges'), 'bytes');
   assert.equal(response.headers.get('Content-Type'), 'video/mp4');
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls.map(({ range }) => range), [
+    { start: 16, end: 31 },
+    { start: 32, end: 47 },
+  ]);
 });
 
 test('a cache miss is served by the extension fetch and never passes to the original fetch', async () => {
@@ -455,6 +457,53 @@ test('a cross-chunk foreground request anchors on its smaller chunk and keeps it
   bank.destroy();
 });
 
+test('a cache hit supersedes an in-flight chunk before its new anchor', async () => {
+  const config = configFor({ stallMs: 1000 });
+  const { bank, windowObject } = createBank({
+    config,
+    maxPrefetchConcurrency: 1,
+    nativeFetch: async (_url, init) => {
+      const range = rangeFromInit(init);
+      if (range.start !== 0) {
+        return responseFor(range.start, range.end, 64, bytesFor(range.start, range.end));
+      }
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      });
+    },
+  });
+  putChunk(bank, 2, config, 64);
+  const state = bank.stateFor(MEDIA_KEY);
+  state.latestUrl = MEDIA_URL;
+  state.lastForegroundStart = 0;
+  state.lastForegroundEnd = 0;
+  bank.touchResource(MEDIA_KEY);
+  const pending = bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+    cacheable: true,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstTask = bank.inflight.get(`${MEDIA_KEY}#0`);
+
+  await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=32-39' } });
+
+  assert.equal(bank.anchorChunkForState(state), 2);
+  assert.equal(firstTask.controller.signal.aborted, true);
+  await assert.rejects(pending, (error) => error.name === 'AbortError');
+  assert.equal(windowObject.messages.some(
+    (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'superseded',
+  ), true);
+  bank.destroy();
+});
+
 test('prefetch concurrency never exceeds two active tasks', async () => {
   const config = configFor({ stallMs: 1000 });
   const pending = new Map();
@@ -494,35 +543,11 @@ test('prefetch concurrency never exceeds two active tasks', async () => {
   assert.equal(results.slice(1).every((result) => result.status === 'rejected' && result.reason.name === 'AbortError'), true);
 });
 
-test('the fetched hard gate blocks speculative work even when the chunk table is empty', async () => {
-  const config = configFor();
-  const { bank, calls } = createBank({ config });
-  const plan = {
-    start: 0,
-    end: 15,
-    chunkIndex: 0,
-    cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
-  };
-  bank.fetchedChunks.set(plan.cacheKey, { fetchedAt: 1 });
-  const result = await bank.getTask(plan, {
-    kind: 'prefetch',
-    url: MEDIA_URL,
-    credentials: 'same-origin',
-    videoKey: '/video/BVbank',
-  });
-  assert.deepEqual(result, { skipped: true, cacheKey: plan.cacheKey });
-  assert.deepEqual(calls, []);
-  assert.equal(bank.inflight.size, 0);
-});
-
-test('eviction removes the same cacheKey from the fetched hard gate', () => {
+test('memory eviction removes the evicted chunk', () => {
   const config = configFor({ maxBankBytes: 32 });
   const { bank } = createBank({ config });
   const first = putChunk(bank, 0, config, 64);
   putChunk(bank, 1, config, 64);
-  bank.fetchedChunks.set(first.cacheKey, { fetchedAt: 1 });
-  bank.fetchedChunks.set(`${MEDIA_KEY}#1`, { fetchedAt: 2 });
   bank.stateFor(MEDIA_KEY).lastForegroundEnd = 20;
   bank.storeTask({
     cacheKey: `${MEDIA_KEY}#2`,
@@ -535,7 +560,6 @@ test('eviction removes the same cacheKey from the fetched hard gate', () => {
     bytes: bytesFor(32, 47).buffer,
   });
   assert.equal(bank.chunks.has(first.cacheKey), false);
-  assert.equal(bank.fetchedChunks.has(first.cacheKey), false);
   assert.equal(bank.chunks.size, 2);
   assert.equal(bank.windowObject.messages.some((message) => message.code === 'bank.evict'), true);
 });
@@ -601,7 +625,6 @@ test('memory storage is atomic and never exposes a half chunk after an invalid r
   assert.equal(response.status, 416);
   assert.equal(fallbackCalls, 1);
   assert.equal(bank.chunks.size, 0);
-  assert.equal(bank.fetchedChunks.size, 0);
 });
 
 test('a memory write failure disables the bank and lets subsequent requests pass', async () => {
@@ -701,6 +724,7 @@ test('a stalled stream is cancelled with the real bytes already received', async
       });
     },
   });
+  const state = bank.stateFor(MEDIA_KEY);
   const pending = bank.getTask({
     start: 0,
     end: 15,
@@ -724,41 +748,88 @@ test('a stalled stream is cancelled with the real bytes already received', async
     (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'stalled',
   );
   assert.equal(diagnostic.data.bytes, 3);
+  assert.equal(state.chunkAttempts.get(0), 1);
 });
 
-test('leaving the video route releases chunks and the fetched hard gate', async () => {
+test('aborting a waiting player request removes it from outstanding without cancelling its chunk task', async () => {
+  const config = configFor({ stallMs: 1000 });
+  let taskSignal;
+  const { bank } = createBank({
+    config,
+    maxPrefetchConcurrency: 1,
+    nativeFetch: (_url, init) => new Promise((_resolve, reject) => {
+      taskSignal = init.signal;
+      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    }),
+  });
+  const controller = new AbortController();
+  const pending = fetchThrough(bank, MEDIA_URL, {
+    headers: { Range: 'bytes=0-7' },
+    signal: controller.signal,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const state = bank.stateFor(MEDIA_KEY);
+  assert.equal(state.outstanding.size, 1);
+
+  controller.abort();
+
+  assert.equal(state.outstanding.size, 0);
+  assert.equal(taskSignal.aborted, false);
+  bank.destroy();
+  await assert.rejects(pending, (error) => error.name === 'AbortError');
+});
+
+test('leaving the video route releases chunks', async () => {
   const config = configFor();
   const { bank, windowObject } = createBank({ config });
   putChunk(bank, 0, config);
-  bank.fetchedChunks.set(`${MEDIA_KEY}#0`, { fetchedAt: 1 });
   windowObject.location = new URL('https://www.bilibili.com/');
   await bank.prefetch();
   assert.equal(bank.chunks.size, 0);
-  assert.equal(bank.fetchedChunks.size, 0);
 });
 
-test('prefetch follows the anchored window and advances only after chunks enter the bank', async () => {
+test('one prefetch call refills the anchored window after each successful store', async () => {
   const config = configFor({ lookAheadChunks: 3 });
-  const { bank, calls } = createBank({ config });
+  const pending = new Map();
+  const ranges = [];
+  const { bank } = createBank({
+    config,
+    nativeFetch: (_url, init) => {
+      const range = rangeFromInit(init);
+      ranges.push(range);
+      return new Promise((resolve, reject) => {
+        pending.set(`${range.start}-${range.end}`, { resolve, reject });
+        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      });
+    },
+  });
   const state = bank.stateFor(MEDIA_KEY);
   state.latestUrl = MEDIA_URL;
   state.totalSize = 48;
-  state.lastForegroundStart = 3;
-  state.lastForegroundEnd = 3;
+  state.lastForegroundStart = 0;
+  state.lastForegroundEnd = 0;
   bank.touchResource(MEDIA_KEY);
 
   await bank.prefetch();
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  await bank.prefetch();
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(ranges, [
+    { start: 0, end: 15 },
+    { start: 16, end: 31 },
+  ]);
+  pending.get('0-15').resolve(responseFor(0, 15, 48, bytesFor(0, 15)));
+  pending.get('16-31').resolve(responseFor(16, 31, 48, bytesFor(16, 31)));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(pending.has('32-47'), true);
+  pending.get('32-47').resolve(responseFor(32, 47, 48, bytesFor(32, 47)));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(calls.map(({ range }) => range), [
+  assert.deepEqual(ranges, [
     { start: 0, end: 15 },
     { start: 16, end: 31 },
     { start: 32, end: 47 },
   ]);
   assert.equal(bank.chunks.size, 3);
-  assert.equal(bank.fetchedChunks.size, 3);
 });
 
 test('a failed chunk is selected again by the next window without retry code', async () => {
@@ -880,7 +951,46 @@ test('the player moving past a chunk cancels its in-flight fetch as superseded',
   assert.equal(windowObject.messages.some(
     (message) => message.code === 'bank.fetch.chunk' && message.data.result === 'superseded',
   ), true);
+  assert.equal(state.chunkAttempts.has(0), false);
   bank.destroy();
+});
+
+test('touching a third resource does not cancel a still-wanted chunk', async () => {
+  const config = configFor({ stallMs: 1000 });
+  let taskSignal;
+  const { bank } = createBank({
+    config,
+    maxPrefetchConcurrency: 1,
+    nativeFetch: (_url, init) => new Promise((_resolve, reject) => {
+      taskSignal = init.signal;
+      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    }),
+  });
+  const state = bank.stateFor(MEDIA_KEY);
+  state.latestUrl = MEDIA_URL;
+  state.lastForegroundStart = 0;
+  bank.touchResource(MEDIA_KEY);
+  const pending = bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+    cacheable: true,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  bank.touchResource('/video/other-a.m4s');
+  bank.touchResource('/video/other-b.m4s');
+
+  assert.equal(bank.anchorChunkForState(state), 0);
+  assert.equal(taskSignal.aborted, false);
+  bank.destroy();
+  await assert.rejects(pending, (error) => error.name === 'AbortError');
 });
 
 test('the window stays within the configured anchor plus lookAheadChunks', () => {

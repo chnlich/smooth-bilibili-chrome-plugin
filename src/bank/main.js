@@ -96,7 +96,6 @@ export class SegmentBank {
     this.resourceState = new Map();
     this.recentResourceKeys = [];
     this.chunks = chunks;
-    this.fetchedChunks = new Map();
     this.lastRouteWasVideo = this.windowObject.location === undefined
       || isVideoLocation(this.windowObject.location);
     this.prefetchTimer = this.windowObject.setInterval?.(() => {
@@ -172,7 +171,6 @@ export class SegmentBank {
     }
     this.queue = [];
     clearMemory(this.chunks);
-    this.fetchedChunks.clear();
     this.resourceState.clear();
     this.recentResourceKeys = [];
   }
@@ -194,8 +192,6 @@ export class SegmentBank {
       ...this.recentResourceKeys.filter((key) => key !== resourceKey),
       resourceKey,
     ].slice(-2);
-    const retained = new Set(nextKeys);
-    this.abortPrefetchTasks((task) => !retained.has(task.bankKey));
     this.recentResourceKeys = nextKeys;
   }
 
@@ -324,6 +320,7 @@ export class SegmentBank {
         throw new BankFallbackError('媒体分片存储命中总长度无效');
       }
       state.totalSize = stored.totalSize;
+      this.scheduleResourceWindow(state);
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(url),
         start,
@@ -352,6 +349,8 @@ export class SegmentBank {
     });
     const foreground = { start, end, state, completed: false };
     state.outstanding.add(foreground);
+    const completeOnAbort = () => this.completeForegroundRequest(foreground);
+    signal?.addEventListener('abort', completeOnAbort, { once: true });
     try {
       if (gaveUpPlans.length > 0) {
         for (const plan of gaveUpPlans) {
@@ -398,9 +397,13 @@ export class SegmentBank {
         response: this.createResponse(supplied.bytes, start, end, supplied.totalSize, url),
         bytes: supplied.bytes,
         totalSize: supplied.totalSize,
-        release: () => this.completeForegroundRequest(foreground),
+        release: () => {
+          signal?.removeEventListener('abort', completeOnAbort);
+          this.completeForegroundRequest(foreground);
+        },
       };
     } catch (error) {
+      signal?.removeEventListener('abort', completeOnAbort);
       this.completeForegroundRequest(foreground, false);
       throw error;
     }
@@ -522,7 +525,8 @@ export class SegmentBank {
 
   recordTaskFailure(task, error) {
     if (task.cacheable === false || task.sessionGeneration !== this.sessionGeneration) return;
-    if (task.abortReason !== undefined || isAbortError(error)) return;
+    if (task.abortReason !== undefined && task.abortReason !== 'stalled') return;
+    if (isAbortError(error) && task.abortReason !== 'stalled') return;
     const state = this.resourceState.get(task.bankKey);
     if (state === undefined) return;
     const attempts = state.chunkAttempts.get(task.chunkIndex) || 0;
@@ -539,8 +543,10 @@ export class SegmentBank {
     task.started = true;
     task.startedAt = performanceNow(this.windowObject);
     this.activePrefetch.add(task);
+    let succeeded = false;
     void this.runTask(task)
       .then((result) => {
+        succeeded = true;
         task.settled = true;
         task.resolve(result);
       }, (error) => {
@@ -552,6 +558,12 @@ export class SegmentBank {
         this.clearTaskStall(task);
         this.activePrefetch.delete(task);
         if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
+        if (succeeded
+          && task.sessionGeneration === this.sessionGeneration
+          && this.recentResourceKeys.includes(task.bankKey)) {
+          const state = this.resourceState.get(task.bankKey);
+          if (state !== undefined) this.scheduleResourceWindow(state);
+        }
         this.pump();
       });
   }
@@ -560,9 +572,6 @@ export class SegmentBank {
     const existing = this.inflight.get(plan.cacheKey);
     if (existing !== undefined) return existing.promise;
     if (plan.cacheable !== false && this.chunks.has(plan.cacheKey)) {
-      return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
-    }
-    if (kind === 'prefetch' && plan.cacheable !== false && this.fetchedChunks.has(plan.cacheKey)) {
       return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
     }
     if (kind === 'foreground' && plan.cacheable !== false) {
@@ -720,7 +729,6 @@ export class SegmentBank {
     };
     if (task.cacheable !== false && task.sessionGeneration === this.sessionGeneration
       && this.enabled === true && this.disabled === false) {
-      this.fetchedChunks.set(task.cacheKey, { fetchedAt: this.now() });
       try {
         this.storeTask(task, result);
       } catch (error) {
@@ -786,7 +794,6 @@ export class SegmentBank {
         reason: 'memory',
       });
       for (const entry of eviction.entries) {
-        this.fetchedChunks.delete(entry.cacheKey);
         this.emitDiagnostic('bank.store', {
           operation: 'evict',
           chunkIndex: entry.chunkIndex,
