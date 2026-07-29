@@ -15,10 +15,11 @@
     stableBufferSeconds: 120
   });
   var BANK_CONFIG = Object.freeze({
-    chunkBytes: 4 * 1024 ** 2,
-    prefetchAheadSeconds: 900,
+    chunkBytes: 1024 ** 2,
     maxBankBytes: 512 * 1024 ** 2,
-    prefetchDeadlineMs: 2e4
+    stallMs: 1e4,
+    lookAheadChunks: 48,
+    maxChunkAttempts: 3
   });
 
   // src/diagnostics/log-session.js

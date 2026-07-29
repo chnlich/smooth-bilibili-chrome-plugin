@@ -1,6 +1,6 @@
-import { BankFallbackError } from './errors.js';
+import { BankFallbackError, BankNetworkError } from './errors.js';
 import { scrubUrl } from '../diagnostics/privacy.js';
-import { classifyRequest, parseContentRange } from './logic.js';
+import { classifyRequest } from './logic.js';
 
 const EVENT_NAMES = Object.freeze([
   'readystatechange',
@@ -47,6 +47,10 @@ function bankEnabled(bank) {
   return typeof bank.isEnabled === 'function' ? bank.isEnabled() : bank.enabled === true;
 }
 
+function isAbortError(error) {
+  return error?.name === 'AbortError';
+}
+
 export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
   return class SegmentBankXMLHttpRequest {
     static UNSENT = 0;
@@ -77,7 +81,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._timedOut = false;
       this._suppressNativeLoadstart = false;
       this._generation = 0;
-      this._nativeContentRangeTap = undefined;
       for (const eventName of EVENT_NAMES) {
         this._native.addEventListener(eventName, (event) => {
           if (!this._intercepted) {
@@ -127,7 +130,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
     set withCredentials(value) { this._native.withCredentials = value; }
 
     open(...args) {
-      this.clearNativeContentRangeTap();
       this._abortController?.abort();
       this.clearTimer();
       this._generation += 1;
@@ -204,29 +206,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       if (!asyncFlag || !classification.intercepted) {
         return this._native.send(body);
       }
-      let served;
-      try {
-        served = bank.serveRequest({
-          url,
-          method,
-          headers: this._headers,
-          credentials: this.withCredentials ? 'include' : 'same-origin',
-        });
-      } catch (error) {
-        if (!(error instanceof BankFallbackError)) throw error;
-        bank.emitDiagnostic('bank.serve', {
-          source: scrubUrl(url),
-          ...this._range,
-          result: 'pass',
-          reason: 'internal_fallback',
-        });
-        this.tapNativeContentRange(url);
-        return this._native.send(body);
-      }
-      if (!served.intercepted) {
-        this.tapNativeContentRange(url);
-        return this._native.send(body);
-      }
       this._intercepted = true;
       this._state = 1;
       this._abortController = new AbortController();
@@ -249,65 +228,73 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
           this.dispatchEvent(eventFor(windowObject, 'loadend'));
         }, this.timeout);
       }
-      void this.serve(served, url, body, generation);
+      void Promise.resolve()
+        .then(() => bank.serveRequest({
+          url,
+          method,
+          headers: this._headers,
+          credentials: this.withCredentials ? 'include' : 'same-origin',
+          signal: this._abortController.signal,
+        }))
+        .then((served) => {
+          if (this._done || generation !== this._generation) {
+            served.release?.();
+            return;
+          }
+          if (!served.intercepted) throw new Error('媒体分片请求未被下载层拦截');
+          void this.serve(served, url, body, generation);
+        })
+        .catch((error) => this.handleServeError(error, url, body, generation));
     }
 
-    tapNativeContentRange(url) {
-      this.clearNativeContentRangeTap();
-      const onReadyStateChange = () => {
-        if (this._native.readyState < 2) return;
-        this.clearNativeContentRangeTap();
-        const contentRange = parseContentRange(this._native.getResponseHeader('Content-Range'));
-        if (contentRange !== undefined) bank.recordTotalSize(url, contentRange.totalSize);
-      };
-      const onLoadEnd = () => this.clearNativeContentRangeTap();
-      this._nativeContentRangeTap = { onReadyStateChange, onLoadEnd };
-      this._native.addEventListener('readystatechange', onReadyStateChange);
-      this._native.addEventListener('loadend', onLoadEnd);
-    }
-
-    clearNativeContentRangeTap() {
-      if (this._nativeContentRangeTap === undefined) return;
-      const { onReadyStateChange, onLoadEnd } = this._nativeContentRangeTap;
-      this._native.removeEventListener('readystatechange', onReadyStateChange);
-      this._native.removeEventListener('loadend', onLoadEnd);
-      this._nativeContentRangeTap = undefined;
-    }
-
-    async serve(result, url, body, generation) {
-      try {
-        await Promise.resolve();
-        if (this._done || generation !== this._generation) return;
-        await this.finishResponse(result.response, result.bytes, url, generation);
-      } catch (error) {
-        if (this._done || generation !== this._generation) return;
-        if (error instanceof BankFallbackError) {
-          bank.emitDiagnostic('bank.serve', {
-            source: scrubUrl(url),
-            ...this._range,
-            result: 'pass',
-            reason: 'internal_fallback',
-          });
-          this.clearTimer();
-          this._suppressNativeLoadstart = true;
-          this._intercepted = false;
-          this._native.send(body);
-          return;
-        }
-        if (error?.name === 'AbortError') {
-          if (!this._aborted && !this._timedOut) this.finishError(error, generation);
-          return;
-        }
+    handleServeError(error, url, body, generation) {
+      if (this._done || generation !== this._generation) return;
+      if (error instanceof BankFallbackError) {
         bank.emitDiagnostic('bank.serve', {
           source: scrubUrl(url),
           ...this._range,
           result: 'pass',
-          reason: 'internal_error',
+          reason: 'internal_fallback',
         });
         this.clearTimer();
         this._suppressNativeLoadstart = true;
         this._intercepted = false;
         this._native.send(body);
+        return;
+      }
+      if (error instanceof BankNetworkError) {
+        if (!this._aborted && !this._timedOut) this.finishError(error, generation);
+        return;
+      }
+      if (isAbortError(error)) {
+        if (!this._aborted && !this._timedOut) this.finishError(error, generation);
+        return;
+      }
+      bank.emitDiagnostic('bank.serve', {
+        source: scrubUrl(url),
+        ...this._range,
+        result: 'pass',
+        reason: 'internal_error',
+      });
+      this.clearTimer();
+      this._suppressNativeLoadstart = true;
+      this._intercepted = false;
+      this._native.send(body);
+    }
+
+    async serve(result, url, body, generation) {
+      try {
+        await Promise.resolve();
+        if (this._done || generation !== this._generation) {
+          result.release?.();
+          return;
+        }
+        await this.finishResponse(result.response, result.bytes, url, generation);
+        result.release?.();
+      } catch (error) {
+        result.release?.();
+        if (this._done || generation !== this._generation) return;
+        this.handleServeError(error, url, body, generation);
       }
     }
 

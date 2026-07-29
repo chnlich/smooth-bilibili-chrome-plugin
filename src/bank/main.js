@@ -11,12 +11,10 @@ import {
   cacheKey,
   classifyRequest,
   chunkIndex,
-  estimateBitrate,
   headerValue,
   parseContentRange,
   partialResponseHeaders,
   planFetchRanges,
-  prefetchRange,
   rangeLength,
   isVideoLocation,
 } from './logic.js';
@@ -141,9 +139,10 @@ export class SegmentBank {
         latestUrl: undefined,
         credentials: 'same-origin',
         totalSize: undefined,
+        lastForegroundStart: undefined,
         lastForegroundEnd: undefined,
-        prefetchEnd: undefined,
-        samples: [],
+        outstanding: new Set(),
+        chunkAttempts: new Map(),
       };
       this.resourceState.set(bankKeyValue, state);
     }
@@ -176,7 +175,6 @@ export class SegmentBank {
     this.fetchedChunks.clear();
     this.resourceState.clear();
     this.recentResourceKeys = [];
-    this.playbackSamples = [];
   }
 
   syncRouteLifecycle() {
@@ -203,27 +201,11 @@ export class SegmentBank {
 
   abortPrefetchTasks(predicate = () => true) {
     for (const task of this.inflight.values()) {
-      if (task.kind === 'prefetch' && predicate(task)) {
-        this.clearTaskDeadline(task);
+      if (predicate(task)) {
+        this.clearTaskStall(task);
         task.controller.abort();
       }
     }
-  }
-
-  updatePlaybackSample() {
-    const videos = [...this.windowObject.document?.querySelectorAll?.('video') || []];
-    const video = videos.sort((left, right) =>
-      (right.clientWidth || 0) * (right.clientHeight || 0)
-      - (left.clientWidth || 0) * (left.clientHeight || 0)).at(0);
-    if (video === undefined) return 0;
-    const bytes = Number(video.webkitVideoDecodedByteCount);
-    const time = Number(video.currentTime);
-    if (!Number.isFinite(bytes) || !Number.isFinite(time)) return 0;
-    const stateSamples = this.playbackSamples || [];
-    stateSamples.push({ time, bytes });
-    while (stateSamples.length > 4) stateSamples.shift();
-    this.playbackSamples = stateSamples;
-    return estimateBitrate(stateSamples);
   }
 
   requestClassification(url, headers) {
@@ -262,7 +244,7 @@ export class SegmentBank {
       return originalFetch.apply(thisArg, args);
     }
     try {
-      const served = this.serveRequest({
+      const served = await this.serveRequest({
         url: request.url,
         method: request.method,
         headers: request.headers,
@@ -270,14 +252,16 @@ export class SegmentBank {
         signal: request.signal,
       });
       if (!served.intercepted) {
-        return originalFetch.apply(thisArg, args).then((response) => {
-          this.observeContentRange(request.url, response.headers.get('Content-Range'));
-          return response;
-        });
+        return originalFetch.apply(thisArg, args);
       }
-      return served.response;
+      try {
+        return served.response;
+      } finally {
+        served.release?.();
+      }
     } catch (error) {
       if (isAbortError(error)) throw error;
+      if (error instanceof BankNetworkError) throw error;
       if (error instanceof BankFallbackError) {
         this.emitDiagnostic('bank.serve', {
           source: scrubUrl(request.url),
@@ -286,31 +270,19 @@ export class SegmentBank {
           result: 'pass',
           reason: 'internal_fallback',
         });
-        return originalFetch.apply(thisArg, args).then((response) => {
-          this.observeContentRange(request.url, response.headers.get('Content-Range'));
-          return response;
-        });
+        return originalFetch.apply(thisArg, args);
       }
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(request.url),
         result: 'pass',
         reason: 'internal_error',
       });
-      return originalFetch.apply(thisArg, args).then((response) => {
-        this.observeContentRange(request.url, response.headers.get('Content-Range'));
-        return response;
-      });
+      return originalFetch.apply(thisArg, args);
     }
   }
 
   readStoredRange(bankKeyValue, start, end) {
     return readMemoryRange(this.chunks, bankKeyValue, start, end, this.config.chunkBytes);
-  }
-
-  observeContentRange(url, value) {
-    const contentRange = parseContentRange(value);
-    if (contentRange === undefined) return;
-    this.recordTotalSize(url, contentRange.totalSize);
   }
 
   recordTotalSize(url, totalSize) {
@@ -329,7 +301,7 @@ export class SegmentBank {
     return response;
   }
 
-  serveRequest({ url, method, headers, credentials, signal }) {
+  async serveRequest({ url, method, headers, credentials, signal }) {
     const classification = this.requestClassification(url, headers);
     if (!classification.intercepted) return { intercepted: false };
     if (signal?.aborted) throw abortError();
@@ -340,7 +312,7 @@ export class SegmentBank {
     state.videoKey = this.windowObject.location.pathname;
     state.latestUrl = url;
     state.credentials = credentials || 'same-origin';
-    if (state.lastForegroundEnd !== end) state.prefetchEnd = undefined;
+    state.lastForegroundStart = start;
     state.lastForegroundEnd = end;
     const stored = this.readStoredRange(resourceKey, start, end);
     if (signal?.aborted) throw abortError();
@@ -366,14 +338,135 @@ export class SegmentBank {
         totalSize: stored.totalSize,
       };
     }
-    this.emitDiagnostic('bank.serve', {
-      source: scrubUrl(url),
-      start,
-      end,
-      result: 'pass',
-      reason: 'miss',
+
+    const requestPlans = planFetchRanges(start, end, {
+      chunkBytes: this.config.chunkBytes,
+      totalSize: state.totalSize,
+      bankKeyValue: resourceKey,
+      aligned: true,
     });
-    return { intercepted: false, reason: 'miss' };
+    const missingPlans = requestPlans.filter((plan) => !this.chunks.has(plan.cacheKey));
+    const gaveUpPlans = missingPlans.filter((plan) => {
+      const attempts = state.chunkAttempts.get(plan.chunkIndex) || 0;
+      return attempts >= this.config.maxChunkAttempts;
+    });
+    const foreground = { start, end, state, completed: false };
+    state.outstanding.add(foreground);
+    try {
+      if (gaveUpPlans.length > 0) {
+        for (const plan of gaveUpPlans) {
+          this.emitChunkDiagnostic(
+            { ...plan, url, kind: 'foreground' },
+            0,
+            0,
+            'gave_up',
+          );
+        }
+        for (const plan of missingPlans) state.chunkAttempts.delete(plan.chunkIndex);
+        throw new BankNetworkError('媒体分片连续取数失败，已达到尝试上限');
+      }
+      for (const plan of missingPlans) state.chunkAttempts.delete(plan.chunkIndex);
+      this.scheduleResourceWindow(state);
+      await Promise.all(missingPlans.map((plan) => this.getTask(plan, {
+        kind: 'foreground',
+        url,
+        credentials: state.credentials,
+        videoKey: state.videoKey,
+      })));
+      if (signal?.aborted) throw abortError();
+      const supplied = this.readStoredRange(resourceKey, start, end);
+      if (supplied?.hit !== true) {
+        throw new BankNetworkError('媒体分片取数完成后未找到完整分片');
+      }
+      if (!(supplied.bytes instanceof ArrayBuffer)
+        || supplied.bytes.byteLength !== rangeLength({ start, end })) {
+        throw new BankFallbackError('媒体分片供数长度不符');
+      }
+      if (!Number.isSafeInteger(supplied.totalSize) || supplied.totalSize <= end) {
+        throw new BankFallbackError('媒体分片供数总长度无效');
+      }
+      state.totalSize = supplied.totalSize;
+      this.emitDiagnostic('bank.serve', {
+        source: scrubUrl(url),
+        start,
+        end,
+        result: 'hit',
+        reason: 'fetched_range',
+      });
+      return {
+        intercepted: true,
+        response: this.createResponse(supplied.bytes, start, end, supplied.totalSize, url),
+        bytes: supplied.bytes,
+        totalSize: supplied.totalSize,
+        release: () => this.completeForegroundRequest(foreground),
+      };
+    } catch (error) {
+      this.completeForegroundRequest(foreground, false);
+      throw error;
+    }
+  }
+
+  completeForegroundRequest(request, schedule = true) {
+    if (request.completed) return;
+    request.completed = true;
+    request.state.outstanding.delete(request);
+    if (schedule && this.resourceState.get(request.state.bankKey) === request.state) {
+      this.scheduleResourceWindow(request.state);
+    }
+  }
+
+  anchorChunkForState(state) {
+    const outstanding = [...state.outstanding];
+    if (outstanding.length > 0) {
+      return Math.min(...outstanding.map((request) => chunkIndex(request.start, this.config.chunkBytes)));
+    }
+    if (!Number.isSafeInteger(state.lastForegroundStart)) return undefined;
+    return chunkIndex(state.lastForegroundStart, this.config.chunkBytes);
+  }
+
+  windowPlansForState(state, anchorChunk) {
+    const start = anchorChunk * this.config.chunkBytes;
+    const end = (anchorChunk + this.config.lookAheadChunks) * this.config.chunkBytes - 1;
+    return planFetchRanges(start, end, {
+      chunkBytes: this.config.chunkBytes,
+      totalSize: state.totalSize,
+      bankKeyValue: state.bankKey,
+      aligned: true,
+    });
+  }
+
+  supersedeTasksBefore(bankKeyValue, anchorChunk) {
+    for (const task of this.inflight.values()) {
+      if (task.bankKey !== bankKeyValue || task.chunkIndex >= anchorChunk || task.controller.signal.aborted) continue;
+      task.abortReason = 'superseded';
+      this.clearTaskStall(task);
+      task.controller.abort();
+      if (!task.started) this.emitTaskAbortDiagnostic(task, 0, 0, 'superseded');
+    }
+  }
+
+  scheduleResourceWindow(state) {
+    if (!this.isEnabled()) return;
+    const anchorChunk = this.anchorChunkForState(state);
+    if (anchorChunk === undefined || state.latestUrl === undefined) return;
+    this.supersedeTasksBefore(state.bankKey, anchorChunk);
+    const candidates = this.windowPlansForState(state, anchorChunk).filter((plan) => {
+      if (this.chunks.has(plan.cacheKey)) return false;
+      const attempts = state.chunkAttempts.get(plan.chunkIndex) || 0;
+      return attempts < this.config.maxChunkAttempts;
+    });
+    for (const plan of candidates.slice(0, this.maxPrefetchConcurrency)) {
+      if (this.inflight.has(plan.cacheKey)) continue;
+      void this.getTask(plan, {
+        kind: 'prefetch',
+        url: state.latestUrl,
+        credentials: state.credentials,
+        videoKey: state.videoKey,
+      }).catch((error) => {
+        if (!isAbortError(error)) console.error('[BilibiliBuffer] 媒体分片预取失败', error);
+      });
+    }
+    this.pump();
   }
 
   disable(reason) {
@@ -391,45 +484,72 @@ export class SegmentBank {
     this.emitDiagnostic('bank.disabled', { reason });
   }
 
-  clearTaskDeadline(task) {
-    if (task.deadlineTimer !== undefined) {
-      this.windowObject.clearTimeout(task.deadlineTimer);
-      task.deadlineTimer = undefined;
+  clearTaskStall(task) {
+    if (task.stallTimer !== undefined) {
+      this.windowObject.clearTimeout(task.stallTimer);
+      task.stallTimer = undefined;
     }
+    task.reader = undefined;
   }
 
-  emitDeadlineDiagnostic(task) {
-    if (task.deadlineReported === true) return;
-    task.deadlineReported = true;
-    this.emitChunkDiagnostic(
-      task,
-      0,
-      performanceNow(this.windowObject) - task.startedAt,
-      'deadline',
-    );
+  armTaskStall(task) {
+    if (task.stallTimer !== undefined) this.windowObject.clearTimeout(task.stallTimer);
+    task.stallTimer = this.windowObject.setTimeout(() => {
+      if (task.settled || task.controller.signal.aborted) return;
+      task.abortReason = 'stalled';
+      task.controller.abort();
+      if (task.reader !== undefined) {
+        void task.reader.cancel().catch((error) => {
+          console.error('[BilibiliBuffer] 停滞媒体分片读取取消失败', error);
+        });
+      }
+    }, this.config.stallMs);
+  }
+
+  emitTaskAbortDiagnostic(task, bytes, durationMs, result) {
+    if (task.abortReported === true) return;
+    task.abortReported = true;
+    this.emitChunkDiagnostic(task, bytes, durationMs, result);
+  }
+
+  taskAbortError(task, bytes, startedAt, error) {
+    const result = task.abortReason === 'superseded'
+      ? 'superseded'
+      : task.abortReason === 'stalled' ? 'stalled' : 'aborted';
+    this.emitTaskAbortDiagnostic(task, bytes, performanceNow(this.windowObject) - startedAt, result);
+    return error;
+  }
+
+  recordTaskFailure(task, error) {
+    if (task.cacheable === false || task.sessionGeneration !== this.sessionGeneration) return;
+    if (task.abortReason !== undefined || isAbortError(error)) return;
+    const state = this.resourceState.get(task.bankKey);
+    if (state === undefined) return;
+    const attempts = state.chunkAttempts.get(task.chunkIndex) || 0;
+    state.chunkAttempts.set(task.chunkIndex, attempts + 1);
+  }
+
+  resetTaskAttempts(task) {
+    if (task.cacheable === false || task.sessionGeneration !== this.sessionGeneration) return;
+    const state = this.resourceState.get(task.bankKey);
+    if (state !== undefined) state.chunkAttempts.delete(task.chunkIndex);
   }
 
   startTask(task) {
     task.started = true;
     task.startedAt = performanceNow(this.windowObject);
     this.activePrefetch.add(task);
-    const deadlineMs = this.config.prefetchDeadlineMs;
-    task.deadlineTimer = this.windowObject.setTimeout(() => {
-      if (task.settled || task.controller.signal.aborted) return;
-      task.abortReason = 'deadline';
-      task.controller.abort();
-      this.emitDeadlineDiagnostic(task);
-    }, deadlineMs);
     void this.runTask(task)
       .then((result) => {
         task.settled = true;
         task.resolve(result);
       }, (error) => {
+        this.recordTaskFailure(task, error);
         task.settled = true;
         task.reject(error);
       })
       .finally(() => {
-        this.clearTaskDeadline(task);
+        this.clearTaskStall(task);
         this.activePrefetch.delete(task);
         if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
         this.pump();
@@ -439,9 +559,19 @@ export class SegmentBank {
   getTask(plan, { kind, url, credentials, videoKey }) {
     const existing = this.inflight.get(plan.cacheKey);
     if (existing !== undefined) return existing.promise;
-    if (kind === 'prefetch' && plan.cacheable !== false
-      && (this.fetchedChunks.has(plan.cacheKey) || this.chunks.has(plan.cacheKey))) {
+    if (plan.cacheable !== false && this.chunks.has(plan.cacheKey)) {
       return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
+    }
+    if (kind === 'prefetch' && plan.cacheable !== false && this.fetchedChunks.has(plan.cacheKey)) {
+      return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
+    }
+    if (kind === 'foreground' && plan.cacheable !== false) {
+      const state = this.stateFor(plan.cacheKey.slice(0, plan.cacheKey.lastIndexOf('#')));
+      const attempts = state.chunkAttempts.get(plan.chunkIndex) || 0;
+      if (attempts >= this.config.maxChunkAttempts) {
+        this.emitChunkDiagnostic({ ...plan, url, kind }, 0, 0, 'gave_up');
+        return Promise.reject(new BankNetworkError('媒体分片连续取数失败，已达到尝试上限'));
+      }
     }
     const controller = new AbortController();
     const task = {
@@ -455,8 +585,9 @@ export class SegmentBank {
       controller,
       started: false,
       startedAt: undefined,
-      deadlineTimer: undefined,
-      deadlineReported: false,
+      stallTimer: undefined,
+      reader: undefined,
+      abortReported: false,
       abortReason: undefined,
       settled: false,
       promise: undefined,
@@ -478,6 +609,7 @@ export class SegmentBank {
       && this.queue.length > 0) {
       const task = this.queue.shift();
       if (task.controller.signal.aborted) {
+        if (task.abortReason === 'superseded') this.emitTaskAbortDiagnostic(task, 0, 0, 'superseded');
         task.settled = true;
         task.reject(abortError());
         if (this.inflight.get(task.cacheKey) === task) this.inflight.delete(task.cacheKey);
@@ -487,18 +619,10 @@ export class SegmentBank {
     }
   }
 
-  taskAbortError(task, bytes, startedAt, error) {
-    if (task.abortReason === 'deadline') {
-      this.emitDeadlineDiagnostic(task);
-    } else {
-      this.emitChunkDiagnostic(task, bytes, performanceNow(this.windowObject) - startedAt, 'aborted');
-    }
-    return error;
-  }
-
   async runTask(task) {
     const startedAt = performanceNow(this.windowObject);
     let response;
+    this.armTaskStall(task);
     try {
       response = await this.nativeFetch.call(this.windowObject, task.url, {
         headers: { Range: `bytes=${task.start}-${task.end}` },
@@ -506,30 +630,58 @@ export class SegmentBank {
         signal: task.controller.signal,
       });
     } catch (error) {
+      this.clearTaskStall(task);
       const result = isAbortError(error) ? 'aborted' : 'network_error';
       if (isAbortError(error)) throw this.taskAbortError(task, 0, startedAt, error);
       this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, result);
       throw new BankNetworkError('媒体分片网络取数失败', error);
     }
     if (task.controller.signal.aborted) {
+      this.clearTaskStall(task);
       throw this.taskAbortError(task, 0, startedAt, abortError());
     }
     if (response.status < 200 || response.status >= 300) {
+      this.clearTaskStall(task);
       this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, 'http_error');
-      return { response };
+      throw new BankNetworkError(`媒体分片网络响应状态无效: ${response.status}`);
     }
     let bytes;
+    let byteCount = 0;
     try {
-      bytes = await response.arrayBuffer();
-    } catch (error) {
-      if (isAbortError(error)) {
-        throw this.taskAbortError(task, 0, startedAt, error);
+      const reader = response.body.getReader();
+      task.reader = reader;
+      const bodyChunks = [];
+      this.armTaskStall(task);
+      while (true) {
+        const read = await reader.read();
+        if (read.done) break;
+        const chunk = read.value.slice();
+        if (chunk.byteLength > 0) {
+          bodyChunks.push(chunk);
+          byteCount += chunk.byteLength;
+          this.armTaskStall(task);
+        }
+        if (task.controller.signal.aborted) throw abortError();
       }
-      this.emitChunkDiagnostic(task, 0, performanceNow(this.windowObject) - startedAt, 'network_error');
+      if (task.controller.signal.aborted) throw abortError();
+      const body = new Uint8Array(byteCount);
+      let offset = 0;
+      for (const chunk of bodyChunks) {
+        body.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      bytes = body.buffer;
+    } catch (error) {
+      if (isAbortError(error) || task.controller.signal.aborted) {
+        throw this.taskAbortError(task, byteCount, startedAt, error);
+      }
+      this.emitChunkDiagnostic(task, byteCount, performanceNow(this.windowObject) - startedAt, 'network_error');
       throw new BankNetworkError('媒体分片响应读取失败', error);
+    } finally {
+      this.clearTaskStall(task);
     }
     if (task.controller.signal.aborted) {
-      throw this.taskAbortError(task, bytes.byteLength, startedAt, abortError());
+      throw this.taskAbortError(task, byteCount, startedAt, abortError());
     }
     const contentRange = parseContentRange(headerValue(response.headers, 'Content-Range'));
     const isCompleteTailChunk = contentRange !== undefined
@@ -541,25 +693,26 @@ export class SegmentBank {
       || (contentRange.end !== task.end && !isCompleteTailChunk)) {
       this.emitChunkDiagnostic(
         task,
-        bytes.byteLength,
+        byteCount,
         performanceNow(this.windowObject) - startedAt,
         'invalid_response',
       );
       throw new BankFallbackError('媒体分片网络 Content-Range 不匹配');
     }
     const resultRange = { start: contentRange.start, end: contentRange.end };
-    if (bytes.byteLength !== rangeLength(resultRange)) {
+    if (byteCount !== rangeLength(resultRange)) {
       this.emitChunkDiagnostic(
         task,
-        bytes.byteLength,
+        byteCount,
         performanceNow(this.windowObject) - startedAt,
         'invalid_response',
       );
       throw new BankFallbackError('媒体分片网络字节长度不匹配');
     }
     if (task.controller.signal.aborted) {
-      throw this.taskAbortError(task, bytes.byteLength, startedAt, abortError());
+      throw this.taskAbortError(task, byteCount, startedAt, abortError());
     }
+    this.recordTotalSize(task.url, contentRange.totalSize);
     const result = {
       ...resultRange,
       bytes,
@@ -581,10 +734,11 @@ export class SegmentBank {
         console.error('[BilibiliBuffer] 媒体分片内存写入失败', error);
         this.disable('store_write_failed');
       }
+      this.resetTaskAttempts(task);
     }
     this.emitChunkDiagnostic(
       task,
-      bytes.byteLength,
+      byteCount,
       performanceNow(this.windowObject) - startedAt,
       'fetched',
       resultRange,
@@ -664,51 +818,16 @@ export class SegmentBank {
       this.abortPrefetchTasks();
       return;
     }
-    const bitrate = this.updatePlaybackSample();
-    if (bitrate <= 0) return;
     for (const state of this.resourceState.values()) {
       if (!this.recentResourceKeys.includes(state.bankKey)) continue;
-      if (state.latestUrl === undefined || !Number.isSafeInteger(state.totalSize) || !Number.isSafeInteger(state.lastForegroundEnd)) {
-        continue;
-      }
-      const start = Math.max(
-        state.lastForegroundEnd + 1,
-        (chunkIndex(state.lastForegroundEnd, this.config.chunkBytes) + 1) * this.config.chunkBytes,
-      );
-      const range = prefetchRange({
-        start,
-        bitrate,
-        aheadSeconds: this.config.prefetchAheadSeconds,
-        totalSize: state.totalSize,
-      });
-      if (range === undefined || range.end <= (state.prefetchEnd ?? -1)) continue;
-      state.prefetchEnd = range.end;
-      const plans = planFetchRanges(range.start, range.end, {
-        chunkBytes: this.config.chunkBytes,
-        totalSize: state.totalSize,
-        bankKeyValue: state.bankKey,
-        aligned: true,
-      });
-      for (const plan of plans) {
-        if (plan.cacheable !== false && (this.chunks.has(plan.cacheKey) || this.fetchedChunks.has(plan.cacheKey))) continue;
-        if (this.inflight.has(plan.cacheKey)) continue;
-        void this.getTask(plan, {
-          kind: 'prefetch',
-          url: state.latestUrl,
-          credentials: state.credentials,
-          videoKey: state.videoKey,
-        }).catch((error) => {
-          if (!isAbortError(error)) console.error('[BilibiliBuffer] 媒体分片投机预取失败', error);
-        });
-      }
-      this.pump();
+      this.scheduleResourceWindow(state);
     }
   }
 
   destroy() {
     if (this.prefetchTimer !== undefined) this.windowObject.clearInterval(this.prefetchTimer);
     for (const task of this.inflight.values()) {
-      this.clearTaskDeadline(task);
+      this.clearTaskStall(task);
       task.controller.abort();
     }
     for (const task of this.queue) {

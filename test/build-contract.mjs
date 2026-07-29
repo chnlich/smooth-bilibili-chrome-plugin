@@ -294,15 +294,17 @@ assert.equal((vodSource.match(/\.setStableBufferTime\(/g) || []).length, 1);
 assert.equal(VOD_CONFIG.stableBufferSeconds, 120);
 assert.deepEqual(Object.keys(BANK_CONFIG), [
   'chunkBytes',
-  'prefetchAheadSeconds',
   'maxBankBytes',
-  'prefetchDeadlineMs',
+  'stallMs',
+  'lookAheadChunks',
+  'maxChunkAttempts',
 ]);
 assert.deepEqual(BANK_CONFIG, {
-  chunkBytes: 4 * 1024 ** 2,
-  prefetchAheadSeconds: 900,
+  chunkBytes: 1024 ** 2,
   maxBankBytes: 512 * 1024 ** 2,
-  prefetchDeadlineMs: 20000,
+  stallMs: 10000,
+  lookAheadChunks: 48,
+  maxChunkAttempts: 3,
 });
 assert.equal(EVENT_CODES.includes('log.persist.result'), true);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);

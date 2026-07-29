@@ -18,10 +18,11 @@ export const VOD_CONFIG = Object.freeze({
 });
 
 export const BANK_CONFIG = Object.freeze({
-  chunkBytes: 4 * 1024 ** 2,
-  prefetchAheadSeconds: 900,
+  chunkBytes: 1024 ** 2,
   maxBankBytes: 512 * 1024 ** 2,
-  prefetchDeadlineMs: 20000,
+  stallMs: 10000,
+  lookAheadChunks: 48,
+  maxChunkAttempts: 3,
 });
 
 export const DIAGNOSTIC_MESSAGE_VERSION = 1;

@@ -16,10 +16,11 @@
     stableBufferSeconds: 120
   });
   var BANK_CONFIG = Object.freeze({
-    chunkBytes: 4 * 1024 ** 2,
-    prefetchAheadSeconds: 900,
+    chunkBytes: 1024 ** 2,
     maxBankBytes: 512 * 1024 ** 2,
-    prefetchDeadlineMs: 2e4
+    stallMs: 1e4,
+    lookAheadChunks: 48,
+    maxChunkAttempts: 3
   });
   var DIAGNOSTIC_MESSAGE_VERSION = 1;
 
@@ -453,7 +454,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-bbfdbb2e2bc50270dac1c684" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-f8e532fc8b527b765f3c295e" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
