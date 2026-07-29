@@ -6,7 +6,7 @@
 ## 播放所有权
 
 - 所有视频都使用 Bilibili 原生播放器。每次页面出现新的播放器或新的媒体内容时，扩展只向 Bilibili 原生下载器请求一次 120 秒稳定缓存目标；播放器或媒体内容更换后，再为新内容请求一次。
-- 扩展观察视频页媒体分片请求，命中时从内存缓存回应，未命中时让 Bilibili 原生下载器原样请求，并可提前预取；分片只在下载层实例内存中保存，离开视频路由或页面关闭即释放，不落盘；但不接管播放：不自建播放管线、不替换媒体地址、不改变清晰度、倍速、seek、播放暂停、音视频轨或音量的任何决策。Bilibili 和用户继续拥有播放与媒体所有权。弹窗只显示当前播放位置覆盖的原生连续缓存秒数；没有覆盖区间就是 0 秒。
+- The extension owns media-segment downloading on video pages: every media-segment request the player makes is answered by the extension — served from the in-memory bank on a hit, otherwise fetched by the extension issuing the same Range request to the same URL on the player's behalf — and it may prefetch ahead. Segments live only in the download layer instance's memory and are released when the video route is left or the page is closed; they are never written to disk. Playback itself is not taken over: no self-built playback pipeline, no media URL replacement, and no change to any decision about quality, playback rate, seek, play/pause, audio and video tracks, or volume. Bilibili and the user continue to own playback and media. The popup shows only the seconds of native contiguous buffer covering the current playback position; with no covering range it is 0 seconds.
 - 用户对播放、暂停、拖动、倍速、画质和音量的控制永远有效，Bilibili 的选择同样保留。扩展只处理视频增强范围内的媒体与缓存事实，不修改浏览器对所有媒体的通用行为。
 
 ## 开发诊断日志
