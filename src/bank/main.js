@@ -577,7 +577,6 @@ export class SegmentBank {
       task.abortReason = 'superseded';
       this.clearTaskStall(task);
       task.controller.abort();
-      if (!task.started) this.emitTaskChunkDiagnostic(task, 0, 0, 'superseded');
     }
   }
 

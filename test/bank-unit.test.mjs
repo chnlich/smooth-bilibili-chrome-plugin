@@ -1043,6 +1043,52 @@ test('the player moving past a chunk cancels its in-flight fetch as superseded',
   bank.destroy();
 });
 
+test('a queued superseded task emits one chunk diagnostic', async () => {
+  const config = configFor({ stallMs: 1000 });
+  const { bank, windowObject } = createBank({
+    config,
+    maxPrefetchConcurrency: 1,
+    nativeFetch: (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        reject(new DOMException('aborted', 'AbortError'));
+      }, { once: true });
+    }),
+  });
+  const first = bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  const queued = bank.getTask({
+    start: 16,
+    end: 31,
+    chunkIndex: 1,
+    cacheKey: `${MEDIA_KEY}#1`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  await tick();
+
+  bank.supersedeTasksBefore(MEDIA_KEY, 2);
+  await Promise.allSettled([first, queued]);
+
+  assert.equal(windowObject.messages.filter(
+    (message) => message.code === 'bank.fetch.chunk'
+      && message.data.chunkIndex === 1
+      && message.data.result === 'superseded',
+  ).length, 1);
+  bank.destroy();
+});
+
 test('touching a third resource does not cancel a still-wanted chunk', async () => {
   const config = configFor({ stallMs: 1000 });
   let taskSignal;
@@ -1467,6 +1513,65 @@ test('XHR pass observation reads responseText without changing native XHR state'
   xhr._native.emit('load');
   await tick();
   assert.equal(bank.addressBook.has(MEDIA_KEY), true);
+  assert.equal(xhr._intercepted, false);
+  assert.equal(xhr.readyState, xhr._native.readyState);
+  bank.destroy();
+});
+
+test('XHR synchronizes video identity before handling a request', () => {
+  const { bank, windowObject } = createBank({ playinfo: playurlBody() });
+  windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({
+    windowObject,
+    nativeConstructor: NativeXHR,
+    bank,
+  });
+  windowObject.location = new URL('https://www.bilibili.com/video/BVother');
+  const xhr = new windowObject.XMLHttpRequest();
+  xhr.open('GET', PLAYURL_URL);
+  xhr.send();
+  assert.equal(bank.addressBook.size, 0);
+  bank.destroy();
+});
+
+test('XHR playurl observation stays with its request and cannot disrupt a non-text response', () => {
+  const { bank, windowObject } = createBank();
+  windowObject.XMLHttpRequest = createBankXMLHttpRequestClass({
+    windowObject,
+    nativeConstructor: NativeXHR,
+    bank,
+  });
+  const xhr = new windowObject.XMLHttpRequest();
+  xhr.open('GET', PLAYURL_URL);
+  xhr.send();
+  xhr.open('GET', 'https://api.bilibili.com/x/web-interface/nav');
+  xhr.send();
+  let laterResponseReads = 0;
+  Object.defineProperty(xhr._native, 'responseText', {
+    configurable: true,
+    get() {
+      laterResponseReads += 1;
+      return JSON.stringify(playurlBody());
+    },
+  });
+  xhr._native.emit('load');
+  assert.equal(laterResponseReads, 0);
+  assert.equal(bank.addressBook.size, 0);
+
+  xhr.open('GET', PLAYURL_URL);
+  xhr.send();
+  Object.defineProperty(xhr._native, 'responseText', {
+    configurable: true,
+    get() { throw new DOMException('responseText is unavailable', 'InvalidStateError'); },
+  });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    assert.doesNotThrow(() => xhr._native.emit('load'));
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(errors.length, 1);
   assert.equal(xhr._intercepted, false);
   assert.equal(xhr.readyState, xhr._native.readyState);
   bank.destroy();

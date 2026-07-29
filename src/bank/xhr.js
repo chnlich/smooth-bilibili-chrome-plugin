@@ -55,9 +55,16 @@ function mirrorForUrl(url) {
   return new URL(url).hostname;
 }
 
-function observePlayurlLoad(bank, native, url) {
+function observePlayurlLoad(bank, native, url, generation, currentGeneration) {
   if (typeof bank.isPlayurlUrl !== 'function' || !bank.isPlayurlUrl(url)) return;
-  native.addEventListener('load', () => bank.observePlayurlText(native.responseText), { once: true });
+  native.addEventListener('load', () => {
+    if (generation !== currentGeneration()) return;
+    try {
+      bank.observePlayurlText(native.responseText);
+    } catch (error) {
+      console.error('[BilibiliBuffer] playurl 地址簿读取失败', error);
+    }
+  }, { once: true });
 }
 
 export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
@@ -202,9 +209,13 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
 
     send(body) {
       this._body = body;
+      if (typeof bank.syncRouteLifecycle === 'function' && !bank.syncRouteLifecycle()) {
+        return this._native.send(body);
+      }
       const method = this._openArgs?.[0];
       const url = new URL(this._openArgs?.[1], windowObject.location.href).href;
       const asyncFlag = this._openArgs?.[2] !== false;
+      const generation = this._generation;
       const enabled = bankEnabled(bank);
       const classification = classifyRequest({
         url,
@@ -222,7 +233,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
             reason: 'sync_xhr',
           });
         }
-        observePlayurlLoad(bank, this._native, url);
+        observePlayurlLoad(bank, this._native, url, generation, () => this._generation);
         return this._native.send(body);
       }
       if (!classification.intercepted) {
@@ -234,7 +245,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
             reason: classification.reason,
           });
         }
-        observePlayurlLoad(bank, this._native, url);
+        observePlayurlLoad(bank, this._native, url, generation, () => this._generation);
         return this._native.send(body);
       }
       this._intercepted = true;
@@ -245,7 +256,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._responseURL = '';
       this._responseHeaders = undefined;
       this._response = null;
-      const generation = this._generation;
       this.dispatchEvent(eventFor(windowObject, 'loadstart'));
       if (this.timeout > 0) {
         this._timer = windowObject.setTimeout(() => {
