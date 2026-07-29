@@ -313,6 +313,7 @@ for (const removedCode of [
   'media.timeupdate',
   'resource.observed',
 ]) assert.equal(EVENT_CODES.includes(removedCode), false);
+assert.equal(EVENT_CODES.includes('log.persist.degraded'), true);
 assert.equal(EVENT_CODES.includes('video.buffer_observed'), true);
 assert.equal(EVENT_CODES.some((code) => code.startsWith('live.')), false);
 assert.doesNotMatch(source, /\broomId\b/);

@@ -565,6 +565,7 @@ test('native numeric MediaError code survives media.error persistence with the f
 test('diagnostic catalog covers all required media events and preserves browser-reported zero', () => {
   assert.ok(MEDIA_EVENT_NAMES.includes('volumechange'));
   assert.equal(MEDIA_EVENT_NAMES.includes('timeupdate'), false);
+  assert.equal(EVENT_CODES.includes('media.timeupdate'), false);
   for (const name of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${name}`));
   assert.deepEqual(browserMetric(0), { value: 0, reportedBy: 'browser' });
   assert.equal(scrubUrl('https://cdn.example/media.m4s?signature=secret#fragment'), 'https://cdn.example/media.m4s');
@@ -759,6 +760,10 @@ test('diagnostics initializes before controls, creates fresh sessions, and flush
   const first = client.getStatus().sessionId;
   client.log('video.attached', { source: 'https://cdn.example/video?token=secret' });
   await client.flush();
+  assert.equal(
+    sent.flatMap((message) => message.events).some((event) => event.code === 'log.persist.result'),
+    false,
+  );
   client.startSession({ routeKind: 'video', bvid: 'BVnext' });
   const second = client.getStatus().sessionId;
   assert.notEqual(first, second);

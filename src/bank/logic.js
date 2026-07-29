@@ -130,7 +130,6 @@ export function planFetchRanges(start, end, {
         end: chunkEnd,
         chunkIndex: index,
         cacheKey: cacheKey(bankKeyValue, index),
-        cacheable: true,
       });
     }
     current += chunkBytes;

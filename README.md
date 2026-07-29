@@ -9,10 +9,9 @@
 
 ## 下载层
 
-- 识别为媒体分片的请求一律由下载层拦截。命中时从内存中的完整分片切片回应，未命中时由扩展用同一 URL 和凭据取回覆盖范围的完整分片，入库后再回应播放器的原始 Range；播放器不会为媒体分片另行发起网络请求。非媒体请求、无效 Range，以及下载层自身的 `internal_fallback`/`internal_error` 路径仍按原样放行。
-- fetch 与 XHR 两条通道都会记录未拦截的 `bank.serve` pass 事件及 `mirror`；媒体请求缺少闭合 Range 或 Range 不是闭合区间时分别记录 `range_missing`/`range_not_closed`，同步 XHR 记录 `sync_xhr`。内存命中和扩展取数命中都记录 `durationMs`，`bank.fetch.chunk` 也记录同一媒体镜像主机。
+- 识别为媒体分片且带闭合单段 `Range` 的请求一律由下载层拦截。命中时从内存中的完整分片切片回应，未命中时由扩展用同一 URL 和凭据取回覆盖范围的完整分片，入库后再回应播放器的原始 Range；播放器不会为这类媒体分片另行发起网络请求。非媒体请求、缺少 `Range`、非闭合 `Range`、同步 XHR，以及下载层自身的 `internal_fallback`/`internal_error` 路径仍按原样放行，并由 `bank.serve` 记录 `pass` 和原因（包括 `range_missing`、`range_not_closed`、`sync_xhr`）。`bank.serve` 的命中事件记录 `mirror` 与 `durationMs`，`bank.fetch.chunk` 记录 `mirror`。
 - 预取窗口按媒体资源分别锚定在仍未供数完成的播放器请求所需的最小块号；没有在途请求时使用最近一次播放器请求的起始块。窗口最多覆盖 48 个块，并发上限 2，只选择窗口内尚未入库且连续失败未达 3 次的前两个块。失败块下一轮自然重新进入窗口，达到上限后向需要它的播放器请求报告错误。
-- 前台取数失败会向 `console.error` 报告；预取失败由下一轮重试吸收并保留 `bank.fetch.chunk`，不输出 console；正常的停滞取消也不输出 console。
+- 前台取数失败和下载层无法供数的异常会向 `console.error` 报告；预取失败由下一轮重试吸收并保留 `bank.fetch.chunk`，不输出 console；正常的停滞取消也不输出 console。
 - 取数按 1 MiB 完整分片流式读取。连续 10 秒没有收到字节时取消并丢弃本次已读的半块；单纯耗时不会取消。文件总长度只从扩展自己的取数响应的 `Content-Range` 学习，不读取让路响应的 body 或 header。
 - 分片只存在 `Map` 里，不落盘；内存上限 512 MiB。
 

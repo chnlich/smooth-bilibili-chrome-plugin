@@ -277,6 +277,7 @@ export class SegmentBank {
         });
         return originalFetch.apply(thisArg, args);
       }
+      console.error('[BilibiliBuffer] 媒体分片供数失败', error);
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(request.url),
         mirror: mirrorForUrl(request.url),
@@ -540,7 +541,7 @@ export class SegmentBank {
   }
 
   recordTaskFailure(task, error) {
-    if (task.cacheable === false || task.sessionGeneration !== this.sessionGeneration) return;
+    if (task.sessionGeneration !== this.sessionGeneration) return;
     if (task.abortReason !== undefined && task.abortReason !== 'stalled') return;
     if (isAbortError(error) && task.abortReason !== 'stalled') return;
     const state = this.resourceState.get(task.bankKey);
@@ -550,7 +551,7 @@ export class SegmentBank {
   }
 
   resetTaskAttempts(task) {
-    if (task.cacheable === false || task.sessionGeneration !== this.sessionGeneration) return;
+    if (task.sessionGeneration !== this.sessionGeneration) return;
     const state = this.resourceState.get(task.bankKey);
     if (state !== undefined) state.chunkAttempts.delete(task.chunkIndex);
   }
@@ -587,10 +588,10 @@ export class SegmentBank {
   getTask(plan, { kind, url, credentials, videoKey }) {
     const existing = this.inflight.get(plan.cacheKey);
     if (existing !== undefined) return existing.promise;
-    if (plan.cacheable !== false && this.chunks.has(plan.cacheKey)) {
+    if (this.chunks.has(plan.cacheKey)) {
       return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
     }
-    if (kind === 'foreground' && plan.cacheable !== false) {
+    if (kind === 'foreground') {
       const state = this.stateFor(plan.cacheKey.slice(0, plan.cacheKey.lastIndexOf('#')));
       const attempts = state.chunkAttempts.get(plan.chunkIndex) || 0;
       if (attempts >= this.config.maxChunkAttempts) {
@@ -710,7 +711,6 @@ export class SegmentBank {
     }
     const contentRange = parseContentRange(headerValue(response.headers, 'Content-Range'));
     const isCompleteTailChunk = contentRange !== undefined
-      && task.cacheable !== false
       && contentRange.start === task.start
       && contentRange.end < task.end
       && contentRange.end === contentRange.totalSize - 1;
@@ -743,7 +743,7 @@ export class SegmentBank {
       bytes,
       totalSize: contentRange.totalSize,
     };
-    if (task.cacheable !== false && task.sessionGeneration === this.sessionGeneration
+    if (task.sessionGeneration === this.sessionGeneration
       && this.enabled === true && this.disabled === false) {
       try {
         this.storeTask(task, result);
@@ -773,12 +773,12 @@ export class SegmentBank {
   emitChunkDiagnostic(task, bytes, durationMs, result, range = task) {
     this.emitDiagnostic('bank.fetch.chunk', {
       source: scrubUrl(task.url),
+      mirror: mirrorForUrl(task.url),
       chunkIndex: task.chunkIndex,
       start: range.start,
       end: range.end,
       bytes,
       durationMs,
-      mirror: mirrorForUrl(task.url),
       priority: task.kind,
       result,
     });

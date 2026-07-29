@@ -200,15 +200,16 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       const method = this._openArgs?.[0];
       const url = new URL(this._openArgs?.[1], windowObject.location.href).href;
       const asyncFlag = this._openArgs?.[2] !== false;
+      const enabled = bankEnabled(bank);
       const classification = classifyRequest({
         url,
         headers: this._headers,
-        enabled: bankEnabled(bank),
+        enabled,
         locationObject: windowObject.location,
       });
       this._range = classification.range;
       if (!asyncFlag) {
-        if (bankEnabled(bank)) {
+        if (enabled) {
           bank.emitDiagnostic('bank.serve', {
             source: scrubUrl(url),
             mirror: mirrorForUrl(url),
@@ -219,7 +220,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
         return this._native.send(body);
       }
       if (!classification.intercepted) {
-        if (bankEnabled(bank)) {
+        if (enabled) {
           bank.emitDiagnostic('bank.serve', {
             source: scrubUrl(url),
             mirror: mirrorForUrl(url),
@@ -297,6 +298,7 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
         if (!this._aborted && !this._timedOut) this.finishError(error, generation);
         return;
       }
+      console.error('[BilibiliBuffer] 媒体分片供数失败', error);
       bank.emitDiagnostic('bank.serve', {
         source: scrubUrl(url),
         mirror: mirrorForUrl(url),

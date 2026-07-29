@@ -304,8 +304,7 @@
           start: current,
           end: chunkEnd,
           chunkIndex: index,
-          cacheKey: cacheKey(bankKeyValue, index),
-          cacheable: true
+          cacheKey: cacheKey(bankKeyValue, index)
         });
       }
       current += chunkBytes;
@@ -706,15 +705,16 @@
         const method = this._openArgs?.[0];
         const url = new URL(this._openArgs?.[1], windowObject.location.href).href;
         const asyncFlag = this._openArgs?.[2] !== false;
+        const enabled = bankEnabled(bank);
         const classification = classifyRequest({
           url,
           headers: this._headers,
-          enabled: bankEnabled(bank),
+          enabled,
           locationObject: windowObject.location
         });
         this._range = classification.range;
         if (!asyncFlag) {
-          if (bankEnabled(bank)) {
+          if (enabled) {
             bank.emitDiagnostic("bank.serve", {
               source: scrubUrl(url),
               mirror: mirrorForUrl(url),
@@ -725,7 +725,7 @@
           return this._native.send(body);
         }
         if (!classification.intercepted) {
-          if (bankEnabled(bank)) {
+          if (enabled) {
             bank.emitDiagnostic("bank.serve", {
               source: scrubUrl(url),
               mirror: mirrorForUrl(url),
@@ -799,6 +799,7 @@
           if (!this._aborted && !this._timedOut) this.finishError(error, generation);
           return;
         }
+        console.error("[BilibiliBuffer] 媒体分片供数失败", error);
         bank.emitDiagnostic("bank.serve", {
           source: scrubUrl(url),
           mirror: mirrorForUrl(url),
@@ -1111,6 +1112,7 @@
           });
           return originalFetch.apply(thisArg, args);
         }
+        console.error("[BilibiliBuffer] 媒体分片供数失败", error);
         this.emitDiagnostic("bank.serve", {
           source: scrubUrl(request.url),
           mirror: mirrorForUrl2(request.url),
@@ -1355,7 +1357,7 @@
       return error;
     }
     recordTaskFailure(task, error) {
-      if (task.cacheable === false || task.sessionGeneration !== this.sessionGeneration) return;
+      if (task.sessionGeneration !== this.sessionGeneration) return;
       if (task.abortReason !== void 0 && task.abortReason !== "stalled") return;
       if (isAbortError2(error) && task.abortReason !== "stalled") return;
       const state = this.resourceState.get(task.bankKey);
@@ -1364,7 +1366,7 @@
       state.chunkAttempts.set(task.chunkIndex, attempts + 1);
     }
     resetTaskAttempts(task) {
-      if (task.cacheable === false || task.sessionGeneration !== this.sessionGeneration) return;
+      if (task.sessionGeneration !== this.sessionGeneration) return;
       const state = this.resourceState.get(task.bankKey);
       if (state !== void 0) state.chunkAttempts.delete(task.chunkIndex);
     }
@@ -1395,10 +1397,10 @@
     getTask(plan, { kind, url, credentials, videoKey }) {
       const existing = this.inflight.get(plan.cacheKey);
       if (existing !== void 0) return existing.promise;
-      if (plan.cacheable !== false && this.chunks.has(plan.cacheKey)) {
+      if (this.chunks.has(plan.cacheKey)) {
         return Promise.resolve({ skipped: true, cacheKey: plan.cacheKey });
       }
-      if (kind === "foreground" && plan.cacheable !== false) {
+      if (kind === "foreground") {
         const state = this.stateFor(plan.cacheKey.slice(0, plan.cacheKey.lastIndexOf("#")));
         const attempts = state.chunkAttempts.get(plan.chunkIndex) || 0;
         if (attempts >= this.config.maxChunkAttempts) {
@@ -1514,7 +1516,7 @@
         throw this.taskAbortError(task, byteCount, startedAt, abortError());
       }
       const contentRange = parseContentRange(headerValue(response.headers, "Content-Range"));
-      const isCompleteTailChunk = contentRange !== void 0 && task.cacheable !== false && contentRange.start === task.start && contentRange.end < task.end && contentRange.end === contentRange.totalSize - 1;
+      const isCompleteTailChunk = contentRange !== void 0 && contentRange.start === task.start && contentRange.end < task.end && contentRange.end === contentRange.totalSize - 1;
       if (contentRange === void 0 || contentRange.start !== task.start || contentRange.end !== task.end && !isCompleteTailChunk) {
         this.emitChunkDiagnostic(
           task,
@@ -1543,7 +1545,7 @@
         bytes,
         totalSize: contentRange.totalSize
       };
-      if (task.cacheable !== false && task.sessionGeneration === this.sessionGeneration && this.enabled === true && this.disabled === false) {
+      if (task.sessionGeneration === this.sessionGeneration && this.enabled === true && this.disabled === false) {
         try {
           this.storeTask(task, result);
         } catch (error) {
@@ -1571,12 +1573,12 @@
     emitChunkDiagnostic(task, bytes, durationMs, result, range = task) {
       this.emitDiagnostic("bank.fetch.chunk", {
         source: scrubUrl(task.url),
+        mirror: mirrorForUrl2(task.url),
         chunkIndex: task.chunkIndex,
         start: range.start,
         end: range.end,
         bytes,
         durationMs,
-        mirror: mirrorForUrl2(task.url),
         priority: task.kind,
         result
       });

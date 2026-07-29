@@ -236,8 +236,8 @@ test('response headers, content-range parser, fetch plans and bitrate estimate a
     totalSize: 100,
     bankKeyValue: MEDIA_KEY,
   }), [
-    { start: 0, end: 15, chunkIndex: 0, cacheKey: `${MEDIA_KEY}#0`, cacheable: true },
-    { start: 16, end: 31, chunkIndex: 1, cacheKey: `${MEDIA_KEY}#1`, cacheable: true },
+    { start: 0, end: 15, chunkIndex: 0, cacheKey: `${MEDIA_KEY}#0` },
+    { start: 16, end: 31, chunkIndex: 1, cacheKey: `${MEDIA_KEY}#1` },
   ]);
   assert.deepEqual(planFetchRanges(4, 10, {
     chunkBytes: 16,
@@ -248,7 +248,6 @@ test('response headers, content-range parser, fetch plans and bitrate estimate a
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
   }]);
 });
 
@@ -293,6 +292,12 @@ test('memory hit returns exact bytes and canonical response fields while refilli
   assert.equal(response.headers.get('Content-Length'), '3');
   assert.equal(response.headers.get('Accept-Ranges'), 'bytes');
   assert.equal(response.headers.get('Content-Type'), 'video/mp4');
+  const serveDiagnostic = bank.windowObject.messages.find(
+    (message) => message.code === 'bank.serve' && message.data.reason === 'stored_range',
+  );
+  assert.equal(serveDiagnostic.data.mirror, new URL(MEDIA_URL).hostname);
+  assert.equal(typeof serveDiagnostic.data.durationMs, 'number');
+  assert.equal(serveDiagnostic.data.durationMs >= 0, true);
   assert.deepEqual(calls.map(({ range }) => range), [
     { start: 16, end: 31 },
     { start: 32, end: 47 },
@@ -426,7 +431,6 @@ test('a cross-chunk foreground request anchors on its smaller chunk and keeps it
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
   }, {
     kind: 'prefetch',
     url: MEDIA_URL,
@@ -470,7 +474,6 @@ test('a cache hit supersedes an in-flight chunk before its new anchor', async ()
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
   }, {
     kind: 'prefetch',
     url: MEDIA_URL,
@@ -509,7 +512,6 @@ test('prefetch concurrency never exceeds two active tasks', async () => {
     end: start + 15,
     chunkIndex: start / 16,
     cacheKey: `${MEDIA_KEY}#${start / 16}`,
-    cacheable: true,
   }, {
     kind: 'prefetch',
     url: MEDIA_URL,
@@ -581,7 +583,6 @@ test('memory limit is enforced after each write', async () => {
       end: start + 15,
       chunkIndex: start / 16,
       cacheKey: `${MEDIA_KEY}#${start / 16}`,
-      cacheable: true,
     }, {
       kind: 'prefetch',
       url: MEDIA_URL,
@@ -623,7 +624,6 @@ test('a memory write failure disables the bank and lets subsequent requests pass
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
   }, {
     kind: 'prefetch',
     url: MEDIA_URL,
@@ -735,7 +735,6 @@ test('a stalled stream is cancelled with the real bytes already received', async
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
   }, {
     kind: 'prefetch',
     url: MEDIA_URL,
@@ -748,8 +747,8 @@ test('a stalled stream is cancelled with the real bytes already received', async
   const errors = [];
   const originalError = console.error;
   console.error = (...args) => errors.push(args);
-  timers.fire(config.stallMs);
   try {
+    timers.fire(config.stallMs);
     await assert.rejects(pending, (error) => error.name === 'AbortError');
     await new Promise((resolve) => setImmediate(resolve));
   } finally {
@@ -913,6 +912,27 @@ test('a retry-absorbed prefetch failure records a chunk event without console ou
   ), true);
 });
 
+test('a serve failure is reported before the native fallback', async () => {
+  const { bank, windowObject } = createBank();
+  bank.serveRequest = async () => { throw new Error('serve failed'); };
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    const response = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=0-7' } }, async () => (
+      new Response('native', { status: 200 })
+    ));
+    assert.equal(await response.text(), 'native');
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(errors.length, 1);
+  const diagnostic = windowObject.messages.find(
+    (message) => message.code === 'bank.serve' && message.data.reason === 'internal_error',
+  );
+  assert.equal(diagnostic.data.mirror, new URL(MEDIA_URL).hostname);
+});
+
 test('a chunk at maxChunkAttempts leaves the window and reports gave_up to its player', async () => {
   const config = configFor({ maxChunkAttempts: 3 });
   let calls = 0;
@@ -979,7 +999,6 @@ test('the player moving past a chunk cancels its in-flight fetch as superseded',
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
   }, {
     kind: 'prefetch',
     url: MEDIA_URL,
@@ -1018,7 +1037,6 @@ test('touching a third resource does not cancel a still-wanted chunk', async () 
     end: 15,
     chunkIndex: 0,
     cacheKey: `${MEDIA_KEY}#0`,
-    cacheable: true,
   }, {
     kind: 'prefetch',
     url: MEDIA_URL,
@@ -1230,6 +1248,14 @@ test('XHR cache miss is served by the extension fetch without native XHR network
   });
   assert.deepEqual(calls[0].range, { start: 0, end: 15 });
   assert.deepEqual([...new Uint8Array(xhr.response)], [...bytesFor(4, 11)]);
+  const serveDiagnostic = bank.windowObject.messages.find(
+    (message) => message.code === 'bank.serve' && message.data.reason === 'fetched_range',
+  );
+  assert.equal(serveDiagnostic.data.mirror, new URL(MEDIA_URL).hostname);
+  assert.equal(typeof serveDiagnostic.data.durationMs, 'number');
+  assert.equal(serveDiagnostic.data.durationMs >= 0, true);
+  const chunkDiagnostic = bank.windowObject.messages.find((message) => message.code === 'bank.fetch.chunk');
+  assert.equal(chunkDiagnostic.data.mirror, new URL(MEDIA_URL).hostname);
   assert.deepEqual(xhr._native.openArgs, ['GET', MEDIA_URL]);
   assert.deepEqual(xhr._native.requestHeaders, [['Range', 'bytes=4-11']]);
   assert.deepEqual(xhr._native.sendCalls, []);
