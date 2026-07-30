@@ -564,17 +564,6 @@
   function mirrorForUrl(url) {
     return new URL(url).hostname;
   }
-  function observePlayurlLoad(bank, native, url, generation, currentGeneration) {
-    if (typeof bank.isPlayurlUrl !== "function" || !bank.isPlayurlUrl(url)) return;
-    native.addEventListener("load", () => {
-      if (generation !== currentGeneration()) return;
-      try {
-        bank.observePlayurlText(native.responseText);
-      } catch (error) {
-        console.error("[BilibiliBuffer] playurl 地址簿读取失败", error);
-      }
-    }, { once: true });
-  }
   function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
     return class SegmentBankXMLHttpRequest {
       static UNSENT = 0;
@@ -604,9 +593,18 @@
         this._timedOut = false;
         this._suppressNativeLoadstart = false;
         this._generation = 0;
+        this._playurlObservationGeneration = void 0;
+        this._playurlObservationUrl = void 0;
         for (const eventName of EVENT_NAMES) {
           this._native.addEventListener(eventName, (event) => {
             if (!this._intercepted) {
+              if (event.type === "load" && this._playurlObservationGeneration === this._generation && this._playurlObservationUrl !== void 0) {
+                try {
+                  bank.observePlayurlText(this._native.responseText);
+                } catch (error) {
+                  console.error("[BilibiliBuffer] playurl 地址簿读取失败", error);
+                }
+              }
               if (event.type === "loadstart" && this._suppressNativeLoadstart) {
                 this._suppressNativeLoadstart = false;
                 return;
@@ -663,6 +661,8 @@
         this._abortController?.abort();
         this.clearTimer();
         this._generation += 1;
+        this._playurlObservationGeneration = void 0;
+        this._playurlObservationUrl = void 0;
         this._openArgs = args;
         this._headers = {};
         this._range = void 0;
@@ -724,6 +724,8 @@
         const url = new URL(this._openArgs?.[1], windowObject.location.href).href;
         const asyncFlag = this._openArgs?.[2] !== false;
         const generation = this._generation;
+        this._playurlObservationGeneration = generation;
+        this._playurlObservationUrl = typeof bank.isPlayurlUrl === "function" && bank.isPlayurlUrl(url) ? url : void 0;
         const enabled = bankEnabled(bank);
         const classification = classifyRequest({
           url,
@@ -741,7 +743,6 @@
               reason: "sync_xhr"
             });
           }
-          observePlayurlLoad(bank, this._native, url, generation, () => this._generation);
           return this._native.send(body);
         }
         if (!classification.intercepted) {
@@ -753,7 +754,6 @@
               reason: classification.reason
             });
           }
-          observePlayurlLoad(bank, this._native, url, generation, () => this._generation);
           return this._native.send(body);
         }
         this._intercepted = true;
@@ -1110,6 +1110,13 @@
         console.error("[BilibiliBuffer] playurl 地址簿解析失败");
       }
     }
+    readInlinePlayinfo() {
+      try {
+        this.observePlayurlData(this.windowObject.__playinfo__);
+      } catch (error) {
+        console.error("[BilibiliBuffer] __playinfo__ 地址簿读取失败", error);
+      }
+    }
     observePlayurlData(data) {
       if (data === void 0 || data === null) return;
       if (typeof data === "string") {
@@ -1163,7 +1170,11 @@
     buildTaskLegs(task) {
       const urls = [task.url];
       if (this.config.raceLegs > 1) {
-        const pairUrl = this.pairUrlFor(task.url);
+        let pairUrl = this.pairUrlFor(task.url);
+        if (pairUrl === void 0) {
+          this.readInlinePlayinfo();
+          pairUrl = this.pairUrlFor(task.url);
+        }
         if (pairUrl !== void 0) urls.push(pairUrl);
       }
       task.legs = urls.map((url, slot) => this.createTaskLeg(task, slot, url));
@@ -1198,7 +1209,7 @@
         }
         const response = await originalFetch.apply(thisArg, args);
         if (this.isPlayurlUrl(request.url)) {
-          void this.observePlayurlResponse(response).catch((error) => {
+          await this.observePlayurlResponse(response).catch((error) => {
             console.error("[BilibiliBuffer] playurl 地址簿读取失败");
           });
         }

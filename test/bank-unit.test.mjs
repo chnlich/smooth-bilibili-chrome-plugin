@@ -1423,6 +1423,198 @@ test('empty, stale, mismatched, and race-disabled address books degrade to one l
   await runSingle({ config: configFor({ raceLegs: 1 }), observe: playurlBody() });
 });
 
+test('the first unpaired chunk reads inline playinfo before building its legs', async () => {
+  const config = configFor({ raceLegs: 2 });
+  const { bank, windowObject, calls } = createBank({ config });
+  windowObject.__playinfo__ = playurlBody();
+  await bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  assert.equal(calls.length, 2);
+  assert.notEqual(new URL(calls[0].url).hostname, new URL(calls[1].url).hostname);
+  bank.destroy();
+});
+
+test('an undefined inline playinfo keeps the first chunk single-legged without an error', async () => {
+  const config = configFor({ raceLegs: 2 });
+  const { bank, calls } = createBank({ config });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    await bank.getTask({
+      start: 0,
+      end: 15,
+      chunkIndex: 0,
+      cacheKey: `${MEDIA_KEY}#0`,
+    }, {
+      kind: 'prefetch',
+      url: MEDIA_URL,
+      credentials: 'same-origin',
+      videoKey: '/video/BVbank',
+    });
+  } finally {
+    console.error = originalError;
+    bank.destroy();
+  }
+  assert.equal(calls.length, 1);
+  assert.equal(errors.length, 0);
+});
+
+test('inline playinfo is reparsed after an in-place mutation and after freshness expiry', async () => {
+  const config = configFor({ raceLegs: 2, pairFreshnessMs: 10 });
+  let now = 1000;
+  const { bank, windowObject, calls } = createBank({ config, now: () => now });
+  const inline = playurlBody(MEDIA_URL, []);
+  windowObject.__playinfo__ = inline;
+  const task = (chunkIndex) => bank.getTask({
+    start: chunkIndex * 16,
+    end: chunkIndex * 16 + 15,
+    chunkIndex,
+    cacheKey: `${MEDIA_KEY}#${chunkIndex}`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+
+  await task(0);
+  inline.data.dash.video[0].backupUrl = [PAIR_URL];
+  now += 11;
+  await task(1);
+
+  assert.equal(calls.length, 3);
+  assert.equal(new URL(calls[1].url).hostname, new URL(MEDIA_URL).hostname);
+  assert.equal(new URL(calls[2].url).hostname, new URL(PAIR_URL).hostname);
+  bank.destroy();
+});
+
+test('cyclic and throwing inline playinfo values cannot fail a successful chunk', async () => {
+  const cases = [
+    (() => {
+      const value = {};
+      value.self = value;
+      return value;
+    })(),
+    'throwing getter',
+  ];
+  for (const value of cases) {
+    const config = configFor({ raceLegs: 2 });
+    const { bank, windowObject, calls } = createBank({ config });
+    const thrown = new Error('page getter failed');
+    if (value === 'throwing getter') {
+      Object.defineProperty(windowObject, '__playinfo__', {
+        configurable: true,
+        get() { throw thrown; },
+      });
+    } else {
+      windowObject.__playinfo__ = value;
+    }
+    const errors = [];
+    const originalError = console.error;
+    console.error = (...args) => errors.push(args);
+    let attempts;
+    try {
+      await bank.getTask({
+        start: 0,
+        end: 15,
+        chunkIndex: 0,
+        cacheKey: `${MEDIA_KEY}#0`,
+      }, {
+        kind: 'prefetch',
+        url: MEDIA_URL,
+        credentials: 'same-origin',
+        videoKey: '/video/BVbank',
+      });
+      attempts = bank.stateFor(MEDIA_KEY).chunkAttempts.has(0);
+    } finally {
+      console.error = originalError;
+      bank.destroy();
+    }
+    assert.equal(calls.length, 1);
+    assert.equal(attempts, false);
+    assert.equal(errors.length, 1);
+    if (value === 'throwing getter') assert.equal(errors[0][1], thrown);
+  }
+});
+
+test('invalid inline playinfo is reported on every read', () => {
+  const { bank, windowObject } = createBank({ config: configFor({ raceLegs: 2 }) });
+  windowObject.__playinfo__ = '{invalid json';
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    bank.readInlinePlayinfo();
+    bank.readInlinePlayinfo();
+  } finally {
+    console.error = originalError;
+    bank.destroy();
+  }
+  assert.equal(errors.length, 2);
+});
+
+test('inline dash audio representations pair audio chunks', async () => {
+  const audioUrl = 'https://audio-one.example/audio/track.m4s?token=secret';
+  const audioPairUrl = 'https://audio-two.example/audio/track.m4s?token=pair';
+  const audioKey = '/audio/track.m4s';
+  const config = configFor({ raceLegs: 2 });
+  const { bank, windowObject, calls } = createBank({ config });
+  windowObject.__playinfo__ = {
+    data: {
+      dash: {
+        audio: [{ baseUrl: audioUrl, backupUrl: [audioPairUrl] }],
+      },
+    },
+  };
+  await bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${audioKey}#0`,
+  }, {
+    kind: 'prefetch',
+    url: audioUrl,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  assert.equal(bank.addressBook.has(audioKey), true);
+  assert.equal(calls.length, 2);
+  assert.notEqual(new URL(calls[0].url).hostname, new URL(calls[1].url).hostname);
+  bank.destroy();
+});
+
+test('raceLegs one never reads inline playinfo', async () => {
+  const config = configFor({ raceLegs: 1 });
+  const { bank, windowObject, calls } = createBank({ config });
+  windowObject.__playinfo__ = playurlBody();
+  let readCount = 0;
+  bank.readInlinePlayinfo = () => { readCount += 1; };
+  await bank.getTask({
+    start: 0,
+    end: 15,
+    chunkIndex: 0,
+    cacheKey: `${MEDIA_KEY}#0`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  });
+  assert.equal(readCount, 0);
+  assert.equal(calls.length, 1);
+  bank.destroy();
+});
+
 test('video identity changes release the address book and pass fetch observes the original playurl response', async () => {
   const { bank, windowObject } = createBank({ playinfo: playurlBody() });
   assert.equal(bank.addressBook.has(MEDIA_KEY), true);
@@ -1447,7 +1639,6 @@ test('video identity changes release the address book and pass fetch observes th
   const returned = await fetchThrough(bank, PLAYURL_URL, {}, async () => response);
   assert.equal(returned, response);
   assert.equal(response.bodyUsed, false);
-  await tick();
   assert.equal(bank.addressBook.has(MEDIA_KEY), true);
   bank.destroy();
 });
@@ -1509,9 +1700,14 @@ test('XHR pass observation reads responseText without changing native XHR state'
   xhr.open('GET', PLAYURL_URL);
   xhr.send();
   assert.equal(xhr._intercepted, false);
+  let addressBookAtLoad;
+  xhr.addEventListener('load', () => {
+    addressBookAtLoad = bank.addressBook.has(MEDIA_KEY);
+  });
   xhr._native.responseText = JSON.stringify(playurlBody());
   xhr._native.emit('load');
   await tick();
+  assert.equal(addressBookAtLoad, true);
   assert.equal(bank.addressBook.has(MEDIA_KEY), true);
   assert.equal(xhr._intercepted, false);
   assert.equal(xhr.readyState, xhr._native.readyState);

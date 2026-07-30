@@ -18,6 +18,31 @@
       <p data-session-details>导出全部 session</p>
       <button type="button" data-export>打开文件并导出 JSONL</button>
       <p role="status" data-status>正在读取日志 session…</p>
+
+      <section class="cdn-panel" data-cdn-panel>
+        <h2>CDN racing</h2>
+        <p>按当前范围读取已保存的 bank.fetch.chunk 事件，查看各镜像在双腿 racing 中的表现。</p>
+        <button type="button" data-cdn-refresh>读取 CDN racing</button>
+        <p role="status" data-cdn-status>尚未读取 CDN racing。</p>
+        <p data-cdn-summary>配对覆盖率和浪费字节率：未计算</p>
+        <div class="cdn-table-wrap">
+          <table class="cdn-table">
+            <thead>
+              <tr>
+                <th scope="col">mirror</th>
+                <th scope="col">races</th>
+                <th scope="col">wins</th>
+                <th scope="col">win rate</th>
+                <th scope="col">ttfb p50</th>
+                <th scope="col">ttfb p90</th>
+                <th scope="col">stalled</th>
+                <th scope="col">bytes delivered</th>
+              </tr>
+            </thead>
+            <tbody data-cdn-rows></tbody>
+          </table>
+        </div>
+      </section>
     </main>
     <script src="logs.js"></script>
   </body>

@@ -55,18 +55,6 @@ function mirrorForUrl(url) {
   return new URL(url).hostname;
 }
 
-function observePlayurlLoad(bank, native, url, generation, currentGeneration) {
-  if (typeof bank.isPlayurlUrl !== 'function' || !bank.isPlayurlUrl(url)) return;
-  native.addEventListener('load', () => {
-    if (generation !== currentGeneration()) return;
-    try {
-      bank.observePlayurlText(native.responseText);
-    } catch (error) {
-      console.error('[BilibiliBuffer] playurl 地址簿读取失败', error);
-    }
-  }, { once: true });
-}
-
 export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor, bank }) {
   return class SegmentBankXMLHttpRequest {
     static UNSENT = 0;
@@ -97,9 +85,20 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._timedOut = false;
       this._suppressNativeLoadstart = false;
       this._generation = 0;
+      this._playurlObservationGeneration = undefined;
+      this._playurlObservationUrl = undefined;
       for (const eventName of EVENT_NAMES) {
         this._native.addEventListener(eventName, (event) => {
           if (!this._intercepted) {
+            if (event.type === 'load'
+              && this._playurlObservationGeneration === this._generation
+              && this._playurlObservationUrl !== undefined) {
+              try {
+                bank.observePlayurlText(this._native.responseText);
+              } catch (error) {
+                console.error('[BilibiliBuffer] playurl 地址簿读取失败', error);
+              }
+            }
             if (event.type === 'loadstart' && this._suppressNativeLoadstart) {
               this._suppressNativeLoadstart = false;
               return;
@@ -149,6 +148,8 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       this._abortController?.abort();
       this.clearTimer();
       this._generation += 1;
+      this._playurlObservationGeneration = undefined;
+      this._playurlObservationUrl = undefined;
       this._openArgs = args;
       this._headers = {};
       this._range = undefined;
@@ -216,6 +217,10 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       const url = new URL(this._openArgs?.[1], windowObject.location.href).href;
       const asyncFlag = this._openArgs?.[2] !== false;
       const generation = this._generation;
+      this._playurlObservationGeneration = generation;
+      this._playurlObservationUrl = typeof bank.isPlayurlUrl === 'function' && bank.isPlayurlUrl(url)
+        ? url
+        : undefined;
       const enabled = bankEnabled(bank);
       const classification = classifyRequest({
         url,
@@ -233,7 +238,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
             reason: 'sync_xhr',
           });
         }
-        observePlayurlLoad(bank, this._native, url, generation, () => this._generation);
         return this._native.send(body);
       }
       if (!classification.intercepted) {
@@ -245,7 +249,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
             reason: classification.reason,
           });
         }
-        observePlayurlLoad(bank, this._native, url, generation, () => this._generation);
         return this._native.send(body);
       }
       this._intercepted = true;

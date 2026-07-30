@@ -263,6 +263,14 @@ export class SegmentBank {
     }
   }
 
+  readInlinePlayinfo() {
+    try {
+      this.observePlayurlData(this.windowObject.__playinfo__);
+    } catch (error) {
+      console.error('[BilibiliBuffer] __playinfo__ 地址簿读取失败', error);
+    }
+  }
+
   observePlayurlData(data) {
     if (data === undefined || data === null) return;
     if (typeof data === 'string') {
@@ -319,7 +327,11 @@ export class SegmentBank {
   buildTaskLegs(task) {
     const urls = [task.url];
     if (this.config.raceLegs > 1) {
-      const pairUrl = this.pairUrlFor(task.url);
+      let pairUrl = this.pairUrlFor(task.url);
+      if (pairUrl === undefined) {
+        this.readInlinePlayinfo();
+        pairUrl = this.pairUrlFor(task.url);
+      }
       if (pairUrl !== undefined) urls.push(pairUrl);
     }
     task.legs = urls.map((url, slot) => this.createTaskLeg(task, slot, url));
@@ -355,7 +367,7 @@ export class SegmentBank {
       }
       const response = await originalFetch.apply(thisArg, args);
       if (this.isPlayurlUrl(request.url)) {
-        void this.observePlayurlResponse(response).catch((error) => {
+        await this.observePlayurlResponse(response).catch((error) => {
           console.error('[BilibiliBuffer] playurl 地址簿读取失败');
         });
       }

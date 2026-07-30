@@ -7,6 +7,10 @@ const sessionSelect = document.querySelector('[data-session-filter]');
 const exportButton = document.querySelector('[data-export]');
 const statusElement = document.querySelector('[data-status]');
 const sessionDetails = document.querySelector('[data-session-details]');
+const cdnButton = document.querySelector('[data-cdn-refresh]');
+const cdnStatusElement = document.querySelector('[data-cdn-status]');
+const cdnSummaryElement = document.querySelector('[data-cdn-summary]');
+const cdnRowsElement = document.querySelector('[data-cdn-rows]');
 
 const currentSessionId = sessionIdFromHash(window.location.hash);
 
@@ -65,7 +69,7 @@ async function writeSessions(writer, sessionId, maxEventId) {
   }
 }
 
-async function writeEvents(writer, sessionId, maxEventId) {
+async function forEachEventPage(sessionId, maxEventId, callback) {
   let afterEventId = 0;
   for (;;) {
     const response = await send({
@@ -75,13 +79,163 @@ async function writeEvents(writer, sessionId, maxEventId) {
       maxEventId,
       ...(sessionId === undefined ? {} : { sessionId }),
     });
-    for (const event of response.events) await writeLine(writer, { recordType: 'event', ...event });
+    await callback(response.events);
     if (!response.hasMore) break;
     const nextAfterEventId = response.nextAfterEventId ?? response.events.at(-1)?.eventId;
     if (!Number.isInteger(nextAfterEventId) || nextAfterEventId <= afterEventId) {
       throw new Error('日志分页没有向前推进');
     }
     afterEventId = nextAfterEventId;
+  }
+}
+
+async function writeEvents(writer, sessionId, maxEventId) {
+  await forEachEventPage(sessionId, maxEventId, async (events) => {
+    for (const event of events) await writeLine(writer, { recordType: 'event', ...event });
+  });
+}
+
+function chunkGroupKey(data) {
+  return JSON.stringify([new URL(data.source).pathname, data.chunkIndex, data.start]);
+}
+
+function finiteValue(value) {
+  if (!Number.isFinite(value)) throw new Error(`CDN 事件 bytes 无效: ${value}`);
+  return value;
+}
+
+function percentile(values, probability) {
+  if (values.length === 0) return undefined;
+  const ordered = [...values].sort((left, right) => left - right);
+  const index = (ordered.length - 1) * probability;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return ordered[lower];
+  return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower);
+}
+
+function mirrorStatsFor(mirrors, mirror) {
+  let stats = mirrors.get(mirror);
+  if (stats === undefined) {
+    stats = {
+      mirror,
+      racesEntered: 0,
+      wins: 0,
+      ttfbValues: [],
+      stalled: 0,
+      bytesDelivered: 0,
+    };
+    mirrors.set(mirror, stats);
+  }
+  return stats;
+}
+
+function isPairedRace(legs) {
+  return new Set(legs.map((leg) => leg.slot)).size >= 2;
+}
+
+export function aggregateCdnEvents(events) {
+  const chunks = new Map();
+  const mirrors = new Map();
+  let fetchedBytes = 0;
+  let wastedBytes = 0;
+  for (const event of events) {
+    if (event.code !== 'bank.fetch.chunk') continue;
+    const data = event.data;
+    const stats = mirrorStatsFor(mirrors, data.mirror);
+    const bytes = finiteValue(data.bytes);
+    if (data.result === 'fetched') {
+      stats.bytesDelivered += bytes;
+      fetchedBytes += bytes;
+    }
+    if (data.result === 'lost_race') wastedBytes += bytes;
+    if (data.result === 'stalled') stats.stalled += 1;
+    if (Number.isFinite(data.ttfbMs)) stats.ttfbValues.push(data.ttfbMs);
+    const key = chunkGroupKey(data);
+    const legs = chunks.get(key) || [];
+    legs.push(data);
+    chunks.set(key, legs);
+  }
+
+  let pairedChunks = 0;
+  for (const legs of chunks.values()) {
+    if (!isPairedRace(legs)) continue;
+    pairedChunks += 1;
+    for (const leg of legs) {
+      const stats = mirrorStatsFor(mirrors, leg.mirror);
+      stats.racesEntered += 1;
+      if (leg.result === 'fetched') stats.wins += 1;
+    }
+  }
+
+  const rows = [...mirrors.values()]
+    .sort((left, right) => String(left.mirror).localeCompare(String(right.mirror)))
+    .map((stats) => ({
+      mirror: stats.mirror,
+      racesEntered: stats.racesEntered,
+      wins: stats.wins,
+      winRate: stats.racesEntered === 0 ? 0 : stats.wins / stats.racesEntered,
+      ttfbP50: percentile(stats.ttfbValues, 0.5),
+      ttfbP90: percentile(stats.ttfbValues, 0.9),
+      stalled: stats.stalled,
+      bytesDelivered: stats.bytesDelivered,
+    }));
+  const totalChunks = chunks.size;
+  return {
+    totalChunks,
+    pairedChunks,
+    pairCoverage: totalChunks === 0 ? 0 : pairedChunks / totalChunks,
+    fetchedBytes,
+    wastedBytes,
+    wastedByteRatio: fetchedBytes === 0 ? 0 : wastedBytes / fetchedBytes,
+    rows,
+  };
+}
+
+async function readCdnEvents(sessionId, maxEventId) {
+  const events = [];
+  await forEachEventPage(sessionId, maxEventId, (page) => {
+    events.push(...page);
+  });
+  return events;
+}
+
+function ratioText(value) {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function metricText(value, suffix = '') {
+  return value === undefined ? '未提供' : `${value.toFixed(1)}${suffix}`;
+}
+
+function integerText(value) {
+  return String(value);
+}
+
+export function renderCdnPanel(summary, summaryElement = cdnSummaryElement, rowsElement = cdnRowsElement) {
+  summaryElement.textContent = [
+    `配对覆盖率 ${summary.pairedChunks}/${summary.totalChunks} (${ratioText(summary.pairCoverage)})`,
+    `浪费字节率 ${ratioText(summary.wastedByteRatio)}`,
+  ].join('；');
+  rowsElement.replaceChildren();
+  for (const row of summary.rows) {
+    const cells = [
+      row.mirror,
+      integerText(row.racesEntered),
+      integerText(row.wins),
+      ratioText(row.winRate),
+      metricText(row.ttfbP50, ' ms'),
+      metricText(row.ttfbP90, ' ms'),
+      integerText(row.stalled),
+      integerText(row.bytesDelivered),
+    ];
+    const tableRow = rowsElement.ownerDocument.createElement('tr');
+    for (const value of cells) {
+      const cell = rowsElement.ownerDocument.createElement('td');
+      cell.textContent = String(value);
+      tableRow.append(cell);
+    }
+    rowsElement.append(tableRow);
   }
 }
 
@@ -129,6 +283,26 @@ exportButton.addEventListener('click', async () => {
     console.error('[BilibiliBuffer] 日志导出失败', error);
   } finally {
     exportButton.disabled = false;
+  }
+});
+
+cdnButton.addEventListener('click', async () => {
+  cdnButton.disabled = true;
+  cdnStatusElement.textContent = '正在读取 bank.fetch.chunk 事件…';
+  try {
+    const sessionId = selectedSessionId();
+    const snapshot = await send({
+      type: 'logs:max-event-id',
+      ...(sessionId === undefined ? {} : { sessionId }),
+    });
+    const events = await readCdnEvents(sessionId, snapshot.maxEventId);
+    renderCdnPanel(aggregateCdnEvents(events));
+    cdnStatusElement.textContent = `读取完成，截止 eventId ${snapshot.maxEventId}。`;
+  } catch (error) {
+    cdnStatusElement.textContent = `读取失败: ${display(error?.message || error)}`;
+    console.error('[BilibiliBuffer] CDN 面板读取失败', error);
+  } finally {
+    cdnButton.disabled = false;
   }
 });
 

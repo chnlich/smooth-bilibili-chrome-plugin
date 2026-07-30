@@ -50,3 +50,51 @@ button:disabled {
 [data-status] {
   color: #86efac;
 }
+
+.cdn-panel {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #334155;
+}
+
+.cdn-panel h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+[data-cdn-status] {
+  color: #fcd34d;
+}
+
+[data-cdn-summary] {
+  color: #f3f4f6;
+}
+
+.cdn-table-wrap {
+  overflow-x: auto;
+}
+
+.cdn-table {
+  min-width: 760px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.cdn-table th,
+.cdn-table td {
+  border: 1px solid #334155;
+  padding: 8px 10px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cdn-table th:first-child,
+.cdn-table td:first-child {
+  text-align: left;
+}
+
+.cdn-table th {
+  color: #cbd5e1;
+  background: #1f2d41;
+  font-weight: 600;
+}

@@ -177,6 +177,79 @@ async function tick() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+function logsPageFixture() {
+  const elements = new Map();
+  const documentObject = {
+    createElement(tagName) {
+      return {
+        tagName,
+        ownerDocument: documentObject,
+        children: [],
+        textContent: '',
+        append(...children) { this.children.push(...children); },
+        replaceChildren(...children) { this.children = [...children]; },
+      };
+    },
+    querySelector(selector) {
+      const element = elements.get(selector);
+      if (element === undefined) throw new Error(`missing test element: ${selector}`);
+      return element;
+    },
+  };
+  for (const selector of [
+    '[data-session-filter]',
+    '[data-export]',
+    '[data-status]',
+    '[data-session-details]',
+    '[data-cdn-refresh]',
+    '[data-cdn-status]',
+    '[data-cdn-summary]',
+    '[data-cdn-rows]',
+  ]) {
+    const listeners = new Map();
+    elements.set(selector, {
+      ownerDocument: documentObject,
+      value: '',
+      disabled: false,
+      textContent: '',
+      listeners,
+      addEventListener(type, listener) { listeners.set(type, listener); },
+      querySelector() { return { disabled: false }; },
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = [...children]; },
+      children: [],
+    });
+  }
+  const originalGlobals = {
+    document: globalThis.document,
+    window: globalThis.window,
+    chrome: globalThis.chrome,
+  };
+  const messages = [];
+  globalThis.document = documentObject;
+  globalThis.window = { location: { hash: '' } };
+  globalThis.chrome = {
+    runtime: {
+      async sendMessage(message) {
+        messages.push(message);
+        throw new Error('test page sendMessage must be configured before use');
+      },
+    },
+  };
+  return {
+    elements,
+    messages,
+    async importModule() {
+      return import(`../src/diagnostics/logs.js?unit=${Date.now()}-${Math.random()}`);
+    },
+    restore() {
+      globalThis.document = originalGlobals.document;
+      globalThis.window = originalGlobals.window;
+      globalThis.chrome = originalGlobals.chrome;
+    },
+  };
+}
+
 test('video buffered inventory uses only the contiguous range covering currentTime', () => {
   assert.equal(computeForwardInventory(12, [[{ start: 0, end: 30 }, { start: 40, end: 90 }]]), 18);
   assert.equal(computeForwardInventory(35, [[{ start: 0, end: 30 }, { start: 40, end: 90 }]]), 0);
@@ -624,6 +697,176 @@ test('bank race diagnostic slot and ttfb fields survive allowlist sanitisation',
     bytes: 0,
     result: 'aborted',
   });
+});
+
+test('CDN panel aggregates paired legs by source pathname and renders no media URL', async () => {
+  const fixture = logsPageFixture();
+  try {
+    const logs = await fixture.importModule();
+    assert.deepEqual(fixture.messages, []);
+    const event = ({ source, mirror, slot, chunkIndex, start, result, bytes, ttfbMs }) => ({
+      code: 'bank.fetch.chunk',
+      data: {
+        source,
+        mirror,
+        slot,
+        chunkIndex,
+        start,
+        result,
+        bytes,
+        ...(ttfbMs === undefined ? {} : { ttfbMs }),
+      },
+    });
+    const events = [
+      event({
+        source: 'https://cdn-a.example/media/seg.m4s?signature=secret-a',
+        mirror: 'cdn-a.example',
+        slot: 0,
+        chunkIndex: 0,
+        start: 0,
+        result: 'fetched',
+        bytes: 100,
+        ttfbMs: 10,
+      }),
+      event({
+        source: 'https://cdn-b.example/media/seg.m4s?signature=secret-b',
+        mirror: 'cdn-b.example',
+        slot: 1,
+        chunkIndex: 0,
+        start: 0,
+        result: 'lost_race',
+        bytes: 50,
+        ttfbMs: 20,
+      }),
+      event({
+        source: 'https://cdn-b.example/media/seg.m4s?signature=secret-c',
+        mirror: 'cdn-b.example',
+        slot: 1,
+        chunkIndex: 1,
+        start: 16,
+        result: 'lost_race',
+        bytes: 20,
+        ttfbMs: 40,
+      }),
+      event({
+        source: 'https://cdn-a.example/media/seg.m4s?signature=secret-d',
+        mirror: 'cdn-a.example',
+        slot: 0,
+        chunkIndex: 1,
+        start: 16,
+        result: 'fetched',
+        bytes: 80,
+        ttfbMs: 30,
+      }),
+      event({
+        source: 'https://cdn-a.example/media/seg.m4s?signature=secret-e',
+        mirror: 'cdn-a.example',
+        slot: 0,
+        chunkIndex: 2,
+        start: 32,
+        result: 'stalled',
+        bytes: 0,
+      }),
+      event({
+        source: 'https://cdn-c.example/media/seg.m4s?signature=secret-f',
+        mirror: 'cdn-c.example',
+        slot: 1,
+        chunkIndex: 2,
+        start: 32,
+        result: 'fetched',
+        bytes: 60,
+        ttfbMs: 50,
+      }),
+      event({
+        source: 'https://cdn-single.example/media/other.m4s?signature=secret-g',
+        mirror: 'cdn-single.example',
+        slot: 0,
+        chunkIndex: 3,
+        start: 48,
+        result: 'fetched',
+        bytes: 70,
+        ttfbMs: 5,
+      }),
+    ];
+    const summary = logs.aggregateCdnEvents(events);
+    assert.equal(summary.totalChunks, 4);
+    assert.equal(summary.pairedChunks, 3);
+    assert.equal(summary.pairCoverage, 0.75);
+    assert.equal(summary.wastedByteRatio, 70 / 310);
+    assert.deepEqual(summary.rows, [
+      {
+        mirror: 'cdn-a.example',
+        racesEntered: 3,
+        wins: 2,
+        winRate: 2 / 3,
+        ttfbP50: 20,
+        ttfbP90: 28,
+        stalled: 1,
+        bytesDelivered: 180,
+      },
+      {
+        mirror: 'cdn-b.example',
+        racesEntered: 2,
+        wins: 0,
+        winRate: 0,
+        ttfbP50: 30,
+        ttfbP90: 38,
+        stalled: 0,
+        bytesDelivered: 0,
+      },
+      {
+        mirror: 'cdn-c.example',
+        racesEntered: 1,
+        wins: 1,
+        winRate: 1,
+        ttfbP50: 50,
+        ttfbP90: 50,
+        stalled: 0,
+        bytesDelivered: 60,
+      },
+      {
+        mirror: 'cdn-single.example',
+        racesEntered: 0,
+        wins: 0,
+        winRate: 0,
+        ttfbP50: 5,
+        ttfbP90: 5,
+        stalled: 0,
+        bytesDelivered: 70,
+      },
+    ]);
+
+    const summaryElement = fixture.elements.get('[data-cdn-summary]');
+    const rowsElement = fixture.elements.get('[data-cdn-rows]');
+    logs.renderCdnPanel(summary, summaryElement, rowsElement);
+    const rendered = [summaryElement.textContent, ...rowsElement.children.flatMap(
+      (row) => row.children.map((cell) => cell.textContent),
+    )].join(' ');
+    assert.match(rendered, /cdn-a\.example/);
+    assert.doesNotMatch(rendered, /https?:\/\/|signature=secret/);
+
+    const pageEvents = [events.slice(0, 4), events.slice(4)];
+    globalThis.chrome.runtime.sendMessage = async (message) => {
+      fixture.messages.push(message);
+      if (message.type === 'logs:max-event-id') return { ok: true, maxEventId: 7 };
+      const page = pageEvents.shift();
+      return {
+        ok: true,
+        events: page,
+        hasMore: pageEvents.length > 0,
+        ...(pageEvents.length > 0 ? { nextAfterEventId: 4 } : { nextAfterEventId: 7 }),
+      };
+    };
+    await fixture.elements.get('[data-cdn-refresh]').listeners.get('click')();
+    assert.deepEqual(fixture.messages.map(({ type }) => type), [
+      'logs:max-event-id',
+      'logs:events-page',
+      'logs:events-page',
+    ]);
+    assert.equal(fixture.messages.some((message) => message.type === 'diagnostic:events'), false);
+  } finally {
+    fixture.restore();
+  }
 });
 
 test('media attribution fields pass through the existing privacy path', () => {
