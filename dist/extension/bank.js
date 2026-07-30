@@ -907,7 +907,7 @@
   }
 
   // src/bank/main.js
-  var MAX_PREFETCH_CONCURRENCY = 2;
+  var MAX_PREFETCH_CONCURRENCY = 4;
   function abortError() {
     return new DOMException("The operation was aborted", "AbortError");
   }

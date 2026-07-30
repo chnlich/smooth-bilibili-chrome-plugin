@@ -519,11 +519,111 @@ test('a cache hit supersedes an in-flight chunk before its new anchor', async ()
   bank.destroy();
 });
 
-test('prefetch concurrency never exceeds two active tasks', async () => {
+test('the default prefetch concurrency is four', () => {
+  const bank = new SegmentBank({ windowObject: windowFixture() });
+  assert.equal(bank.maxPrefetchConcurrency, 4);
+  bank.destroy();
+});
+
+test('default prefetch concurrency runs four active tasks and queues a fifth', async () => {
+  const config = configFor({ raceLegs: 1, stallMs: 1000 });
+  const pending = new Map();
+  const bank = new SegmentBank({
+    windowObject: windowFixture(),
+    config,
+    nativeFetch: async (_url, init) => {
+      const range = rangeFromInit(init);
+      return new Promise((resolve, reject) => {
+        pending.set(`${range.start}-${range.end}`, { resolve, reject });
+        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      });
+    },
+  });
+  const tasks = [0, 16, 32, 48, 64].map((start) => bank.getTask({
+    start,
+    end: start + 15,
+    chunkIndex: start / 16,
+    cacheKey: `${MEDIA_KEY}#${start / 16}`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  }));
+  await tick();
+  assert.equal(bank.maxPrefetchConcurrency, 4);
+  assert.equal(bank.activePrefetch.size, 4);
+  assert.equal(bank.queue.length, 1);
+  assert.equal(pending.has('64-79'), false);
+
+  pending.get('0-15').resolve(responseFor(0, 15, 80, bytesFor(0, 15)));
+  await tick();
+  assert.equal(bank.activePrefetch.size <= 4, true);
+  assert.equal(pending.has('64-79'), true);
+
+  bank.destroy();
+  const results = await Promise.allSettled(tasks);
+  assert.equal(results[0].status, 'fulfilled');
+  assert.equal(
+    results.slice(1).every((result) => result.status === 'rejected' && result.reason.name === 'AbortError'),
+    true,
+  );
+});
+
+test('default prefetch concurrency keeps two legs per in-flight chunk', async () => {
+  const config = configFor({ raceLegs: 2, stallMs: 1000 });
+  const calls = [];
+  const windowObject = windowFixture();
+  windowObject.__playinfo__ = playurlBody();
+  const bank = new SegmentBank({
+    windowObject,
+    config,
+    nativeFetch: (url, init) => {
+      const range = rangeFromInit(init);
+      calls.push({ url, range });
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      });
+    },
+  });
+  const tasks = [0, 16, 32, 48].map((start) => bank.getTask({
+    start,
+    end: start + 15,
+    chunkIndex: start / 16,
+    cacheKey: `${MEDIA_KEY}#${start / 16}`,
+  }, {
+    kind: 'prefetch',
+    url: MEDIA_URL,
+    credentials: 'same-origin',
+    videoKey: '/video/BVbank',
+  }));
+  await tick();
+
+  assert.equal(bank.activePrefetch.size, 4);
+  assert.equal(calls.length, 8);
+  const callsByRange = new Map();
+  for (const { range } of calls) {
+    const key = `${range.start}-${range.end}`;
+    callsByRange.set(key, (callsByRange.get(key) || 0) + 1);
+  }
+  assert.deepEqual([...callsByRange.values()].sort((left, right) => left - right), [2, 2, 2, 2]);
+  assert.equal(calls.filter(({ url }) => new URL(url).hostname === new URL(MEDIA_URL).hostname).length, 4);
+  assert.equal(calls.filter(({ url }) => new URL(url).hostname === new URL(PAIR_URL).hostname).length, 4);
+
+  bank.destroy();
+  const results = await Promise.allSettled(tasks);
+  assert.equal(
+    results.every((result) => result.status === 'rejected' && result.reason.name === 'AbortError'),
+    true,
+  );
+});
+
+test('explicit prefetch concurrency of two never exceeds two active tasks', async () => {
   const config = configFor({ stallMs: 1000 });
   const pending = new Map();
   const { bank } = createBank({
     config,
+    maxPrefetchConcurrency: 2,
     nativeFetch: async (_url, init) => {
       const range = rangeFromInit(init);
       return new Promise((resolve, reject) => {
@@ -623,6 +723,7 @@ test('memory storage is atomic and never exposes a half chunk after an invalid r
   const config = configFor();
   const { bank } = createBank({
     config,
+    maxPrefetchConcurrency: 2,
     nativeFetch: async () => responseFor(0, 15, 64, new Uint8Array(15)),
   });
   let fallbackCalls = 0;
@@ -678,11 +779,14 @@ test('non-2xx responses and network errors fail the intercepted player request',
     statusText: 'Unavailable',
     headers: { 'X-CDN': 'same' },
   });
-  const { bank } = createBank({ nativeFetch: async () => networkResponse });
+  const { bank } = createBank({ maxPrefetchConcurrency: 2, nativeFetch: async () => networkResponse });
   await assert.rejects(fetchThrough(bank), (error) => error.name === 'BankNetworkError');
 
   const networkError = new TypeError('cdn failed');
-  const failedBank = createBank({ nativeFetch: async () => { throw networkError; } }).bank;
+  const failedBank = createBank({
+    maxPrefetchConcurrency: 1,
+    nativeFetch: async () => { throw networkError; },
+  }).bank;
   await assert.rejects(fetchThrough(failedBank), (error) => error.name === 'BankNetworkError');
 });
 
@@ -738,6 +842,7 @@ test('a stalled stream is cancelled with the real bytes already received', async
   let streamController;
   const { bank, windowObject } = createBank({
     config,
+    maxPrefetchConcurrency: 2,
     timers,
     nativeFetch: async () => {
       const body = new ReadableStream({

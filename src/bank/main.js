@@ -26,7 +26,7 @@ import {
 } from './storage.js';
 import { createBankXMLHttpRequestClass } from './xhr.js';
 
-const MAX_PREFETCH_CONCURRENCY = 2;
+const MAX_PREFETCH_CONCURRENCY = 4;
 
 function abortError() {
   return new DOMException('The operation was aborted', 'AbortError');
