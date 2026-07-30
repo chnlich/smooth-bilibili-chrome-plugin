@@ -1501,7 +1501,7 @@ test('inline playinfo is reparsed after an in-place mutation and after freshness
 test('cyclic and throwing inline playinfo values cannot fail a successful chunk', async () => {
   const cases = [
     (() => {
-      const value = {};
+      const value = playurlBody();
       value.self = value;
       return value;
     })(),
@@ -1523,6 +1523,7 @@ test('cyclic and throwing inline playinfo values cannot fail a successful chunk'
     const originalError = console.error;
     console.error = (...args) => errors.push(args);
     let attempts;
+    let addressBookSize;
     try {
       await bank.getTask({
         start: 0,
@@ -1536,12 +1537,14 @@ test('cyclic and throwing inline playinfo values cannot fail a successful chunk'
         videoKey: '/video/BVbank',
       });
       attempts = bank.stateFor(MEDIA_KEY).chunkAttempts.has(0);
+      addressBookSize = bank.addressBook.size;
     } finally {
       console.error = originalError;
       bank.destroy();
     }
     assert.equal(calls.length, 1);
     assert.equal(attempts, false);
+    assert.equal(addressBookSize, 0);
     assert.equal(errors.length, 1);
     if (value === 'throwing getter') assert.equal(errors[0][1], thrown);
   }

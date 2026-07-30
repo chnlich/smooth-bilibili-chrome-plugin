@@ -264,9 +264,11 @@ export class SegmentBank {
   }
 
   readInlinePlayinfo() {
+    const addressBook = new Map(this.addressBook);
     try {
       this.observePlayurlData(this.windowObject.__playinfo__);
     } catch (error) {
+      this.addressBook = addressBook;
       console.error('[BilibiliBuffer] __playinfo__ 地址簿读取失败', error);
     }
   }
