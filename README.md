@@ -11,7 +11,9 @@
 
 标签页转入后台约 10 秒后，Chrome 会完全停止视频解码，只保留音频。这是 Chrome 的 background video track optimization：MSE 播放且含音轨、关键帧间隔小于 5 秒时，隐藏标签页的视频轨会被禁用以省电。实测（BV12hGK6bELA，系统 Chrome，专用 profile）：隐藏后 10.0 秒解码停止并持续 50 秒，其间 `getVideoPlaybackQuality().totalVideoFrames` 一帧不动、`droppedVideoFrames` 保持 0、`currentTime` 正常前进、`readyState` 恒为 4、缓冲余量 60–73 秒，且页面仍在向 SourceBuffer 追加数据。
 
-切回前台时解码管线被拆掉重建：`totalVideoFrames` 归零重新计数（实测 938 → 97），`video.buffered` 覆盖当前播放点的余量从 69.3 秒塌到 11.5 秒后重新回填。
+视频轨被禁用这件事可以在 CDP 的 Media 域直接看到：隐藏后 10.6 秒出现一条 `kVideoTrackChange`，`video_track_selected` 变为 `unset`。
+
+切回前台时是页面自己重建播放器，不是浏览器重建解码管线：页面换掉 `<video>` 元素、新建一个 MediaSource，再跳回原播放位置。因此 `totalVideoFrames` 归零重新计数（实测 938 → 97），`video.buffered` 覆盖当前播放点的余量从 69.3 秒塌到 11.5 秒后重新回填。
 
 读诊断日志时据此判读：解码帧计数停住不等于故障，先看同一时刻附近的 `video.visibility_changed`。扩展不改变这一行为，也不试图绕过它。
 

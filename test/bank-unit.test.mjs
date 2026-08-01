@@ -20,6 +20,7 @@ import {
   selectEvictions,
 } from '../src/bank/logic.js';
 import { BankFallbackError } from '../src/bank/errors.js';
+import { createRouteIdentity } from '../src/diagnostics/client.js';
 import {
   enforceMemoryLimit,
   readMemoryRange,
@@ -89,12 +90,12 @@ function manualTimers() {
   };
 }
 
-function windowFixture({ timers } = {}) {
+function windowFixture({ timers, location = new URL('https://www.bilibili.com/video/BVbank') } = {}) {
   const listeners = new Map();
   const realTimers = new Set();
   const messages = [];
   return {
-    location: new URL('https://www.bilibili.com/video/BVbank'),
+    location,
     Response,
     Event,
     Blob,
@@ -160,8 +161,9 @@ function createBank({
   timers,
   now,
   playinfo,
+  location,
 } = {}) {
-  const windowObject = windowFixture({ timers });
+  const windowObject = windowFixture({ timers, location });
   if (playinfo !== undefined) windowObject.__playinfo__ = playinfo;
   const calls = [];
   const fetchFunction = nativeFetch || (async (url, init) => {
@@ -327,6 +329,37 @@ test('memory hit returns exact bytes and canonical response fields while refilli
     { start: 16, end: 31 },
     { start: 32, end: 47 },
   ]);
+});
+
+test('a query-only route rewrite preserves stored chunks', async () => {
+  const config = configFor();
+  const { bank, windowObject, calls } = createBank({
+    config,
+    location: new URL('https://www.bilibili.com/video/BVbank/'),
+  });
+  putChunk(bank, 0, config);
+  windowObject.location = new URL(
+    'https://www.bilibili.com/video/BVbank/?vd_source=abc&spm_id_from=333.788',
+  );
+
+  const response = await fetchThrough(bank, MEDIA_URL, { headers: { Range: 'bytes=4-6' } });
+
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [4, 5, 6]);
+  assert.equal(calls.some(({ range }) => range.start === 0), false);
+  assert.equal(bank.windowObject.messages.some(
+    (message) => message.code === 'bank.serve' && message.data.reason === 'stored_range',
+  ), true);
+  bank.destroy();
+});
+
+test('diagnostics and download layers share the route identity', () => {
+  const locationObject = new URL(
+    'https://www.bilibili.com/video/BVbank/?p=2&vd_source=abc',
+  );
+  const { bank } = createBank({ location: locationObject });
+
+  assert.equal(bank.videoIdentity, JSON.stringify(createRouteIdentity(locationObject)));
+  bank.destroy();
 });
 
 test('a cache miss is served by the extension fetch and never passes to the original fetch', async () => {
@@ -930,6 +963,51 @@ test('leaving the video route releases chunks', async () => {
   windowObject.location = new URL('https://www.bilibili.com/');
   await bank.prefetch();
   assert.equal(bank.chunks.size, 0);
+});
+
+test('changing bvid releases chunks', async () => {
+  const config = configFor();
+  const { bank, windowObject } = createBank({
+    config,
+    location: new URL('https://www.bilibili.com/video/BVbank/'),
+  });
+  putChunk(bank, 0, config);
+  windowObject.location = new URL('https://www.bilibili.com/video/BVother/');
+
+  await bank.prefetch();
+
+  assert.equal(bank.chunks.size, 0);
+  bank.destroy();
+});
+
+test('changing part releases chunks', async () => {
+  const config = configFor();
+  const { bank, windowObject } = createBank({
+    config,
+    location: new URL('https://www.bilibili.com/video/BVbank/?p=1'),
+  });
+  putChunk(bank, 0, config);
+  windowObject.location = new URL('https://www.bilibili.com/video/BVbank/?p=2');
+
+  await bank.prefetch();
+
+  assert.equal(bank.chunks.size, 0);
+  bank.destroy();
+});
+
+test('changing watch-later item releases chunks', async () => {
+  const config = configFor();
+  const { bank, windowObject } = createBank({
+    config,
+    location: new URL('https://www.bilibili.com/list/watchlater/item-a'),
+  });
+  putChunk(bank, 0, config);
+  windowObject.location = new URL('https://www.bilibili.com/list/watchlater/item-b');
+
+  await bank.prefetch();
+
+  assert.equal(bank.chunks.size, 0);
+  bank.destroy();
 });
 
 test('one prefetch call refills the anchored window after each successful store', async () => {

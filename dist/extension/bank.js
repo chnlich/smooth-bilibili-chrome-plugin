@@ -195,6 +195,19 @@
     }
   };
 
+  // src/route.js
+  function routeIdentity(locationObject) {
+    const pathname = locationObject.pathname || "/";
+    const part = new URLSearchParams(locationObject.search || "").get("p") || void 0;
+    if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/video/")) {
+      return { routeKind: "video", bvid: pathname.split("/")[2] || void 0, part };
+    }
+    if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/list/watchlater")) {
+      return { routeKind: "video", watchLaterItem: pathname.split("/")[3] || void 0, part };
+    }
+    return { routeKind: "other", part };
+  }
+
   // src/bank/contract.js
   var BANK_ENABLED_ATTRIBUTE = "data-bilibili-buffer-bank-enabled";
   var BANK_MESSAGE_NAMESPACE = "bilibili-buffer:segment-bank-v1";
@@ -926,7 +939,7 @@
   }
   function videoIdentityFor(locationObject) {
     if (locationObject === void 0) return void 0;
-    return `${locationObject.pathname}${locationObject.search || ""}`;
+    return JSON.stringify(routeIdentity(locationObject));
   }
   function playurlRepresentationUrls(value) {
     if (value === null || typeof value !== "object" || typeof value.baseUrl !== "string") return void 0;

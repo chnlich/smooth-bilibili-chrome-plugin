@@ -1,6 +1,7 @@
 import { BANK_CONFIG } from '../constants.js';
 import { scrubUrl } from '../diagnostics/privacy.js';
 import { BankFallbackError, BankNetworkError } from './errors.js';
+import { routeIdentity } from '../route.js';
 import {
   BANK_ENABLED_ATTRIBUTE,
   BANK_DIAGNOSTIC_MESSAGE_TYPE,
@@ -46,7 +47,7 @@ function mirrorForUrl(url) {
 
 function videoIdentityFor(locationObject) {
   if (locationObject === undefined) return undefined;
-  return `${locationObject.pathname}${locationObject.search || ''}`;
+  return JSON.stringify(routeIdentity(locationObject));
 }
 
 function playurlRepresentationUrls(value) {

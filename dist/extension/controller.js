@@ -465,7 +465,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-e629e8064b2bd0aef2a81d3b" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-98843e355a36bf7754c43e81" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -612,6 +612,19 @@
     };
   }
 
+  // src/route.js
+  function routeIdentity(locationObject) {
+    const pathname = locationObject.pathname || "/";
+    const part = new URLSearchParams(locationObject.search || "").get("p") || void 0;
+    if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/video/")) {
+      return { routeKind: "video", bvid: pathname.split("/")[2] || void 0, part };
+    }
+    if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/list/watchlater")) {
+      return { routeKind: "video", watchLaterItem: pathname.split("/")[3] || void 0, part };
+    }
+    return { routeKind: "other", part };
+  }
+
   // src/diagnostics/client.js
   var PERSIST_RETRY_BASE_DELAY_MS = 100;
   var PERSIST_RETRY_MAX_DELAY_MS = 5e3;
@@ -650,17 +663,6 @@
   }
   function eventNow() {
     return /* @__PURE__ */ new Date();
-  }
-  function routeIdentity(locationObject) {
-    const pathname = locationObject.pathname || "/";
-    const part = new URLSearchParams(locationObject.search || "").get("p") || void 0;
-    if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/video/")) {
-      return { routeKind: "video", bvid: pathname.split("/")[2] || void 0, part };
-    }
-    if (locationObject.hostname === "www.bilibili.com" && pathname.startsWith("/list/watchlater")) {
-      return { routeKind: "video", watchLaterItem: pathname.split("/")[3] || void 0, part };
-    }
-    return { routeKind: "other", part };
   }
   function contextFields(context) {
     const result = {};
@@ -910,9 +912,6 @@
       this.destroyed = true;
     }
   };
-  function createRouteIdentity(locationObject) {
-    return routeIdentity(locationObject);
-  }
 
   // src/diagnostics/media.js
   var CLOCK_ADVANCE_THRESHOLD_SECONDS = 0.2;
@@ -2433,7 +2432,7 @@
       const changedRoute = this.routeKey !== "";
       await this.teardownActive();
       if (changedRoute) {
-        this.diagnostics?.startSession(createRouteIdentity(this.windowObject.location));
+        this.diagnostics?.startSession(routeIdentity(this.windowObject.location));
         this.diagnostics?.log("route.changed", { reason: "location_changed" });
       }
       if (generation !== this.routeGeneration || this.destroyed || routeAbort.signal.aborted) return;

@@ -2,6 +2,7 @@ import { DIAGNOSTIC_MESSAGE_VERSION, isSafePersistErrorCode } from './catalog.js
 import { normalizeEventForStorage } from './privacy.js';
 import { createSessionIdentity } from './session.js';
 import { serializeError } from '../extension/bridge-contract.js';
+import { routeIdentity } from '../route.js';
 
 const PERSIST_RETRY_BASE_DELAY_MS = 100;
 const PERSIST_RETRY_MAX_DELAY_MS = 5000;
@@ -43,18 +44,6 @@ function runtimeSendMessage(runtimeObject, message) {
 
 function eventNow() {
   return new Date();
-}
-
-function routeIdentity(locationObject) {
-  const pathname = locationObject.pathname || '/';
-  const part = new URLSearchParams(locationObject.search || '').get('p') || undefined;
-  if (locationObject.hostname === 'www.bilibili.com' && pathname.startsWith('/video/')) {
-    return { routeKind: 'video', bvid: pathname.split('/')[2] || undefined, part };
-  }
-  if (locationObject.hostname === 'www.bilibili.com' && pathname.startsWith('/list/watchlater')) {
-    return { routeKind: 'video', watchLaterItem: pathname.split('/')[3] || undefined, part };
-  }
-  return { routeKind: 'other', part };
 }
 
 function contextFields(context) {
@@ -323,6 +312,4 @@ export class DiagnosticsClient {
   }
 }
 
-export function createRouteIdentity(locationObject) {
-  return routeIdentity(locationObject);
-}
+export { routeIdentity as createRouteIdentity };
