@@ -114,18 +114,24 @@ if (typeof SourceBuffer !== 'undefined' && typeof SourceBuffer.prototype?.append
   const originalAppendBuffer = SourceBuffer.prototype.appendBuffer;
   SourceBuffer.prototype.appendBuffer = function smoothAppendBuffer(...args) {
     const startedAt = window.performance.now();
+    let result;
     try {
-      const result = originalAppendBuffer.call(this, ...args);
-      appends += 1;
-      lastAppendAt = startedAt;
-      appendStartedAt.set(this, startedAt);
-      return result;
+      result = originalAppendBuffer.call(this, ...args);
     } catch (error) {
       const name = typeof error?.name === 'string' && error.name.length > 0 ? error.name : 'UnknownError';
       appendErrors[name] = (appendErrors[name] || 0) + 1;
       dispatchDiagnostics();
       throw error;
     }
+    appends += 1;
+    lastAppendAt = startedAt;
+    appendStartedAt.set(this, startedAt);
+    try {
+      dispatchUpdateEndDiagnostics();
+    } catch (error) {
+      console.error('[BilibiliBuffer] source buffer diagnostic dispatch failed', error);
+    }
+    return result;
   };
 }
 

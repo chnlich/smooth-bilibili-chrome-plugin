@@ -173,3 +173,19 @@ test('append diagnostics count successful calls and measure their updateend', ()
   assert.equal(failedPublish.appends, 1);
   assert.equal(failedPublish.lastAppendAt, 10000);
 });
+
+test('successful append diagnostics publish before its updateend arrives', () => {
+  const mediaSource = new FakeMediaSource();
+  currentTimeMilliseconds = 14000;
+  const sourceBuffer = mediaSource.addSourceBuffer('video/mp4');
+  const appendsBefore = diagnosticPublishes.at(-1).appends;
+  diagnosticPublishes.length = 0;
+
+  sourceBuffer.appendBuffer(new Uint8Array([1]));
+  advanceTime(1000);
+
+  const published = diagnosticPublishes.at(-1);
+  assert.equal(published.appends, appendsBefore + 1);
+  assert.equal(published.lastAppendAt, 14000);
+  assert.equal(published.updateEndMsMax, null);
+});
