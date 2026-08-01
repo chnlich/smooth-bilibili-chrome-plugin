@@ -62,6 +62,7 @@
     "video.replaced",
     "video.destroyed",
     "video.source_replaced",
+    "video.visibility_changed",
     "video.core_replaced",
     "video.no_video",
     "media.sample",
@@ -113,6 +114,7 @@
       "source",
       "previousSource",
       "state",
+      "previousState",
       "targetSeconds",
       "actualSeconds",
       "peakSeconds",
@@ -138,7 +140,9 @@
       "sourceBufferRanges",
       "mediaSourceState",
       "appendErrors",
-      "removeStats"
+      "removeStats",
+      "presented",
+      "stallDetail"
     ]),
     resource: Object.freeze([
       "name",
@@ -306,6 +310,26 @@
       corrupted: finiteOrUnknown(value.corrupted)
     };
   }
+  function safeReportedMetric(value) {
+    if (value !== null && typeof value === "object" && !Array.isArray(value) && value.value === 0 && value.reportedBy === "browser") {
+      return { value: 0, reportedBy: "browser" };
+    }
+    return browserMetric(value);
+  }
+  function safeStallDetail(value) {
+    if (value === UNKNOWN_VALUE) return value;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
+    return {
+      presentedTotal: safeReportedMetric(value.presentedTotal),
+      maxFrameGapMs: finiteOrUnknown(value.maxFrameGapMs),
+      maxFrameGapEndedAgoMs: finiteOrUnknown(value.maxFrameGapEndedAgoMs),
+      processingMsMax: safeReportedMetric(value.processingMsMax),
+      processingMsMedian: safeReportedMetric(value.processingMsMedian),
+      appends: finiteOrUnknown(value.appends),
+      lastAppendAgoMs: finiteOrUnknown(value.lastAppendAgoMs),
+      updateEndMsMax: finiteOrUnknown(value.updateEndMsMax)
+    };
+  }
   function safeRemoveStats(value) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
     return {
@@ -334,6 +358,7 @@
     if (field === "appendErrors") return safeAppendErrors(value);
     if (field === "removeStats") return safeRemoveStats(value);
     if (field === "resolution") return safeResolution(value);
+    if (field === "stallDetail") return safeStallDetail(value);
     if (field === "transferSize" || field === "encodedBodySize" || field === "decodedBodySize" || field === "startTime" || field === "duration" || field === "responseStart" || field === "responseEnd") {
       return browserMetric(value);
     }

@@ -83,6 +83,75 @@ function mediaVideo(source = 'https://media.example/video-1.m3u8') {
   return video;
 }
 
+function mediaRecorderFixture({ supportsFrameCallback = true, visibilityState = 'visible' } = {}) {
+  const video = mediaVideo('https://media.example/diagnostic-video');
+  const documentListeners = new Map();
+  let shimDiagnostics;
+  let now = 0;
+  let frameCallback;
+  const intervalCallbacks = [];
+  const events = [];
+  const documentObject = {
+    visibilityState,
+    documentElement: {
+      getAttribute(name) {
+        assert.equal(name, 'data-bilibili-buffer-shim-diagnostics');
+        return shimDiagnostics === undefined ? null : JSON.stringify(shimDiagnostics);
+      },
+    },
+    addEventListener(name, listener) {
+      const listeners = documentListeners.get(name) || new Set();
+      listeners.add(listener);
+      documentListeners.set(name, listeners);
+    },
+    removeEventListener(name, listener) {
+      documentListeners.get(name)?.delete(listener);
+    },
+    emit(name) {
+      for (const listener of documentListeners.get(name) || []) listener();
+    },
+  };
+  video.ownerDocument = documentObject;
+  if (supportsFrameCallback) {
+    video.requestVideoFrameCallback = (callback) => {
+      frameCallback = callback;
+      return 1;
+    };
+  }
+  const recorder = new MediaEventRecorder({
+    video,
+    runtimeObject: {
+      setInterval(callback) {
+        intervalCallbacks.push(callback);
+        return callback;
+      },
+      clearInterval() {},
+    },
+    now: () => now,
+    logger: {
+      log(code, data, error, context) {
+        events.push({ code, data, error, context });
+      },
+    },
+  });
+  return {
+    video,
+    documentObject,
+    recorder,
+    events,
+    setTime(value) { now = value; },
+    setShimDiagnostics(value) { shimDiagnostics = value; },
+    emitFrame(timestamp, metadata) {
+      assert.notEqual(frameCallback, undefined);
+      frameCallback(timestamp, metadata);
+    },
+    sample() {
+      recorder.sample();
+    },
+    intervalCallbacks,
+  };
+}
+
 function nativeOwnership(video) {
   return {
     paused: video.paused,
@@ -590,6 +659,186 @@ test('every catalog media event records its own eventType while samples remain s
   assert.equal(readMediaFacts(video, 'volumechange').eventType, 'volumechange');
 });
 
+test('media frame aggregation reports presented deltas and resets each interval', () => {
+  const fixture = mediaRecorderFixture();
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  fixture.emitFrame(100, { presentedFrames: 10 });
+  fixture.emitFrame(200, { presentedFrames: 13 });
+  fixture.setTime(1000);
+  fixture.sample();
+  fixture.setTime(2000);
+  fixture.sample();
+
+  const samples = fixture.events.filter((event) => event.code === 'media.sample');
+  assert.equal(samples[0].data.presented, 3);
+  assert.equal(samples[1].data.presented, 0);
+  assert.equal(Object.hasOwn(samples[0].data, 'stallDetail'), false);
+  assert.equal(Object.hasOwn(samples[0].data, 'appends'), false);
+  fixture.recorder.destroy();
+});
+
+test('media frame gap keeps its full duration across record boundaries and locates recovery', () => {
+  const fixture = mediaRecorderFixture();
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  fixture.emitFrame(0, { presentedFrames: 1 });
+  fixture.setTime(400);
+  fixture.sample();
+  fixture.setTime(1000);
+  fixture.sample();
+  const frameless = fixture.events.at(-1).data.stallDetail;
+  assert.equal(frameless.maxFrameGapMs, 1000);
+  assert.equal(frameless.maxFrameGapEndedAgoMs, '未提供');
+
+  fixture.emitFrame(1800, { presentedFrames: 2 });
+  fixture.setTime(2000);
+  fixture.sample();
+  const recovery = fixture.events.at(-1).data.stallDetail;
+  assert.equal(recovery.maxFrameGapMs, 1800);
+  assert.equal(recovery.maxFrameGapEndedAgoMs, 200);
+  assert.equal(2000 - recovery.maxFrameGapEndedAgoMs, 1800);
+  fixture.recorder.destroy();
+});
+
+test('each stall predicate arm fires independently', () => {
+  const advancingClock = mediaRecorderFixture();
+  advancingClock.recorder.start();
+  advancingClock.events.length = 0;
+  advancingClock.video.currentTime = 10.3;
+  advancingClock.setTime(1000);
+  advancingClock.sample();
+  assert.equal(typeof advancingClock.events.at(-1).data.stallDetail, 'object');
+  advancingClock.recorder.destroy();
+
+  const lowReadyState = mediaRecorderFixture();
+  lowReadyState.recorder.start();
+  lowReadyState.events.length = 0;
+  lowReadyState.video.readyState = 2;
+  lowReadyState.setTime(1000);
+  lowReadyState.sample();
+  assert.equal(typeof lowReadyState.events.at(-1).data.stallDetail, 'object');
+  lowReadyState.recorder.destroy();
+
+  const longGap = mediaRecorderFixture();
+  longGap.recorder.start();
+  longGap.events.length = 0;
+  longGap.emitFrame(0, { presentedFrames: 1 });
+  longGap.setTime(0);
+  longGap.sample();
+  longGap.setTime(600);
+  longGap.sample();
+  assert.equal(longGap.events.at(-1).data.stallDetail.maxFrameGapMs, 600);
+  longGap.recorder.destroy();
+});
+
+test('normal intervals omit stallDetail and clear interval quantities before recovery', () => {
+  const fixture = mediaRecorderFixture();
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  fixture.emitFrame(0, { presentedFrames: 1, processingDuration: 99 });
+  fixture.emitFrame(400, { presentedFrames: 2, processingDuration: 99 });
+  fixture.setTime(400);
+  fixture.sample();
+  assert.equal(Object.hasOwn(fixture.events.at(-1).data, 'stallDetail'), false);
+
+  fixture.video.readyState = 2;
+  fixture.setTime(600);
+  fixture.sample();
+  const detail = fixture.events.at(-1).data.stallDetail;
+  assert.equal(detail.maxFrameGapMs, 200);
+  assert.equal(detail.processingMsMax, '未提供');
+  assert.equal(detail.processingMsMedian, '未提供');
+  fixture.recorder.destroy();
+});
+
+test('processing duration aggregation excludes missing values and computes the even median', () => {
+  const fixture = mediaRecorderFixture();
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  fixture.emitFrame(0, { presentedFrames: 1, processingDuration: 0.004 });
+  fixture.emitFrame(100, { presentedFrames: 2 });
+  fixture.emitFrame(200, { presentedFrames: 3, processingDuration: 0.010 });
+  fixture.emitFrame(300, { presentedFrames: 4, processingDuration: 0.006 });
+  fixture.emitFrame(400, { presentedFrames: 5, processingDuration: 0.008 });
+  fixture.video.readyState = 2;
+  fixture.setTime(400);
+  fixture.sample();
+  const detail = fixture.events.at(-1).data.stallDetail;
+  assert.equal(detail.processingMsMax, 10);
+  assert.equal(detail.processingMsMedian, 7);
+  fixture.recorder.destroy();
+});
+
+test('missing requestVideoFrameCallback degrades presented without blocking readyState diagnostics', () => {
+  const fixture = mediaRecorderFixture({ supportsFrameCallback: false });
+  fixture.recorder.start();
+  fixture.events.length = 0;
+  fixture.video.readyState = 2;
+  fixture.setTime(1000);
+  assert.doesNotThrow(() => fixture.sample());
+  const data = fixture.events.at(-1).data;
+  assert.equal(data.presented, '未提供');
+  assert.equal(typeof data.stallDetail, 'object');
+  assert.equal(data.stallDetail.presentedTotal, '未提供');
+  fixture.recorder.destroy();
+});
+
+test('append diagnostics use cumulative count, latest success age, and one updateend interval', () => {
+  const fixture = mediaRecorderFixture();
+  fixture.recorder.start();
+  fixture.events.length = 0;
+  fixture.video.readyState = 2;
+  fixture.setTime(100);
+  fixture.sample();
+  let detail = fixture.events.at(-1).data.stallDetail;
+  assert.equal(detail.appends, '未提供');
+  assert.equal(detail.lastAppendAgoMs, '未提供');
+  assert.equal(detail.updateEndMsMax, '未提供');
+
+  fixture.setShimDiagnostics({
+    appends: 3,
+    lastAppendAt: 900,
+    updateEndMsMax: 37,
+    updateEndAt: 800,
+  });
+  fixture.setTime(1000);
+  fixture.sample();
+  detail = fixture.events.at(-1).data.stallDetail;
+  assert.equal(detail.appends, 3);
+  assert.equal(detail.lastAppendAgoMs, 100);
+  assert.equal(detail.updateEndMsMax, 37);
+
+  fixture.setTime(2000);
+  fixture.sample();
+  detail = fixture.events.at(-1).data.stallDetail;
+  assert.equal(detail.appends, 3);
+  assert.equal(detail.lastAppendAgoMs, 1100);
+  assert.equal(detail.updateEndMsMax, '未提供');
+  fixture.recorder.destroy();
+});
+
+test('visibility records initial and changed states without copying state to media samples', () => {
+  const fixture = mediaRecorderFixture({ visibilityState: 'visible' });
+  fixture.recorder.start();
+  const startup = fixture.events.find((event) => event.code === 'video.visibility_changed');
+  assert.deepEqual(startup.data, { state: 'visible', previousState: '未提供' });
+
+  fixture.documentObject.visibilityState = 'hidden';
+  fixture.documentObject.emit('visibilitychange');
+  const changed = fixture.events.at(-1);
+  assert.equal(changed.code, 'video.visibility_changed');
+  assert.deepEqual(changed.data, { state: 'hidden', previousState: 'visible' });
+  const sample = fixture.events.find((event) => event.code === 'media.sample');
+  assert.equal(Object.hasOwn(sample.data, 'state'), false);
+  assert.equal(Object.hasOwn(sample.data, 'previousState'), false);
+  fixture.recorder.destroy();
+});
+
 test('native numeric MediaError code survives media.error persistence with the fixed error schema', async () => {
   const video = mediaVideo('https://media.example/media-error');
   const sent = [];
@@ -639,6 +888,7 @@ test('diagnostic catalog covers all required media events and preserves browser-
   assert.ok(MEDIA_EVENT_NAMES.includes('volumechange'));
   assert.equal(MEDIA_EVENT_NAMES.includes('timeupdate'), false);
   assert.equal(EVENT_CODES.includes('media.timeupdate'), false);
+  assert.equal(EVENT_CODES.includes('video.visibility_changed'), true);
   for (const name of MEDIA_EVENT_NAMES) assert.ok(EVENT_CODES.includes(`media.${name}`));
   assert.deepEqual(browserMetric(0), { value: 0, reportedBy: 'browser' });
   assert.equal(scrubUrl('https://cdn.example/media.m4s?signature=secret#fragment'), 'https://cdn.example/media.m4s');
@@ -674,6 +924,45 @@ test('diagnostic catalog covers all required media events and preserves browser-
     sanitizeEventData('log.persist.degraded', { code: 'free text with secret' }).code,
     '未提供',
   );
+});
+
+test('stall detail survives its dedicated privacy sanitizer field by field', () => {
+  const sanitized = sanitizeEventData('media.sample', {
+    presented: 0,
+    stallDetail: {
+      presentedTotal: { value: 0, reportedBy: 'browser' },
+      maxFrameGapMs: 601,
+      maxFrameGapEndedAgoMs: 12,
+      processingMsMax: 8.5,
+      processingMsMedian: 4.25,
+      appends: 17,
+      lastAppendAgoMs: 33,
+      updateEndMsMax: 6.75,
+    },
+  });
+  assert.equal(sanitized.presented, 0);
+  assert.deepEqual(sanitized.stallDetail.presentedTotal, { value: 0, reportedBy: 'browser' });
+  assert.equal(sanitized.stallDetail.maxFrameGapMs, 601);
+  assert.equal(sanitized.stallDetail.maxFrameGapEndedAgoMs, 12);
+  assert.equal(sanitized.stallDetail.processingMsMax, 8.5);
+  assert.equal(sanitized.stallDetail.processingMsMedian, 4.25);
+  assert.equal(sanitized.stallDetail.appends, 17);
+  assert.equal(sanitized.stallDetail.lastAppendAgoMs, 33);
+  assert.equal(sanitized.stallDetail.updateEndMsMax, 6.75);
+});
+
+test('legacy media records without the additive fields remain valid', () => {
+  assert.doesNotThrow(() => normalizeEventForStorage({
+    sessionId: 'legacy-media-session',
+    sequence: 1,
+    wallTime: '2026-07-20T00:00:00.000Z',
+    elapsedMs: 0,
+    code: 'media.sample',
+    data: { eventType: 'sample', currentTime: 10 },
+  }));
+  assert.deepEqual(sanitizeEventData('media.sample', { eventType: 'sample' }), {
+    eventType: 'sample',
+  });
 });
 
 test('bank race diagnostic slot and ttfb fields survive allowlist sanitisation', () => {

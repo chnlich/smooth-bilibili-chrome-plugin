@@ -5,7 +5,12 @@ const stats = {
   removeCalls: 0,
 };
 const sourceBufferTracks = new WeakMap();
+const appendStartedAt = new WeakMap();
 const appendErrors = Object.create(null);
+let appends = 0;
+let lastAppendAt;
+let updateEndMsMax;
+let lastUpdateEndAt;
 let activeSource;
 
 function readSourceBufferRanges(sourceBuffer) {
@@ -39,7 +44,12 @@ function publishDiagnostics() {
       removeStats: {
         removeCalls: stats.removeCalls,
       },
+      appends,
+      lastAppendAt: lastAppendAt ?? null,
+      updateEndMsMax: updateEndMsMax ?? null,
+      updateEndAt: lastUpdateEndAt ?? null,
     }));
+    updateEndMsMax = undefined;
   } catch (error) {
     console.error('[BilibiliBuffer] source buffer diagnostic dispatch failed', error);
   }
@@ -74,13 +84,24 @@ function dispatchUpdateEndDiagnostics() {
   }
 }
 
+function recordUpdateEnd() {
+  const startedAt = appendStartedAt.get(this);
+  if (Number.isFinite(startedAt)) {
+    const duration = Math.max(0, window.performance.now() - startedAt);
+    updateEndMsMax = updateEndMsMax === undefined ? duration : Math.max(updateEndMsMax, duration);
+    lastUpdateEndAt = window.performance.now();
+    appendStartedAt.delete(this);
+  }
+  dispatchUpdateEndDiagnostics();
+}
+
 if (typeof MediaSource !== 'undefined' && typeof MediaSource.prototype?.addSourceBuffer === 'function') {
   const originalAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
   MediaSource.prototype.addSourceBuffer = function smoothAddSourceBuffer(mimeType) {
     const sourceBuffer = originalAddSourceBuffer.call(this, mimeType);
     activeSource = this;
     sourceBufferTracks.set(sourceBuffer, String(mimeType).split(';', 1)[0]);
-    sourceBuffer.addEventListener('updateend', dispatchUpdateEndDiagnostics);
+    sourceBuffer.addEventListener('updateend', recordUpdateEnd);
     for (const eventName of ['sourceopen', 'sourceended', 'sourceclose']) {
       this.addEventListener(eventName, dispatchDiagnostics);
     }
@@ -92,8 +113,13 @@ if (typeof MediaSource !== 'undefined' && typeof MediaSource.prototype?.addSourc
 if (typeof SourceBuffer !== 'undefined' && typeof SourceBuffer.prototype?.appendBuffer === 'function') {
   const originalAppendBuffer = SourceBuffer.prototype.appendBuffer;
   SourceBuffer.prototype.appendBuffer = function smoothAppendBuffer(...args) {
+    const startedAt = window.performance.now();
     try {
-      return originalAppendBuffer.call(this, ...args);
+      const result = originalAppendBuffer.call(this, ...args);
+      appends += 1;
+      lastAppendAt = startedAt;
+      appendStartedAt.set(this, startedAt);
+      return result;
     } catch (error) {
       const name = typeof error?.name === 'string' && error.name.length > 0 ? error.name : 'UnknownError';
       appendErrors[name] = (appendErrors[name] || 0) + 1;

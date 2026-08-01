@@ -44,7 +44,13 @@ class FakeSourceBuffer {
     for (const listener of this.listeners.get(event.type) || []) listener.call(this, event);
   }
 
-  appendBuffer() {}
+  appendBuffer() {
+    if (this.appendError !== undefined) {
+      const error = this.appendError;
+      this.appendError = undefined;
+      throw error;
+    }
+  }
 
   remove(start, end) {
     this.removeCalls.push([start, end]);
@@ -141,4 +147,29 @@ test('remove forwards exact arguments and only records the native call', () => {
     removeCalls: statsBefore.removeCalls + 1,
   });
   assert.equal(updateEndDispatches, 0);
+});
+
+test('append diagnostics count successful calls and measure their updateend', () => {
+  const mediaSource = new FakeMediaSource();
+  currentTimeMilliseconds = 10000;
+  const sourceBuffer = mediaSource.addSourceBuffer('video/mp4');
+  diagnosticPublishes.length = 0;
+
+  sourceBuffer.appendBuffer(new Uint8Array([1]));
+  currentTimeMilliseconds = 10040;
+  sourceBuffer.dispatchEvent({ type: 'updateend' });
+  advanceTime(960);
+
+  const published = diagnosticPublishes.at(-1);
+  assert.equal(published.appends, 1);
+  assert.equal(published.lastAppendAt, 10000);
+  assert.equal(published.updateEndMsMax, 40);
+  assert.equal(published.updateEndAt, 10040);
+
+  currentTimeMilliseconds = 12000;
+  sourceBuffer.appendError = Object.assign(new Error('buffer full'), { name: 'QuotaExceededError' });
+  assert.throws(() => sourceBuffer.appendBuffer(new Uint8Array([2])), /buffer full/);
+  const failedPublish = diagnosticPublishes.at(-1);
+  assert.equal(failedPublish.appends, 1);
+  assert.equal(failedPublish.lastAppendAt, 10000);
 });

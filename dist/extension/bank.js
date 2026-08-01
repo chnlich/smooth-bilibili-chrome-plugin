@@ -61,6 +61,7 @@
     "video.replaced",
     "video.destroyed",
     "video.source_replaced",
+    "video.visibility_changed",
     "video.core_replaced",
     "video.no_video",
     "media.sample",
@@ -102,6 +103,7 @@
       "source",
       "previousSource",
       "state",
+      "previousState",
       "targetSeconds",
       "actualSeconds",
       "peakSeconds",
@@ -127,7 +129,9 @@
       "sourceBufferRanges",
       "mediaSourceState",
       "appendErrors",
-      "removeStats"
+      "removeStats",
+      "presented",
+      "stallDetail"
     ]),
     resource: Object.freeze([
       "name",

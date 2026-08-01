@@ -63,6 +63,7 @@
     "video.replaced",
     "video.destroyed",
     "video.source_replaced",
+    "video.visibility_changed",
     "video.core_replaced",
     "video.no_video",
     "media.sample",
@@ -114,6 +115,7 @@
       "source",
       "previousSource",
       "state",
+      "previousState",
       "targetSeconds",
       "actualSeconds",
       "peakSeconds",
@@ -139,7 +141,9 @@
       "sourceBufferRanges",
       "mediaSourceState",
       "appendErrors",
-      "removeStats"
+      "removeStats",
+      "presented",
+      "stallDetail"
     ]),
     resource: Object.freeze([
       "name",
@@ -281,6 +285,26 @@
       corrupted: finiteOrUnknown(value.corrupted)
     };
   }
+  function safeReportedMetric(value) {
+    if (value !== null && typeof value === "object" && !Array.isArray(value) && value.value === 0 && value.reportedBy === "browser") {
+      return { value: 0, reportedBy: "browser" };
+    }
+    return browserMetric(value);
+  }
+  function safeStallDetail(value) {
+    if (value === UNKNOWN_VALUE) return value;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
+    return {
+      presentedTotal: safeReportedMetric(value.presentedTotal),
+      maxFrameGapMs: finiteOrUnknown(value.maxFrameGapMs),
+      maxFrameGapEndedAgoMs: finiteOrUnknown(value.maxFrameGapEndedAgoMs),
+      processingMsMax: safeReportedMetric(value.processingMsMax),
+      processingMsMedian: safeReportedMetric(value.processingMsMedian),
+      appends: finiteOrUnknown(value.appends),
+      lastAppendAgoMs: finiteOrUnknown(value.lastAppendAgoMs),
+      updateEndMsMax: finiteOrUnknown(value.updateEndMsMax)
+    };
+  }
   function safeRemoveStats(value) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
     return {
@@ -309,6 +333,7 @@
     if (field === "appendErrors") return safeAppendErrors(value);
     if (field === "removeStats") return safeRemoveStats(value);
     if (field === "resolution") return safeResolution(value);
+    if (field === "stallDetail") return safeStallDetail(value);
     if (field === "transferSize" || field === "encodedBodySize" || field === "decodedBodySize" || field === "startTime" || field === "duration" || field === "responseStart" || field === "responseEnd") {
       return browserMetric(value);
     }
@@ -440,7 +465,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-61cee77b6ae6e28141d107c2" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-8344a6ce494a565ce19ab09c" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -890,6 +915,8 @@
   }
 
   // src/diagnostics/media.js
+  var CLOCK_ADVANCE_THRESHOLD_SECONDS = 0.2;
+  var MAX_FRAME_GAP_MILLISECONDS = 500;
   function readRanges(timeRanges) {
     if (timeRanges === void 0 || timeRanges === null) return UNKNOWN_VALUE;
     const result = [];
@@ -902,7 +929,7 @@
     return Number.isFinite(value) ? value : UNKNOWN_VALUE;
   }
   function readVideoQuality(video) {
-    if (typeof video.getVideoPlaybackQuality !== "function") return null;
+    if (typeof video.getVideoPlaybackQuality !== "function") return UNKNOWN_VALUE;
     try {
       const quality = video.getVideoPlaybackQuality();
       return {
@@ -922,7 +949,11 @@
         sourceBufferRanges: UNKNOWN_VALUE,
         mediaSourceState: UNKNOWN_VALUE,
         appendErrors: UNKNOWN_VALUE,
-        removeStats: UNKNOWN_VALUE
+        removeStats: UNKNOWN_VALUE,
+        appends: UNKNOWN_VALUE,
+        lastAppendAt: UNKNOWN_VALUE,
+        updateEndMsMax: UNKNOWN_VALUE,
+        updateEndAt: UNKNOWN_VALUE
       };
     }
     try {
@@ -931,7 +962,11 @@
         sourceBufferRanges: value.sourceBufferRanges,
         mediaSourceState: value.mediaSourceState,
         appendErrors: value.appendErrors,
-        removeStats: value.removeStats
+        removeStats: value.removeStats,
+        appends: value.appends,
+        lastAppendAt: value.lastAppendAt,
+        updateEndMsMax: value.updateEndMsMax,
+        updateEndAt: value.updateEndAt
       };
     } catch (error) {
       console.error("[BilibiliBuffer] shim diagnostic read failed", error);
@@ -939,7 +974,11 @@
         sourceBufferRanges: UNKNOWN_VALUE,
         mediaSourceState: UNKNOWN_VALUE,
         appendErrors: UNKNOWN_VALUE,
-        removeStats: UNKNOWN_VALUE
+        removeStats: UNKNOWN_VALUE,
+        appends: UNKNOWN_VALUE,
+        lastAppendAt: UNKNOWN_VALUE,
+        updateEndMsMax: UNKNOWN_VALUE,
+        updateEndAt: UNKNOWN_VALUE
       };
     }
   }
@@ -974,8 +1013,52 @@
       sourceBufferRanges: shimDiagnostics.sourceBufferRanges,
       mediaSourceState: shimDiagnostics.mediaSourceState,
       appendErrors: shimDiagnostics.appendErrors,
-      removeStats: shimDiagnostics.removeStats
+      removeStats: shimDiagnostics.removeStats,
+      appends: shimDiagnostics.appends,
+      lastAppendAt: shimDiagnostics.lastAppendAt,
+      updateEndMsMax: shimDiagnostics.updateEndMsMax,
+      updateEndAt: shimDiagnostics.updateEndAt
     };
+  }
+  function emptyMediaFacts(eventType) {
+    return {
+      eventType,
+      bufferedRanges: UNKNOWN_VALUE,
+      seekableRanges: UNKNOWN_VALUE,
+      currentTime: UNKNOWN_VALUE,
+      duration: UNKNOWN_VALUE,
+      paused: UNKNOWN_VALUE,
+      ended: UNKNOWN_VALUE,
+      readyState: UNKNOWN_VALUE,
+      networkState: UNKNOWN_VALUE,
+      resolution: { width: UNKNOWN_VALUE, height: UNKNOWN_VALUE },
+      playbackRate: UNKNOWN_VALUE,
+      estimatedDelay: UNKNOWN_VALUE,
+      source: UNKNOWN_VALUE,
+      videoQuality: UNKNOWN_VALUE,
+      sourceBufferRanges: UNKNOWN_VALUE,
+      mediaSourceState: UNKNOWN_VALUE,
+      appendErrors: UNKNOWN_VALUE,
+      removeStats: UNKNOWN_VALUE,
+      appends: UNKNOWN_VALUE,
+      lastAppendAt: UNKNOWN_VALUE,
+      updateEndMsMax: UNKNOWN_VALUE,
+      updateEndAt: UNKNOWN_VALUE
+    };
+  }
+  function runtimeNow(runtimeObject) {
+    const value = runtimeObject?.performance?.now?.();
+    return Number.isFinite(value) ? value : UNKNOWN_VALUE;
+  }
+  function finiteDelta(value, previous) {
+    if (!Number.isFinite(value) || !Number.isFinite(previous)) return 0;
+    return Math.max(0, value - previous);
+  }
+  function median(values) {
+    const ordered = [...values].sort((left, right) => left - right);
+    const middle = Math.floor(ordered.length / 2);
+    if (ordered.length % 2 === 1) return ordered[middle];
+    return (ordered[middle - 1] + ordered[middle]) / 2;
   }
   var MediaEventRecorder = class {
     constructor({
@@ -986,7 +1069,8 @@
       onEvent = () => {
       },
       onFrame = () => {
-      }
+      },
+      now = () => runtimeNow(runtimeObject)
     }) {
       this.video = video;
       this.logger = logger2 || {
@@ -997,10 +1081,26 @@
       this.context = context;
       this.onEvent = onEvent;
       this.onFrame = onFrame;
+      this.now = now;
       this.listeners = [];
       this.sampleTimer = void 0;
       this.frameCallbackActive = false;
       this.destroyed = false;
+      this.previousCurrentTime = void 0;
+      this.previousPresentedFrames = void 0;
+      this.presentedFramesTotal = void 0;
+      this.frameCallbackSupported = typeof this.video.requestVideoFrameCallback === "function";
+      this.intervalPresented = this.frameCallbackSupported ? 0 : UNKNOWN_VALUE;
+      this.intervalFrameCount = 0;
+      this.intervalMaxFrameGapMs = void 0;
+      this.intervalMaxFrameGapEndedAt = void 0;
+      this.intervalProcessingDurations = [];
+      this.lastFrameTimestamp = void 0;
+      this.lastUpdateEndAt = void 0;
+      this.updateEndBaselineEstablished = false;
+      this.visibilityDocument = void 0;
+      this.visibilityListener = void 0;
+      this.visibilityState = UNKNOWN_VALUE;
     }
     start() {
       if (this.destroyed) throw new Error("媒体日志 recorder 已销毁");
@@ -1016,6 +1116,7 @@
         this.video.addEventListener(name, listener);
         this.listeners.push([name, listener]);
       }
+      this.startVisibilityRecording();
       this.sample();
       this.sampleTimer = this.runtimeObject.setInterval(() => this.sample(), 1e3);
       this.scheduleFrameCallback();
@@ -1030,28 +1131,16 @@
         facts = readMediaFacts(this.video, name);
       } catch (error2) {
         this.writeLog("extension.observer_error", { reason: "media-facts" }, error2);
-        facts = {
-          eventType: name,
-          bufferedRanges: UNKNOWN_VALUE,
-          seekableRanges: UNKNOWN_VALUE,
-          currentTime: UNKNOWN_VALUE,
-          duration: UNKNOWN_VALUE,
-          paused: UNKNOWN_VALUE,
-          ended: UNKNOWN_VALUE,
-          readyState: UNKNOWN_VALUE,
-          networkState: UNKNOWN_VALUE,
-          resolution: { width: UNKNOWN_VALUE, height: UNKNOWN_VALUE },
-          playbackRate: UNKNOWN_VALUE,
-          estimatedDelay: UNKNOWN_VALUE,
-          source: UNKNOWN_VALUE,
-          videoQuality: UNKNOWN_VALUE,
-          sourceBufferRanges: UNKNOWN_VALUE,
-          mediaSourceState: UNKNOWN_VALUE,
-          appendErrors: UNKNOWN_VALUE,
-          removeStats: UNKNOWN_VALUE
-        };
+        facts = emptyMediaFacts(name);
       }
-      this.writeLog(`media.${name}`, facts, error);
+      const recordNow = this.now();
+      const { data, currentTime } = this.mediaRecordData(facts, recordNow);
+      try {
+        this.writeLog(`media.${name}`, data, error);
+      } finally {
+        this.previousCurrentTime = Number.isFinite(currentTime) ? currentTime : void 0;
+        this.resetInterval();
+      }
     }
     writeLog(code, data, error) {
       try {
@@ -1061,13 +1150,14 @@
       }
     }
     scheduleFrameCallback() {
-      if (this.destroyed || this.frameCallbackActive || typeof this.video.requestVideoFrameCallback !== "function") return;
+      if (this.destroyed || this.frameCallbackActive || !this.frameCallbackSupported) return;
       this.frameCallbackActive = true;
       try {
-        this.video.requestVideoFrameCallback((_now, metadata) => {
+        this.video.requestVideoFrameCallback((callbackNow, metadata) => {
           this.frameCallbackActive = false;
           if (this.destroyed) return;
           try {
+            this.recordFrame(callbackNow, metadata);
             this.onFrame(this.video, metadata);
           } catch (error) {
             this.writeLog("extension.observer_error", { reason: "decoded-frame" }, error);
@@ -1079,11 +1169,112 @@
         this.writeLog("extension.observer_error", { reason: "frame-callback" }, error);
       }
     }
+    startVisibilityRecording() {
+      this.visibilityDocument = this.video?.ownerDocument || this.runtimeObject?.document;
+      this.visibilityState = this.readVisibilityState();
+      this.writeLog("video.visibility_changed", {
+        state: this.visibilityState,
+        previousState: UNKNOWN_VALUE
+      });
+      if (typeof this.visibilityDocument?.addEventListener !== "function") return;
+      this.visibilityListener = () => {
+        const previousState = this.visibilityState;
+        this.visibilityState = this.readVisibilityState();
+        this.writeLog("video.visibility_changed", {
+          state: this.visibilityState,
+          previousState
+        });
+      };
+      this.visibilityDocument.addEventListener("visibilitychange", this.visibilityListener);
+    }
+    readVisibilityState() {
+      const state = this.visibilityDocument?.visibilityState;
+      return state === "visible" || state === "hidden" ? state : UNKNOWN_VALUE;
+    }
+    recordFrame(callbackNow, metadata = {}) {
+      const frameMetadata = metadata ?? {};
+      const frameTimestamp = Number.isFinite(callbackNow) ? callbackNow : this.now();
+      this.intervalFrameCount += 1;
+      if (Number.isFinite(this.lastFrameTimestamp)) {
+        const gapMs = Math.max(0, frameTimestamp - this.lastFrameTimestamp);
+        if (this.intervalMaxFrameGapMs === void 0 || gapMs > this.intervalMaxFrameGapMs) {
+          this.intervalMaxFrameGapMs = gapMs;
+          this.intervalMaxFrameGapEndedAt = frameTimestamp;
+        }
+      }
+      this.lastFrameTimestamp = frameTimestamp;
+      if (Number.isFinite(frameMetadata.presentedFrames)) {
+        this.presentedFramesTotal = frameMetadata.presentedFrames;
+        this.intervalPresented = (this.intervalPresented === UNKNOWN_VALUE ? 0 : this.intervalPresented) + finiteDelta(frameMetadata.presentedFrames, this.previousPresentedFrames);
+        this.previousPresentedFrames = frameMetadata.presentedFrames;
+      }
+      if (Number.isFinite(frameMetadata.processingDuration)) {
+        this.intervalProcessingDurations.push(frameMetadata.processingDuration * 1e3);
+      }
+    }
+    mediaRecordData(facts, recordNow) {
+      const {
+        appends,
+        lastAppendAt,
+        updateEndMsMax: rawUpdateEndMsMax,
+        updateEndAt,
+        ...loggedFacts
+      } = facts;
+      const maxFrameGapMs = this.intervalFrameCount === 0 && Number.isFinite(recordNow) && Number.isFinite(this.lastFrameTimestamp) ? Math.max(0, recordNow - this.lastFrameTimestamp) : this.intervalMaxFrameGapMs === void 0 ? UNKNOWN_VALUE : this.intervalMaxFrameGapMs;
+      const maxFrameGapEndedAgoMs = Number.isFinite(this.intervalMaxFrameGapEndedAt) && Number.isFinite(recordNow) ? Math.max(0, recordNow - this.intervalMaxFrameGapEndedAt) : UNKNOWN_VALUE;
+      const processingMsMax = this.intervalProcessingDurations.length === 0 ? UNKNOWN_VALUE : browserMetric(Math.max(...this.intervalProcessingDurations));
+      const processingMsMedian = this.intervalProcessingDurations.length === 0 ? UNKNOWN_VALUE : browserMetric(median(this.intervalProcessingDurations));
+      const updateEndMsMax = this.readUpdateEndMsMax({ updateEndAt, updateEndMsMax: rawUpdateEndMsMax });
+      const presented = this.intervalPresented;
+      const currentTime = loggedFacts.currentTime;
+      const currentTimeAdvanced = Number.isFinite(this.previousCurrentTime) && Number.isFinite(currentTime) && currentTime - this.previousCurrentTime > CLOCK_ADVANCE_THRESHOLD_SECONDS;
+      const anomalous = presented === 0 && currentTimeAdvanced || Number.isFinite(loggedFacts.readyState) && loggedFacts.readyState < 3 || typeof maxFrameGapMs === "number" && maxFrameGapMs > MAX_FRAME_GAP_MILLISECONDS;
+      const data = {
+        ...loggedFacts,
+        presented
+      };
+      if (anomalous) {
+        data.stallDetail = {
+          presentedTotal: Number.isFinite(this.presentedFramesTotal) ? browserMetric(this.presentedFramesTotal) : UNKNOWN_VALUE,
+          maxFrameGapMs,
+          maxFrameGapEndedAgoMs,
+          processingMsMax,
+          processingMsMedian,
+          appends: Number.isFinite(appends) ? appends : UNKNOWN_VALUE,
+          lastAppendAgoMs: Number.isFinite(recordNow) && Number.isFinite(lastAppendAt) ? Math.max(0, recordNow - lastAppendAt) : UNKNOWN_VALUE,
+          updateEndMsMax
+        };
+      }
+      return { data, currentTime };
+    }
+    readUpdateEndMsMax(facts) {
+      if (!this.updateEndBaselineEstablished) {
+        this.updateEndBaselineEstablished = true;
+        this.lastUpdateEndAt = Number.isFinite(facts.updateEndAt) ? facts.updateEndAt : void 0;
+        return UNKNOWN_VALUE;
+      }
+      if (!Number.isFinite(facts.updateEndAt) || facts.updateEndAt <= (this.lastUpdateEndAt ?? Number.NEGATIVE_INFINITY)) {
+        return UNKNOWN_VALUE;
+      }
+      this.lastUpdateEndAt = facts.updateEndAt;
+      return Number.isFinite(facts.updateEndMsMax) ? facts.updateEndMsMax : UNKNOWN_VALUE;
+    }
+    resetInterval() {
+      this.intervalPresented = this.frameCallbackSupported ? 0 : UNKNOWN_VALUE;
+      this.intervalFrameCount = 0;
+      this.intervalMaxFrameGapMs = void 0;
+      this.intervalMaxFrameGapEndedAt = void 0;
+      this.intervalProcessingDurations = [];
+    }
     destroy() {
       if (this.destroyed) return;
       this.destroyed = true;
       for (const [name, listener] of this.listeners) this.video.removeEventListener(name, listener);
       this.listeners = [];
+      if (this.visibilityListener !== void 0) {
+        this.visibilityDocument?.removeEventListener?.("visibilitychange", this.visibilityListener);
+        this.visibilityListener = void 0;
+      }
       if (this.sampleTimer !== void 0) this.runtimeObject.clearInterval(this.sampleTimer);
       this.sampleTimer = void 0;
     }
