@@ -7,6 +7,14 @@
 - `/video/*` 与 `/list/watchlater*` 使用同一视频增强。扩展拦截视频页媒体分片请求，命中时从内存回应，未命中时由扩展取回覆盖请求的完整分片、入库后再回应；分片只在实例内存中保存，离开视频路由或页面关闭即释放，不落盘；仍只对当前原生播放器尝试一次 120 秒稳定缓存目标，并只读显示覆盖当前播放点的 `video.buffered` 连续区间。不接管播放，不调用 `play()`/`pause()`，不写播放位置、倍速、画质、音量、静音、source，也不改变播放器的清晰度、seek、播放暂停或音视频轨决策。
 - popup 只显示视频增强开关和可直接读取的事实：实际连续缓存秒数、120 秒目标状态和错误。
 
+## 浏览器后台行为
+
+标签页转入后台约 10 秒后，Chrome 会完全停止视频解码，只保留音频。这是 Chrome 的 background video track optimization：MSE 播放且含音轨、关键帧间隔小于 5 秒时，隐藏标签页的视频轨会被禁用以省电。实测（BV12hGK6bELA，系统 Chrome，专用 profile）：隐藏后 10.0 秒解码停止并持续 50 秒，其间 `getVideoPlaybackQuality().totalVideoFrames` 一帧不动、`droppedVideoFrames` 保持 0、`currentTime` 正常前进、`readyState` 恒为 4、缓冲余量 60–73 秒，且页面仍在向 SourceBuffer 追加数据。
+
+切回前台时解码管线被拆掉重建：`totalVideoFrames` 归零重新计数（实测 938 → 97），`video.buffered` 覆盖当前播放点的余量从 69.3 秒塌到 11.5 秒后重新回填。
+
+读诊断日志时据此判读：解码帧计数停住不等于故障，先看同一时刻附近的 `video.visibility_changed`。扩展不改变这一行为，也不试图绕过它。
+
 ## 下载层
 
 - 识别为媒体分片且带闭合单段 `Range` 的请求一律由下载层拦截。命中时从内存中的完整分片切片回应，未命中时由扩展用同一 URL 和凭据取回覆盖范围的完整分片，入库后再回应播放器的原始 Range；播放器不会为这类媒体分片另行发起网络请求。非媒体请求、缺少 `Range`、非闭合 `Range`、同步 XHR，以及下载层自身的 `internal_fallback`/`internal_error` 路径仍按原样放行，并由 `bank.serve` 记录 `pass` 和原因（包括 `range_missing`、`range_not_closed`、`sync_xhr`）。`bank.serve` 的命中事件记录 `mirror` 与 `durationMs`，`bank.fetch.chunk` 记录 `mirror`。
@@ -57,6 +65,10 @@ npm audit --omit=dev --json
 构建保持未压缩，并为每个 JavaScript bundle 生成外部 source map。`buildId` 由 `src` 内容确定性生成；源码不变时连续构建的文件内容、文件列表和 build id 相同。现有确定性浏览器测试仍使用新建的临时 profile。所有自动化浏览器都保持 `--mute-audio` 和 document-start 静音 guard；真实 Bilibili 页面受环境阻挡时只报告 `BLOCKED`，不伪造通过。
 
 浏览器脚本明确使用系统 Chrome，不回退到 Playwright Chromium。默认路径是 `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`，也可以用 `BILIBILI_E2E_CHROME` 覆盖。`npm run test:e2e` 使用临时 profile；真实播放验收使用 `npm run verify:browser -- --profile <专用登录 profile> --bv <BV号>`。验证输出目录包含 `events.json`、`console.json`、`network.json` 和 `summary.json`；`summary.json` 会记录 commit sha、buildId，以及 `pass`、`fail` 或 `INCONCLUSIVE` 和失败项。
+
+Playwright 启动的 Chrome 无法产生后台标签页：同窗口切换标签页、以及用 `Browser.setWindowBounds` 最小化窗口（已确认生效），页面都仍报 `visibilityState: 'visible'`，页面自身也收不到 `visibilitychange`；去掉 Playwright 默认传入的 `--disable-backgrounding-occluded-windows`、`--disable-renderer-backgrounding`、`--disable-background-timer-throttling` 三个参数亦无效。需要验证后台相关行为时，自行启动 Chrome 并用原生 CDP 驱动，通过 DevTools HTTP 端点的 `/json/activate/<targetId>` 切换标签页，并在每个阶段断言 `document.hidden`。
+
+Chrome 不再单独接受 `--load-extension`。加载未打包扩展走 CDP `Extensions.loadUnpacked`，即 `scripts/install-unpacked-extension.mjs` 的做法。
 
 ## 自己验证
 
