@@ -314,6 +314,27 @@ test('a synchronous append throw emits one failed append record', () => {
   assert.equal(shimAppendEvents[0].errorName, 'QuotaExceededError');
 });
 
+test('a rejected append does not replace an earlier pending append', () => {
+  currentTimeMilliseconds = 24500;
+  const mediaSource = new FakeMediaSource();
+  const sourceBuffer = mediaSource.addSourceBuffer('video/mp4');
+  shimAppendEvents.length = 0;
+
+  sourceBuffer.appendBuffer(new Uint8Array([1]));
+  sourceBuffer.appendError = Object.assign(new Error('still updating'), { name: 'InvalidStateError' });
+  assert.throws(() => sourceBuffer.appendBuffer(new Uint8Array([2])), /still updating/);
+  assert.deepEqual(shimAppendEvents.map(({ appendSequence, result }) => ({ appendSequence, result })), [
+    { appendSequence: 2, result: 'throw' },
+  ]);
+
+  currentTimeMilliseconds = 24510;
+  sourceBuffer.dispatchEvent({ type: 'updateend' });
+  assert.deepEqual(shimAppendEvents.map(({ appendSequence, result }) => ({ appendSequence, result })), [
+    { appendSequence: 2, result: 'throw' },
+    { appendSequence: 1, result: 'ok' },
+  ]);
+});
+
 test('a SourceBuffer error event settles one failed append record', () => {
   currentTimeMilliseconds = 25000;
   const mediaSource = new FakeMediaSource();

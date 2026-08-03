@@ -211,11 +211,10 @@ function dispatchAppendEvent(payload) {
   }
 }
 
-function settleAppend(sourceBuffer, result, error) {
+function settleAppend(sourceBuffer, pendingAppend, result, error) {
   const record = sourceBufferRecords.get(sourceBuffer);
-  const pendingAppend = record.pendingAppend;
   if (pendingAppend === undefined) return;
-  record.pendingAppend = undefined;
+  if (record.pendingAppend === pendingAppend) record.pendingAppend = undefined;
   const settledAt = window.performance.now();
   if (result === 'ok') {
     record.updateEndMsMax = record.updateEndMsMax === undefined
@@ -241,12 +240,17 @@ function settleAppend(sourceBuffer, result, error) {
 }
 
 function recordUpdateEnd() {
-  settleAppend(this, 'ok');
+  settleAppend(this, sourceBufferRecords.get(this).pendingAppend, 'ok');
   dispatchUpdateEndDiagnostics();
 }
 
 function recordSourceBufferError(event) {
-  settleAppend(this, 'error_event', event?.error ?? this.error);
+  settleAppend(
+    this,
+    sourceBufferRecords.get(this).pendingAppend,
+    'error_event',
+    event?.error ?? this.error,
+  );
   dispatchUpdateEndDiagnostics();
 }
 
@@ -270,18 +274,21 @@ if (typeof SourceBuffer !== 'undefined' && typeof SourceBuffer.prototype?.append
     record.appendSequence += 1;
     record.appends += 1;
     record.lastAppendAt = startedAt;
-    record.pendingAppend = {
+    const pendingAppend = {
       appendSequence: record.appendSequence,
       startedAt,
       bytes: readAppendBytes(args[0]),
       bufferedBefore: readSourceBufferRanges(this),
     };
+    const previousPendingAppend = record.pendingAppend;
+    record.pendingAppend = pendingAppend;
     try {
       const result = originalAppendBuffer.call(this, ...args);
       dispatchUpdateEndDiagnostics();
       return result;
     } catch (error) {
-      settleAppend(this, 'throw', error);
+      if (record.pendingAppend === pendingAppend) record.pendingAppend = previousPendingAppend;
+      settleAppend(this, pendingAppend, 'throw', error);
       dispatchDiagnostics();
       throw error;
     }

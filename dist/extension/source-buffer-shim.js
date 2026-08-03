@@ -374,11 +374,10 @@
       console.error("[BilibiliBuffer] source buffer append event dispatch failed", error);
     }
   }
-  function settleAppend(sourceBuffer, result, error) {
+  function settleAppend(sourceBuffer, pendingAppend, result, error) {
     const record = sourceBufferRecords.get(sourceBuffer);
-    const pendingAppend = record.pendingAppend;
     if (pendingAppend === void 0) return;
-    record.pendingAppend = void 0;
+    if (record.pendingAppend === pendingAppend) record.pendingAppend = void 0;
     const settledAt = window.performance.now();
     if (result === "ok") {
       record.updateEndMsMax = record.updateEndMsMax === void 0 ? Math.max(0, settledAt - pendingAppend.startedAt) : Math.max(record.updateEndMsMax, Math.max(0, settledAt - pendingAppend.startedAt));
@@ -401,11 +400,16 @@
     });
   }
   function recordUpdateEnd() {
-    settleAppend(this, "ok");
+    settleAppend(this, sourceBufferRecords.get(this).pendingAppend, "ok");
     dispatchUpdateEndDiagnostics();
   }
   function recordSourceBufferError(event) {
-    settleAppend(this, "error_event", event?.error ?? this.error);
+    settleAppend(
+      this,
+      sourceBufferRecords.get(this).pendingAppend,
+      "error_event",
+      event?.error ?? this.error
+    );
     dispatchUpdateEndDiagnostics();
   }
   if (typeof MediaSource !== "undefined" && typeof MediaSource.prototype?.addSourceBuffer === "function") {
@@ -427,18 +431,21 @@
       record.appendSequence += 1;
       record.appends += 1;
       record.lastAppendAt = startedAt;
-      record.pendingAppend = {
+      const pendingAppend = {
         appendSequence: record.appendSequence,
         startedAt,
         bytes: readAppendBytes(args[0]),
         bufferedBefore: readSourceBufferRanges(this)
       };
+      const previousPendingAppend = record.pendingAppend;
+      record.pendingAppend = pendingAppend;
       try {
         const result = originalAppendBuffer.call(this, ...args);
         dispatchUpdateEndDiagnostics();
         return result;
       } catch (error) {
-        settleAppend(this, "throw", error);
+        if (record.pendingAppend === pendingAppend) record.pendingAppend = previousPendingAppend;
+        settleAppend(this, pendingAppend, "throw", error);
         dispatchDiagnostics();
         throw error;
       }
