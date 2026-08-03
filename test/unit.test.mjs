@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { VOD_CONFIG } from '../src/constants.js';
-import { serializeError } from '../src/extension/bridge-contract.js';
+import { SHIM_APPEND_EVENT, serializeError } from '../src/extension/bridge-contract.js';
 import { ExtensionCoordinator } from '../src/extension/controller.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
 import { VodBufferController } from '../src/vod/controller.js';
@@ -600,6 +600,30 @@ test('disabled video route passively records media without media or bridge owner
   assert.equal(availableCount, 1);
   assert.equal(noVideoPending, false);
   assert.equal(diagnostics.events.filter((event) => event.code === 'media.sample').length, 1);
+  fixture.coordinator.documentObject.emit(SHIM_APPEND_EVENT, {
+    detail: JSON.stringify({
+      mediaSourceInstance: 1,
+      sourceBufferInstance: 1,
+      appendSequence: 1,
+      track: 'video/mp4',
+      bytes: 8,
+      bufferedBefore: [{ start: 0, end: 10 }],
+      bufferedAfter: [{ start: 0, end: 12 }],
+      durationMs: 4,
+      result: 'ok',
+    }),
+  });
+  assert.deepEqual(diagnostics.events.find((event) => event.code === 'media.append').data, {
+    mediaSourceInstance: 1,
+    sourceBufferInstance: 1,
+    appendSequence: 1,
+    track: 'video/mp4',
+    bytes: 8,
+    bufferedBefore: [{ start: 0, end: 10 }],
+    bufferedAfter: [{ start: 0, end: 12 }],
+    durationMs: 4,
+    result: 'ok',
+  });
   fixture.video.emit('playing');
   assert.equal(diagnostics.events.filter((event) => event.code === 'media.playing').length, 1);
   fixture.video.emit('timeupdate');
@@ -618,6 +642,10 @@ test('disabled video route passively records media without media or bridge owner
 
   await fixture.coordinator.destroy();
   const eventCount = diagnostics.events.length;
+  fixture.coordinator.documentObject.emit(SHIM_APPEND_EVENT, {
+    detail: JSON.stringify({ result: 'ok' }),
+  });
+  assert.equal(diagnostics.events.length, eventCount);
   fixture.video.emit('timeupdate');
   assert.equal(diagnostics.events.length, eventCount);
 });
@@ -1170,7 +1198,17 @@ test('media attribution fields pass through the existing privacy path', () => {
       getAttribute(name) {
         assert.equal(name, 'data-bilibili-buffer-shim-diagnostics');
         return JSON.stringify({
-          sourceBufferRanges: [{ track: 'video', ranges: [{ start: 0, end: 80 }] }],
+          sourceBufferRanges: [{
+            mediaSourceInstance: 2,
+            sourceBufferInstance: 1,
+            mediaSourceState: 'open',
+            track: 'video',
+            ranges: [{ start: 0, end: 80 }],
+            updating: false,
+            pendingSinceMs: null,
+            appends: 17,
+            appendErrors: { QuotaExceededError: 2 },
+          }],
           mediaSourceState: 'open',
           appendErrors: { QuotaExceededError: 2 },
           removeStats: { removeCalls: 7 },
@@ -1181,10 +1219,56 @@ test('media attribution fields pass through the existing privacy path', () => {
   const facts = readMediaFacts(video, 'waiting');
   const sanitized = sanitizeEventData('media.waiting', facts);
   assert.deepEqual(sanitized.videoQuality, { total: 100, dropped: 4, corrupted: 1 });
-  assert.deepEqual(sanitized.sourceBufferRanges, [{ track: 'video', ranges: [{ start: 0, end: 80 }] }]);
+  assert.deepEqual(sanitized.sourceBufferRanges, [{
+    mediaSourceInstance: 2,
+    sourceBufferInstance: 1,
+    mediaSourceState: 'open',
+    track: 'video',
+    ranges: [{ start: 0, end: 80 }],
+    updating: false,
+    pendingSinceMs: null,
+    appends: 17,
+    appendErrors: { QuotaExceededError: 2 },
+  }]);
   assert.equal(sanitized.mediaSourceState, 'open');
   assert.deepEqual(sanitized.appendErrors, { QuotaExceededError: 2 });
   assert.deepEqual(sanitized.removeStats, { removeCalls: 7 });
+});
+
+test('media.append fields pass through privacy normalization and discard unknown fields', () => {
+  const data = {
+    mediaSourceInstance: 2,
+    sourceBufferInstance: 1,
+    appendSequence: 3,
+    track: 'video/mp4',
+    bytes: 128,
+    bufferedBefore: [{ start: 0, end: 80 }],
+    bufferedAfter: [{ start: 0, end: 90 }],
+    durationMs: 12.5,
+    result: 'ok',
+    secretField: 'removed',
+  };
+  const sanitized = sanitizeEventData('media.append', data);
+  assert.deepEqual(sanitized, {
+    mediaSourceInstance: 2,
+    sourceBufferInstance: 1,
+    appendSequence: 3,
+    track: 'video/mp4',
+    bytes: 128,
+    bufferedBefore: [{ start: 0, end: 80 }],
+    bufferedAfter: [{ start: 0, end: 90 }],
+    durationMs: 12.5,
+    result: 'ok',
+  });
+  const persisted = normalizeEventForStorage({
+    sessionId: 'media-append-session',
+    sequence: 1,
+    wallTime: '2026-07-20T00:00:00.000Z',
+    elapsedMs: 0,
+    code: 'media.append',
+    data,
+  });
+  assert.deepEqual(persisted.data, sanitized);
 });
 
 test('watch-later route identity preserves the real item and omits an absent item', () => {

@@ -10,6 +10,7 @@ import {
   getCurrentStatusSurface,
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
+import { SHIM_APPEND_EVENT } from './bridge-contract.js';
 import {
   isBankDiagnosticMessage,
   postBankControl,
@@ -164,6 +165,10 @@ export class ExtensionCoordinator {
     this.routeAbort = undefined;
     this.routeTimer = undefined;
     this.destroyed = false;
+    this.onShimAppend = (event) => {
+      this.diagnostics?.log('media.append', JSON.parse(event.detail));
+    };
+    this.documentObject.addEventListener(SHIM_APPEND_EVENT, this.onShimAppend);
   }
 
   async start() {
@@ -370,6 +375,7 @@ export class ExtensionCoordinator {
     await this.teardownActive();
     this.diagnostics?.log('extension.destroyed', { action: 'coordinator' });
     this.destroyed = true;
+    this.documentObject.removeEventListener(SHIM_APPEND_EVENT, this.onShimAppend);
     this.diagnostics?.destroy();
     this.bridgeClient.destroy();
   }

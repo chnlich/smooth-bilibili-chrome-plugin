@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { BANK_CONFIG, EXTENSION_MANIFEST, VOD_CONFIG } from '../src/constants.js';
 import { createManifest } from '../src/extension/manifest-source.js';
+import { SHIM_APPEND_EVENT } from '../src/extension/bridge-contract.js';
 import { DATA_ALLOWLIST, EVENT_CODES, MEDIA_EVENT_NAMES } from '../src/diagnostics/catalog.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -323,6 +324,7 @@ assert.equal(EVENT_CODES.some((code) => code.startsWith('live.')), false);
 assert.doesNotMatch(source, /\broomId\b/);
 assert.equal(EVENT_CODES.includes('bank.fetch.chunk'), true);
 assert.equal(EVENT_CODES.includes('bank.serve'), true);
+assert.equal(EVENT_CODES.includes('media.append'), true);
 assert.equal(EVENT_CODES.includes('bank.evict'), true);
 assert.equal(EVENT_CODES.includes('bank.store'), true);
 assert.equal(EVENT_CODES.includes('bank.disabled'), true);
@@ -341,9 +343,24 @@ assert.deepEqual([...DATA_ALLOWLIST.bank].sort(), [
   'slot',
   'ttfbMs',
 ].sort());
+for (const field of [
+  'mediaSourceInstance',
+  'sourceBufferInstance',
+  'appendSequence',
+  'track',
+  'bytes',
+  'bufferedBefore',
+  'bufferedAfter',
+  'durationMs',
+  'result',
+  'errorName',
+]) assert.equal(DATA_ALLOWLIST.media.includes(field), true);
+assert.equal(SHIM_APPEND_EVENT, 'bilibili-buffer:shim-append-v1');
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.doesNotMatch(bridgeContractSource, /BRIDGE_LIVE|setChasingFrameThreshold|getLiveCapabilitySnapshot|disableLiveAutoCatchup/);
-assert.doesNotMatch(shim, /adjustedEnd|dispatchEvent\s*\(/);
+assert.doesNotMatch(shim, /adjustedEnd/);
+assert.match(shim, /SHIM_APPEND_EVENT/);
+assert.match(shim, /document\.dispatchEvent/);
 assert.match(shim, /return originalRemove\.call\(this, start, end\)/);
 assert.doesNotMatch(shim, /intercepted|lastReason|lastCurrentTime|lastRemoveStart|lastRemoveEnd|lastOriginalEnd/);
 assert.doesNotMatch(bank, /(?:\.currentTime|\.playbackRate|\.muted|\.volume|\.src|\.currentSrc)\s*=/);

@@ -76,16 +76,54 @@ function safeRangeList(value) {
   });
 }
 
+function safePositiveInteger(value) {
+  return Number.isInteger(value) && value >= 1 ? value : UNKNOWN_VALUE;
+}
+
+function safeNonnegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0 ? value : UNKNOWN_VALUE;
+}
+
+function safeNonnegativeNumber(value) {
+  return Number.isFinite(value) && value >= 0 ? value : UNKNOWN_VALUE;
+}
+
+function safeSourceState(value) {
+  return ['closed', 'open', 'ended'].includes(value) ? value : UNKNOWN_VALUE;
+}
+
 function safeSourceBufferRanges(value) {
   if (!Array.isArray(value)) return UNKNOWN_VALUE;
   return value.map((track) => {
     if (track === null || typeof track !== 'object' || Array.isArray(track)) {
       throw new Error('track buffer range structure is invalid');
     }
-    return {
+    const result = {
       track: safeScalar(track.track),
       ranges: safeRangeList(track.ranges),
     };
+    if (Object.prototype.hasOwnProperty.call(track, 'mediaSourceInstance')) {
+      result.mediaSourceInstance = safePositiveInteger(track.mediaSourceInstance);
+    }
+    if (Object.prototype.hasOwnProperty.call(track, 'sourceBufferInstance')) {
+      result.sourceBufferInstance = safePositiveInteger(track.sourceBufferInstance);
+    }
+    if (Object.prototype.hasOwnProperty.call(track, 'mediaSourceState')) {
+      result.mediaSourceState = safeSourceState(track.mediaSourceState);
+    }
+    if (Object.prototype.hasOwnProperty.call(track, 'updating')) {
+      result.updating = track.updating === true || track.updating === false ? track.updating : UNKNOWN_VALUE;
+    }
+    if (Object.prototype.hasOwnProperty.call(track, 'pendingSinceMs')) {
+      result.pendingSinceMs = track.pendingSinceMs === null ? null : safeNonnegativeNumber(track.pendingSinceMs);
+    }
+    if (Object.prototype.hasOwnProperty.call(track, 'appends')) {
+      result.appends = safeNonnegativeInteger(track.appends);
+    }
+    if (Object.prototype.hasOwnProperty.call(track, 'appendErrors')) {
+      result.appendErrors = safeAppendErrors(track.appendErrors);
+    }
+    return result;
   });
 }
 
@@ -156,7 +194,8 @@ function sanitizeField(field, value) {
   }
   if (['bvid', 'part', 'watchLaterItem'].includes(field)) return scrubIdentifier(value);
   if (field === 'source' || field === 'previousSource' || field === 'name') return scrubUrl(value);
-  if (field === 'bufferedRanges' || field === 'seekableRanges') return safeRangeList(value);
+  if (field === 'bufferedRanges' || field === 'seekableRanges'
+    || field === 'bufferedBefore' || field === 'bufferedAfter') return safeRangeList(value);
   if (field === 'sourceBufferRanges') return safeSourceBufferRanges(value);
   if (field === 'videoQuality') return safeVideoQuality(value);
   if (field === 'appendErrors') return safeAppendErrors(value);
@@ -178,6 +217,10 @@ function sanitizeField(field, value) {
   if (field === 'code') return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
   if (field === 'message') return scrubErrorText(value);
   if (field === 'samples') return safeSampleList(value);
+  if (field === 'mediaSourceInstance' || field === 'sourceBufferInstance' || field === 'appendSequence') {
+    return safePositiveInteger(value);
+  }
+  if (field === 'durationMs') return safeNonnegativeNumber(value);
   return safeScalar(value);
 }
 

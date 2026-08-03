@@ -67,6 +67,7 @@
     "video.core_replaced",
     "video.no_video",
     "media.sample",
+    "media.append",
     ...MEDIA_EVENT_NAMES.map((name) => `media.${name}`),
     "resource.observer_unavailable",
     "video.buffer_hint.attempt",
@@ -143,7 +144,17 @@
       "appendErrors",
       "removeStats",
       "presented",
-      "stallDetail"
+      "stallDetail",
+      "mediaSourceInstance",
+      "sourceBufferInstance",
+      "appendSequence",
+      "track",
+      "bytes",
+      "bufferedBefore",
+      "bufferedAfter",
+      "durationMs",
+      "result",
+      "errorName"
     ]),
     resource: Object.freeze([
       "name",
@@ -255,16 +266,50 @@
       };
     });
   }
+  function safePositiveInteger(value) {
+    return Number.isInteger(value) && value >= 1 ? value : UNKNOWN_VALUE;
+  }
+  function safeNonnegativeInteger(value) {
+    return Number.isInteger(value) && value >= 0 ? value : UNKNOWN_VALUE;
+  }
+  function safeNonnegativeNumber(value) {
+    return Number.isFinite(value) && value >= 0 ? value : UNKNOWN_VALUE;
+  }
+  function safeSourceState(value) {
+    return ["closed", "open", "ended"].includes(value) ? value : UNKNOWN_VALUE;
+  }
   function safeSourceBufferRanges(value) {
     if (!Array.isArray(value)) return UNKNOWN_VALUE;
     return value.map((track) => {
       if (track === null || typeof track !== "object" || Array.isArray(track)) {
         throw new Error("track buffer range structure is invalid");
       }
-      return {
+      const result = {
         track: safeScalar(track.track),
         ranges: safeRangeList(track.ranges)
       };
+      if (Object.prototype.hasOwnProperty.call(track, "mediaSourceInstance")) {
+        result.mediaSourceInstance = safePositiveInteger(track.mediaSourceInstance);
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "sourceBufferInstance")) {
+        result.sourceBufferInstance = safePositiveInteger(track.sourceBufferInstance);
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "mediaSourceState")) {
+        result.mediaSourceState = safeSourceState(track.mediaSourceState);
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "updating")) {
+        result.updating = track.updating === true || track.updating === false ? track.updating : UNKNOWN_VALUE;
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "pendingSinceMs")) {
+        result.pendingSinceMs = track.pendingSinceMs === null ? null : safeNonnegativeNumber(track.pendingSinceMs);
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "appends")) {
+        result.appends = safeNonnegativeInteger(track.appends);
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "appendErrors")) {
+        result.appendErrors = safeAppendErrors(track.appendErrors);
+      }
+      return result;
     });
   }
   function safeAppendErrors(value) {
@@ -327,7 +372,7 @@
     }
     if (["bvid", "part", "watchLaterItem"].includes(field)) return scrubIdentifier(value);
     if (field === "source" || field === "previousSource" || field === "name") return scrubUrl(value);
-    if (field === "bufferedRanges" || field === "seekableRanges") return safeRangeList(value);
+    if (field === "bufferedRanges" || field === "seekableRanges" || field === "bufferedBefore" || field === "bufferedAfter") return safeRangeList(value);
     if (field === "sourceBufferRanges") return safeSourceBufferRanges(value);
     if (field === "videoQuality") return safeVideoQuality(value);
     if (field === "appendErrors") return safeAppendErrors(value);
@@ -341,6 +386,10 @@
     if (field === "code") return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
     if (field === "message") return scrubErrorText(value);
     if (field === "samples") return safeSampleList(value);
+    if (field === "mediaSourceInstance" || field === "sourceBufferInstance" || field === "appendSequence") {
+      return safePositiveInteger(value);
+    }
+    if (field === "durationMs") return safeNonnegativeNumber(value);
     return safeScalar(value);
   }
   function safeSampleList(value) {
@@ -465,7 +514,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-98843e355a36bf7754c43e81" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-1e9e710c7d2a1803dd1ee470" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -531,6 +580,7 @@
   var BRIDGE_RESPONSE_EVENT = "bilibili-buffer:bridge-response-v1";
   var BRIDGE_RESPONSE_ATTRIBUTE = "data-bilibili-buffer-bridge-response-v1";
   var SHIM_DIAGNOSTIC_ATTRIBUTE = "data-bilibili-buffer-shim-diagnostics";
+  var SHIM_APPEND_EVENT = "bilibili-buffer:shim-append-v1";
   var BRIDGE_OPERATIONS = Object.freeze([
     "getCoreSnapshot",
     "callCoreSync"
@@ -2381,6 +2431,10 @@
       this.routeAbort = void 0;
       this.routeTimer = void 0;
       this.destroyed = false;
+      this.onShimAppend = (event) => {
+        this.diagnostics?.log("media.append", JSON.parse(event.detail));
+      };
+      this.documentObject.addEventListener(SHIM_APPEND_EVENT, this.onShimAppend);
     }
     async start() {
       if (this.routeTimer !== void 0) throw new Error("扩展路由协调器已经启动");
@@ -2566,6 +2620,7 @@
       await this.teardownActive();
       this.diagnostics?.log("extension.destroyed", { action: "coordinator" });
       this.destroyed = true;
+      this.documentObject.removeEventListener(SHIM_APPEND_EVENT, this.onShimAppend);
       this.diagnostics?.destroy();
       this.bridgeClient.destroy();
     }

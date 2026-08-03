@@ -65,6 +65,7 @@
     "video.core_replaced",
     "video.no_video",
     "media.sample",
+    "media.append",
     ...MEDIA_EVENT_NAMES.map((name) => `media.${name}`),
     "resource.observer_unavailable",
     "video.buffer_hint.attempt",
@@ -131,7 +132,17 @@
       "appendErrors",
       "removeStats",
       "presented",
-      "stallDetail"
+      "stallDetail",
+      "mediaSourceInstance",
+      "sourceBufferInstance",
+      "appendSequence",
+      "track",
+      "bytes",
+      "bufferedBefore",
+      "bufferedAfter",
+      "durationMs",
+      "result",
+      "errorName"
     ]),
     resource: Object.freeze([
       "name",

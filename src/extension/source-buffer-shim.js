@@ -1,17 +1,12 @@
-import { SHIM_DIAGNOSTIC_ATTRIBUTE } from './bridge-contract.js';
+import { UNKNOWN_VALUE } from '../diagnostics/privacy.js';
+import { SHIM_APPEND_EVENT, SHIM_DIAGNOSTIC_ATTRIBUTE } from './bridge-contract.js';
 
 let installed = false;
-const stats = {
-  removeCalls: 0,
-};
-const sourceBufferTracks = new WeakMap();
-const appendStartedAt = new WeakMap();
-const appendErrors = Object.create(null);
-let appends = 0;
-let lastAppendAt;
-let updateEndMsMax;
-let lastUpdateEndAt;
-let activeSource;
+const mediaSourceInstances = new WeakMap();
+const sourceBufferInstances = new WeakMap();
+const sourceBufferRecords = new WeakMap();
+const liveMediaSources = [];
+let nextMediaSourceInstance = 1;
 
 function readSourceBufferRanges(sourceBuffer) {
   const ranges = [];
@@ -25,31 +20,140 @@ function readSourceBufferRanges(sourceBuffer) {
   return ranges;
 }
 
+function registerMediaSource(mediaSource) {
+  const existingInstance = mediaSourceInstances.get(mediaSource);
+  if (existingInstance !== undefined) return existingInstance;
+  const mediaSourceInstance = nextMediaSourceInstance;
+  nextMediaSourceInstance += 1;
+  mediaSourceInstances.set(mediaSource, mediaSourceInstance);
+  sourceBufferInstances.set(mediaSource, 1);
+  liveMediaSources.push(new WeakRef(mediaSource));
+  for (const eventName of ['sourceopen', 'sourceended', 'sourceclose']) {
+    mediaSource.addEventListener(eventName, dispatchDiagnostics);
+  }
+  return mediaSourceInstance;
+}
+
+function registerSourceBuffer(mediaSource, sourceBuffer, mimeType) {
+  const mediaSourceInstance = registerMediaSource(mediaSource);
+  const sourceBufferInstance = sourceBufferInstances.get(mediaSource);
+  sourceBufferInstances.set(mediaSource, sourceBufferInstance + 1);
+  sourceBufferRecords.set(sourceBuffer, {
+    mediaSourceInstance,
+    sourceBufferInstance,
+    track: String(mimeType).split(';', 1)[0],
+    appends: 0,
+    appendErrors: Object.create(null),
+    appendSequence: 0,
+    pendingAppend: undefined,
+    lastAppendAt: undefined,
+    updateEndMsMax: undefined,
+    lastUpdateEndAt: undefined,
+    removeCalls: 0,
+  });
+}
+
+function collectLiveMediaSources() {
+  const liveReferences = [];
+  const sources = [];
+  for (const reference of liveMediaSources) {
+    const mediaSource = reference.deref();
+    if (mediaSource === undefined) continue;
+    liveReferences.push(reference);
+    sources.push(mediaSource);
+  }
+  liveMediaSources.length = 0;
+  liveMediaSources.push(...liveReferences);
+  return sources;
+}
+
+function forEachSourceBuffer(mediaSource, callback) {
+  for (let index = 0; index < mediaSource.sourceBuffers.length; index += 1) {
+    const sourceBuffer = mediaSource.sourceBuffers[index];
+    callback(sourceBuffer, sourceBufferRecords.get(sourceBuffer));
+  }
+}
+
+function aggregateRemoveCalls() {
+  let removeCalls = 0;
+  for (const mediaSource of collectLiveMediaSources()) {
+    forEachSourceBuffer(mediaSource, (_sourceBuffer, record) => {
+      removeCalls += record.removeCalls;
+    });
+  }
+  return removeCalls;
+}
+
 function publishDiagnostics() {
   try {
     const sourceBufferRanges = [];
-    if (activeSource !== undefined) {
-      for (let index = 0; index < activeSource.sourceBuffers.length; index += 1) {
-        const sourceBuffer = activeSource.sourceBuffers[index];
+    const appendErrors = Object.create(null);
+    const sources = collectLiveMediaSources();
+    const now = window.performance.now();
+    let appends = 0;
+    let lastAppendAt;
+    let updateEndMsMax;
+    let updateEndAt;
+    let removeCalls = 0;
+    let mediaSourceState = null;
+    let hasOpenMediaSource = false;
+
+    for (const mediaSource of sources) {
+      const state = mediaSource.readyState || null;
+      mediaSourceState = state;
+      hasOpenMediaSource ||= state === 'open';
+      forEachSourceBuffer(mediaSource, (sourceBuffer, record) => {
+        appends += record.appends;
+        if (Number.isFinite(record.lastAppendAt)) {
+          lastAppendAt = lastAppendAt === undefined
+            ? record.lastAppendAt
+            : Math.max(lastAppendAt, record.lastAppendAt);
+        }
+        if (Number.isFinite(record.updateEndMsMax)) {
+          updateEndMsMax = updateEndMsMax === undefined
+            ? record.updateEndMsMax
+            : Math.max(updateEndMsMax, record.updateEndMsMax);
+        }
+        if (Number.isFinite(record.lastUpdateEndAt)) {
+          updateEndAt = updateEndAt === undefined
+            ? record.lastUpdateEndAt
+            : Math.max(updateEndAt, record.lastUpdateEndAt);
+        }
+        removeCalls += record.removeCalls;
+        for (const [name, count] of Object.entries(record.appendErrors)) {
+          appendErrors[name] = (appendErrors[name] || 0) + count;
+        }
         sourceBufferRanges.push({
-          track: sourceBufferTracks.get(sourceBuffer) || 'unknown',
+          mediaSourceInstance: record.mediaSourceInstance,
+          sourceBufferInstance: record.sourceBufferInstance,
+          mediaSourceState: state,
+          track: record.track,
           ranges: readSourceBufferRanges(sourceBuffer),
+          updating: record.pendingAppend !== undefined,
+          pendingSinceMs: record.pendingAppend === undefined
+            ? null
+            : Math.max(0, now - record.pendingAppend.startedAt),
+          appends: record.appends,
+          appendErrors: { ...record.appendErrors },
         });
-      }
+      });
     }
+
     document.documentElement.setAttribute(SHIM_DIAGNOSTIC_ATTRIBUTE, JSON.stringify({
       sourceBufferRanges,
-      mediaSourceState: activeSource?.readyState || null,
+      mediaSourceState: hasOpenMediaSource ? 'open' : mediaSourceState,
       appendErrors: { ...appendErrors },
-      removeStats: {
-        removeCalls: stats.removeCalls,
-      },
+      removeStats: { removeCalls },
       appends,
       lastAppendAt: lastAppendAt ?? null,
       updateEndMsMax: updateEndMsMax ?? null,
-      updateEndAt: lastUpdateEndAt ?? null,
+      updateEndAt: updateEndAt ?? null,
     }));
-    updateEndMsMax = undefined;
+    for (const mediaSource of sources) {
+      forEachSourceBuffer(mediaSource, (_sourceBuffer, record) => {
+        record.updateEndMsMax = undefined;
+      });
+    }
   } catch (error) {
     console.error('[BilibiliBuffer] source buffer diagnostic dispatch failed', error);
   }
@@ -84,14 +188,65 @@ function dispatchUpdateEndDiagnostics() {
   }
 }
 
-function recordUpdateEnd() {
-  const startedAt = appendStartedAt.get(this);
-  if (Number.isFinite(startedAt)) {
-    const duration = Math.max(0, window.performance.now() - startedAt);
-    updateEndMsMax = updateEndMsMax === undefined ? duration : Math.max(updateEndMsMax, duration);
-    lastUpdateEndAt = window.performance.now();
-    appendStartedAt.delete(this);
+function errorName(error) {
+  return typeof error?.name === 'string' && error.name.length > 0 ? error.name : 'UnknownError';
+}
+
+function readAppendBytes(argument) {
+  try {
+    const bytes = argument?.byteLength;
+    return Number.isInteger(bytes) && bytes >= 0 ? bytes : UNKNOWN_VALUE;
+  } catch (error) {
+    console.error('[BilibiliBuffer] append byte length read failed', error);
+    return UNKNOWN_VALUE;
   }
+}
+
+function dispatchAppendEvent(payload) {
+  try {
+    const CustomEventClass = document.defaultView?.CustomEvent || globalThis.CustomEvent;
+    document.dispatchEvent(new CustomEventClass(SHIM_APPEND_EVENT, { detail: JSON.stringify(payload) }));
+  } catch (error) {
+    console.error('[BilibiliBuffer] source buffer append event dispatch failed', error);
+  }
+}
+
+function settleAppend(sourceBuffer, result, error) {
+  const record = sourceBufferRecords.get(sourceBuffer);
+  const pendingAppend = record.pendingAppend;
+  if (pendingAppend === undefined) return;
+  record.pendingAppend = undefined;
+  const settledAt = window.performance.now();
+  if (result === 'ok') {
+    record.updateEndMsMax = record.updateEndMsMax === undefined
+      ? Math.max(0, settledAt - pendingAppend.startedAt)
+      : Math.max(record.updateEndMsMax, Math.max(0, settledAt - pendingAppend.startedAt));
+    record.lastUpdateEndAt = settledAt;
+  } else {
+    const name = errorName(error);
+    record.appendErrors[name] = (record.appendErrors[name] || 0) + 1;
+  }
+  dispatchAppendEvent({
+    mediaSourceInstance: record.mediaSourceInstance,
+    sourceBufferInstance: record.sourceBufferInstance,
+    appendSequence: pendingAppend.appendSequence,
+    track: record.track,
+    bytes: pendingAppend.bytes,
+    bufferedBefore: pendingAppend.bufferedBefore,
+    bufferedAfter: readSourceBufferRanges(sourceBuffer),
+    durationMs: Math.max(0, settledAt - pendingAppend.startedAt),
+    result,
+    ...(result === 'ok' ? {} : { errorName: errorName(error) }),
+  });
+}
+
+function recordUpdateEnd() {
+  settleAppend(this, 'ok');
+  dispatchUpdateEndDiagnostics();
+}
+
+function recordSourceBufferError(event) {
+  settleAppend(this, 'error_event', event?.error ?? this.error);
   dispatchUpdateEndDiagnostics();
 }
 
@@ -99,12 +254,9 @@ if (typeof MediaSource !== 'undefined' && typeof MediaSource.prototype?.addSourc
   const originalAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
   MediaSource.prototype.addSourceBuffer = function smoothAddSourceBuffer(mimeType) {
     const sourceBuffer = originalAddSourceBuffer.call(this, mimeType);
-    activeSource = this;
-    sourceBufferTracks.set(sourceBuffer, String(mimeType).split(';', 1)[0]);
+    registerSourceBuffer(this, sourceBuffer, mimeType);
     sourceBuffer.addEventListener('updateend', recordUpdateEnd);
-    for (const eventName of ['sourceopen', 'sourceended', 'sourceclose']) {
-      this.addEventListener(eventName, dispatchDiagnostics);
-    }
+    sourceBuffer.addEventListener('error', recordSourceBufferError);
     dispatchDiagnostics();
     return sourceBuffer;
   };
@@ -113,36 +265,42 @@ if (typeof MediaSource !== 'undefined' && typeof MediaSource.prototype?.addSourc
 if (typeof SourceBuffer !== 'undefined' && typeof SourceBuffer.prototype?.appendBuffer === 'function') {
   const originalAppendBuffer = SourceBuffer.prototype.appendBuffer;
   SourceBuffer.prototype.appendBuffer = function smoothAppendBuffer(...args) {
+    const record = sourceBufferRecords.get(this);
     const startedAt = window.performance.now();
-    let result;
+    record.appendSequence += 1;
+    record.appends += 1;
+    record.lastAppendAt = startedAt;
+    record.pendingAppend = {
+      appendSequence: record.appendSequence,
+      startedAt,
+      bytes: readAppendBytes(args[0]),
+      bufferedBefore: readSourceBufferRanges(this),
+    };
     try {
-      result = originalAppendBuffer.call(this, ...args);
+      const result = originalAppendBuffer.call(this, ...args);
+      dispatchUpdateEndDiagnostics();
+      return result;
     } catch (error) {
-      const name = typeof error?.name === 'string' && error.name.length > 0 ? error.name : 'UnknownError';
-      appendErrors[name] = (appendErrors[name] || 0) + 1;
+      settleAppend(this, 'throw', error);
       dispatchDiagnostics();
       throw error;
     }
-    appends += 1;
-    lastAppendAt = startedAt;
-    appendStartedAt.set(this, startedAt);
-    try {
-      dispatchUpdateEndDiagnostics();
-    } catch (error) {
-      console.error('[BilibiliBuffer] source buffer diagnostic dispatch failed', error);
-    }
-    return result;
   };
 }
 
 if (typeof SourceBuffer !== 'undefined' && SourceBuffer.prototype && typeof SourceBuffer.prototype.remove === 'function') {
   const originalRemove = SourceBuffer.prototype.remove;
   SourceBuffer.prototype.remove = function smoothRemove(start, end) {
-    stats.removeCalls += 1;
+    sourceBufferRecords.get(this).removeCalls += 1;
     return originalRemove.call(this, start, end);
   };
   installed = true;
 }
 
-window.__smoothBufferShim = { installed, stats };
+window.__smoothBufferShim = {
+  installed,
+  get stats() {
+    return { removeCalls: aggregateRemoveCalls() };
+  },
+};
 dispatchDiagnostics();
