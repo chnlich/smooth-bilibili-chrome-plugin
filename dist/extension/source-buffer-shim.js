@@ -79,6 +79,7 @@
     "bank.evict",
     "bank.store",
     "bank.disabled",
+    "bank.inventory",
     "extension.started",
     "extension.boot_error",
     "extension.observer_error",
@@ -169,7 +170,18 @@
       "ttfbMs",
       "priority",
       "result",
-      "reason"
+      "reason",
+      "sessionGeneration",
+      "storedBytes",
+      "storedChunks",
+      "maxBankBytes",
+      "queued",
+      "inflight",
+      "prefetchConcurrency",
+      "disabled",
+      "routeActive",
+      "pairedAddressAvailable",
+      "resources"
     ]),
     extension: Object.freeze(["action", "reason", "status"]),
     persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
@@ -192,8 +204,41 @@
   var mediaSourceInstances = /* @__PURE__ */ new WeakMap();
   var sourceBufferInstances = /* @__PURE__ */ new WeakMap();
   var sourceBufferRecords = /* @__PURE__ */ new WeakMap();
+  var mediaSourceObjectUrls = /* @__PURE__ */ new WeakMap();
   var liveMediaSources = [];
   var nextMediaSourceInstance = 1;
+  function currentVideoSource() {
+    if (typeof document.querySelectorAll !== "function") return "";
+    const videos = [...document.querySelectorAll("video")];
+    const video = videos.sort((left, right) => (right.clientWidth || 0) * (right.clientHeight || 0) - (left.clientWidth || 0) * (left.clientHeight || 0))[0];
+    return video?.currentSrc || video?.src || "";
+  }
+  function mediaSourceAttached(mediaSource) {
+    const source = currentVideoSource();
+    const urls = mediaSourceObjectUrls.get(mediaSource);
+    return source.length > 0 && urls?.has(source) === true;
+  }
+  if (typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
+    const originalCreateObjectURL = URL.createObjectURL;
+    URL.createObjectURL = function smoothCreateObjectURL(value) {
+      const url = originalCreateObjectURL.call(this, value);
+      if (typeof MediaSource !== "undefined" && value instanceof MediaSource) {
+        const urls = mediaSourceObjectUrls.get(value) || /* @__PURE__ */ new Set();
+        urls.add(url);
+        mediaSourceObjectUrls.set(value, urls);
+      }
+      return url;
+    };
+    if (typeof URL.revokeObjectURL === "function") {
+      const originalRevokeObjectURL = URL.revokeObjectURL;
+      URL.revokeObjectURL = function smoothRevokeObjectURL(url) {
+        for (const mediaSource of collectLiveMediaSources()) {
+          mediaSourceObjectUrls.get(mediaSource)?.delete(url);
+        }
+        return originalRevokeObjectURL.call(this, url);
+      };
+    }
+  }
   function readSourceBufferRanges(sourceBuffer) {
     const ranges = [];
     try {
@@ -304,6 +349,8 @@
             ranges: readSourceBufferRanges(sourceBuffer),
             updating: record.pendingAppend !== void 0,
             pendingSinceMs: record.pendingAppend === void 0 ? null : Math.max(0, now - record.pendingAppend.startedAt),
+            lastAppendAgoMs: Number.isFinite(record.lastAppendAt) ? Math.max(0, now - record.lastAppendAt) : UNKNOWN_VALUE,
+            attached: mediaSourceAttached(mediaSource),
             appends: record.appends,
             appendErrors: { ...record.appendErrors }
           });

@@ -1110,6 +1110,17 @@ test('CDN panel aggregates paired legs by source pathname and renders no media U
     assert.equal(summary.pairedChunks, 3);
     assert.equal(summary.pairCoverage, 0.75);
     assert.equal(summary.wastedByteRatio, 70 / 310);
+    assert.deepEqual(summary.byResult, {
+      fetched: 4,
+      lost_race: 2,
+      stalled: 1,
+      aborted: 0,
+      superseded: 0,
+      network_error: 0,
+      http_error: 0,
+      invalid_response: 0,
+      gave_up: 0,
+    });
     assert.deepEqual(summary.rows, [
       {
         mirror: 'cdn-a.example',
@@ -1162,23 +1173,15 @@ test('CDN panel aggregates paired legs by source pathname and renders no media U
     assert.match(rendered, /cdn-a\.example/);
     assert.doesNotMatch(rendered, /https?:\/\/|signature=secret/);
 
-    const pageEvents = [events.slice(0, 4), events.slice(4)];
+    fixture.elements.get('[data-session-filter]').value = 'session-cdn';
     globalThis.chrome.runtime.sendMessage = async (message) => {
       fixture.messages.push(message);
-      if (message.type === 'logs:max-event-id') return { ok: true, maxEventId: 7 };
-      const page = pageEvents.shift();
-      return {
-        ok: true,
-        events: page,
-        hasMore: pageEvents.length > 0,
-        ...(pageEvents.length > 0 ? { nextAfterEventId: 4 } : { nextAfterEventId: 7 }),
-      };
+      assert.equal(message.type, 'logs:cdn-summary');
+      return { ok: true, maxEventId: 7, sampleCount: events.length, summary };
     };
     await fixture.elements.get('[data-cdn-refresh]').listeners.get('click')();
-    assert.deepEqual(fixture.messages.map(({ type }) => type), [
-      'logs:max-event-id',
-      'logs:events-page',
-      'logs:events-page',
+    assert.deepEqual(fixture.messages.map(({ type, sessionId }) => ({ type, sessionId })), [
+      { type: 'logs:cdn-summary', sessionId: 'session-cdn' },
     ]);
     assert.equal(fixture.messages.some((message) => message.type === 'diagnostic:events'), false);
   } finally {

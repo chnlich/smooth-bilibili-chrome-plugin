@@ -328,6 +328,7 @@ assert.equal(EVENT_CODES.includes('media.append'), true);
 assert.equal(EVENT_CODES.includes('bank.evict'), true);
 assert.equal(EVENT_CODES.includes('bank.store'), true);
 assert.equal(EVENT_CODES.includes('bank.disabled'), true);
+assert.equal(EVENT_CODES.includes('bank.inventory'), true);
 assert.deepEqual([...DATA_ALLOWLIST.bank].sort(), [
   'bytes',
   'chunkIndex',
@@ -342,6 +343,17 @@ assert.deepEqual([...DATA_ALLOWLIST.bank].sort(), [
   'start',
   'slot',
   'ttfbMs',
+  'sessionGeneration',
+  'storedBytes',
+  'storedChunks',
+  'maxBankBytes',
+  'queued',
+  'inflight',
+  'prefetchConcurrency',
+  'disabled',
+  'routeActive',
+  'pairedAddressAvailable',
+  'resources',
 ].sort());
 for (const field of [
   'mediaSourceInstance',

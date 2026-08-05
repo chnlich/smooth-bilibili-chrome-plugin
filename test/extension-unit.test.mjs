@@ -10,7 +10,13 @@ import {
 } from '../src/extension/bridge-contract.js';
 import { BridgeCore } from '../src/extension/bridge-client.js';
 import { createManifest } from '../src/extension/manifest-source.js';
-import { installPopupMessageHandler, isVideoPage, isVodPage, modeForLocation } from '../src/extension/controller.js';
+import {
+  installBankDiagnostics,
+  installPopupMessageHandler,
+  isVideoPage,
+  isVodPage,
+  modeForLocation,
+} from '../src/extension/controller.js';
 import { createStatusPanel, createUnavailableStatusSnapshot, STATUS_MESSAGE_VERSION } from '../src/ui/panel.js';
 import { logSessionFragment, sessionIdFromHash } from '../src/diagnostics/log-session.js';
 import { assertAppendSessionPolicy, isSessionWithinEventCutoff, readLogs } from '../src/diagnostics/worker.js';
@@ -131,6 +137,94 @@ test('popup diagnostics session request is a fixed narrow message and never expa
     sessionId: 'session-video-popup',
   });
   panel.destroy();
+});
+
+test('popup readouts:get is a separate structured message while status:get stays narrow', async () => {
+  let listener;
+  installPopupMessageHandler({
+    onMessage: {
+      addListener(callback) {
+        listener = callback;
+      },
+    },
+  }, () => 'session-readout', () => ({
+    version: STATUS_MESSAGE_VERSION,
+    surfaceId: 'surface-readout',
+    media: { forwardSeconds: 1, tracks: [] },
+    bank: '未提供',
+    bankSecondsEstimated: {},
+    diagnostics: { sessionId: 'session-readout', persistence: 'PERSISTED' },
+  }));
+  const response = await new Promise((resolve) => {
+    const result = listener({ version: STATUS_MESSAGE_VERSION, type: 'readouts:get' }, {}, resolve);
+    assert.equal(result, true);
+  });
+  assert.equal(response.version, STATUS_MESSAGE_VERSION);
+  assert.equal(response.surfaceId, 'surface-readout');
+  assert.equal(Array.isArray(response.media.tracks), true);
+  assert.deepEqual(Object.keys(response).sort(), [
+    'bank',
+    'bankSecondsEstimated',
+    'diagnostics',
+    'media',
+    'surfaceId',
+    'version',
+  ]);
+});
+
+test('bank diagnostic listener retains a sanitized inventory for readouts', () => {
+  let listener;
+  const messages = [];
+  const windowObject = {
+    addEventListener(name, callback) {
+      assert.equal(name, 'message');
+      listener = callback;
+    },
+    removeEventListener() {},
+  };
+  const diagnostics = { log(code, data) { messages.push({ code, data }); } };
+  const installed = installBankDiagnostics({ windowObject, diagnostics, now: () => 42 });
+  listener({
+    source: windowObject,
+    data: {
+      namespace: 'bilibili-buffer:segment-bank-v1',
+      direction: 'event',
+      type: 'diagnostic',
+      code: 'bank.inventory',
+      data: {
+        sessionGeneration: 1,
+        storedBytes: 0,
+        storedChunks: 0,
+        maxBankBytes: 10,
+        queued: 0,
+        inflight: 0,
+        prefetchConcurrency: 2,
+        disabled: false,
+        routeActive: true,
+        pairedAddressAvailable: false,
+        resources: [{
+          pathname: '/video/segment.m4s?signature=secret#hash',
+          kind: 'video',
+          label: '720P',
+          height: 720,
+          codecs: 'avc1',
+          bandwidth: 10,
+          storedBytes: 0,
+          storedChunks: 0,
+          totalSize: '未提供',
+          lastForegroundEnd: '未提供',
+          outstanding: 0,
+          retrying: 0,
+          active: false,
+        }],
+      },
+    },
+  });
+  assert.equal(messages.length, 1);
+  assert.equal(installed.latestInventory().receivedAtMs, 42);
+  assert.equal(installed.latestInventory().data.resources[0].pathname, '/video/segment.m4s');
+  assert.doesNotMatch(JSON.stringify(installed.latestInventory()), /signature=secret|hash/);
+  installed.destroy();
 });
 
 test('bridge contract allows only the native video hint operations', () => {

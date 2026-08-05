@@ -3,12 +3,14 @@ import { EVENT_INDEX, EVENT_STORE, SESSION_STORE, openLogDatabase } from './idb.
 import { normalizeEventForStorage } from './privacy.js';
 import { sessionWithTabId, validateSession } from './session.js';
 import { serializeError } from '../extension/bridge-contract.js';
+import { aggregateCdnEvents } from './cdn.js';
 
 const BATCH_TYPE = 'diagnostic:events';
 const READ_TYPES = new Set([
   'logs:max-event-id',
   'logs:sessions-page',
   'logs:events-page',
+  'logs:cdn-summary',
 ]);
 
 function storageError(code, message, cause) {
@@ -199,6 +201,7 @@ function validateReadMessage(message) {
     'logs:max-event-id': ['type', 'version', 'sessionId'],
     'logs:sessions-page': ['type', 'version', 'limit', 'afterSessionId', 'maxEventId', 'sessionId'],
     'logs:events-page': ['type', 'version', 'limit', 'afterEventId', 'maxEventId', 'sessionId'],
+    'logs:cdn-summary': ['type', 'version', 'sessionId'],
   }[message.type];
   if (Object.keys(message).some((field) => !allowed.includes(field))) {
     throw storageError('MESSAGE_INVALID', '日志读取消息包含未允许字段');
@@ -207,6 +210,10 @@ function validateReadMessage(message) {
     if (message[field] !== undefined && (typeof message[field] !== 'string' || message[field].length === 0)) {
       throw storageError('MESSAGE_INVALID', `${field} 无效`);
     }
+  }
+  if (message.type === 'logs:cdn-summary'
+    && (typeof message.sessionId !== 'string' || message.sessionId.length === 0)) {
+    throw storageError('MESSAGE_INVALID', 'CDN summary sessionId 无效');
   }
   return message;
 }
@@ -359,10 +366,40 @@ async function readEventsPage(message, indexedDbObject) {
   });
 }
 
+async function readCdnSummary(message, indexedDbObject) {
+  const database = await openLogDatabase(indexedDbObject);
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(EVENT_STORE, 'readonly');
+    const index = transaction.objectStore(EVENT_STORE).index(EVENT_INDEX);
+    const request = index.openCursor(
+      IDBKeyRange.bound([message.sessionId, 0], [message.sessionId, Number.MAX_SAFE_INTEGER]),
+    );
+    const events = [];
+    let maxEventId = 0;
+    request.onerror = () => reject(request.error || new Error('读取 CDN summary 事件失败'));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor === null) {
+        const summary = aggregateCdnEvents(events);
+        resolve({ maxEventId, sampleCount: events.length, summary });
+        return;
+      }
+      const event = cursor.value;
+      const eventId = cursor.primaryKey ?? event.eventId;
+      if (Number.isInteger(eventId) && eventId > maxEventId) maxEventId = eventId;
+      if (event.code === 'bank.fetch.chunk') events.push(event);
+      cursor.continue();
+    };
+    transaction.oncomplete = () => database.close();
+    transaction.onerror = () => reject(transaction.error || new Error('读取 CDN summary 事务失败'));
+  });
+}
+
 async function readLogs(message, indexedDbObject) {
   validateReadMessage(message);
   if (message.type === 'logs:max-event-id') return readMaxEventId(message, indexedDbObject);
   if (message.type === 'logs:sessions-page') return readSessionsPage(message, indexedDbObject);
+  if (message.type === 'logs:cdn-summary') return readCdnSummary(message, indexedDbObject);
   return readEventsPage(message, indexedDbObject);
 }
 

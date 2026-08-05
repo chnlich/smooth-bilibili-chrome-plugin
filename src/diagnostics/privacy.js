@@ -117,6 +117,12 @@ function safeSourceBufferRanges(value) {
     if (Object.prototype.hasOwnProperty.call(track, 'pendingSinceMs')) {
       result.pendingSinceMs = track.pendingSinceMs === null ? null : safeNonnegativeNumber(track.pendingSinceMs);
     }
+    if (Object.prototype.hasOwnProperty.call(track, 'lastAppendAgoMs')) {
+      result.lastAppendAgoMs = safeNonnegativeNumber(track.lastAppendAgoMs);
+    }
+    if (Object.prototype.hasOwnProperty.call(track, 'attached')) {
+      result.attached = track.attached === true || track.attached === false ? track.attached : UNKNOWN_VALUE;
+    }
     if (Object.prototype.hasOwnProperty.call(track, 'appends')) {
       result.appends = safeNonnegativeInteger(track.appends);
     }
@@ -124,6 +130,37 @@ function safeSourceBufferRanges(value) {
       result.appendErrors = safeAppendErrors(track.appendErrors);
     }
     return result;
+  });
+}
+
+function safeInventoryResources(value) {
+  if (!Array.isArray(value)) return UNKNOWN_VALUE;
+  return value.map((resource) => {
+    if (resource === null || typeof resource !== 'object' || Array.isArray(resource)) {
+      throw new Error('inventory resource structure is invalid');
+    }
+    const pathname = typeof resource.pathname === 'string' && resource.pathname.startsWith('/')
+      ? scrubPathname(resource.pathname)
+      : UNKNOWN_VALUE;
+    const kind = ['video', 'audio'].includes(resource.kind) ? resource.kind : UNKNOWN_VALUE;
+    const label = typeof resource.label === 'string' ? resource.label : UNKNOWN_VALUE;
+    const codecs = typeof resource.codecs === 'string' ? resource.codecs : UNKNOWN_VALUE;
+    const active = resource.active === true || resource.active === false ? resource.active : UNKNOWN_VALUE;
+    return {
+      pathname,
+      kind,
+      label,
+      height: safeNonnegativeInteger(resource.height),
+      codecs,
+      bandwidth: safeNonnegativeInteger(resource.bandwidth),
+      storedBytes: safeNonnegativeInteger(resource.storedBytes),
+      storedChunks: safeNonnegativeInteger(resource.storedChunks),
+      totalSize: safeNonnegativeInteger(resource.totalSize),
+      lastForegroundEnd: safeNonnegativeInteger(resource.lastForegroundEnd),
+      outstanding: safeNonnegativeInteger(resource.outstanding),
+      retrying: safeNonnegativeInteger(resource.retrying),
+      active,
+    };
   });
 }
 
@@ -197,6 +234,7 @@ function sanitizeField(field, value) {
   if (field === 'bufferedRanges' || field === 'seekableRanges'
     || field === 'bufferedBefore' || field === 'bufferedAfter') return safeRangeList(value);
   if (field === 'sourceBufferRanges') return safeSourceBufferRanges(value);
+  if (field === 'resources') return safeInventoryResources(value);
   if (field === 'videoQuality') return safeVideoQuality(value);
   if (field === 'appendErrors') return safeAppendErrors(value);
   if (field === 'removeStats') return safeRemoveStats(value);
@@ -214,6 +252,18 @@ function sanitizeField(field, value) {
     return browserMetric(value);
   }
   if (field === 'enabled') return value === true || value === false ? value : UNKNOWN_VALUE;
+  if (['disabled', 'routeActive', 'pairedAddressAvailable'].includes(field)) {
+    return value === true || value === false ? value : UNKNOWN_VALUE;
+  }
+  if ([
+    'sessionGeneration',
+    'storedBytes',
+    'storedChunks',
+    'maxBankBytes',
+    'queued',
+    'inflight',
+    'prefetchConcurrency',
+  ].includes(field)) return safeNonnegativeInteger(value);
   if (field === 'code') return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
   if (field === 'message') return scrubErrorText(value);
   if (field === 'samples') return safeSampleList(value);

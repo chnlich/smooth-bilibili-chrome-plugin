@@ -80,6 +80,7 @@
     "bank.evict",
     "bank.store",
     "bank.disabled",
+    "bank.inventory",
     "extension.started",
     "extension.boot_error",
     "extension.observer_error",
@@ -180,7 +181,18 @@
       "ttfbMs",
       "priority",
       "result",
-      "reason"
+      "reason",
+      "sessionGeneration",
+      "storedBytes",
+      "storedChunks",
+      "maxBankBytes",
+      "queued",
+      "inflight",
+      "prefetchConcurrency",
+      "disabled",
+      "routeActive",
+      "pairedAddressAvailable",
+      "resources"
     ]),
     extension: Object.freeze(["action", "reason", "status"]),
     persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
@@ -328,6 +340,12 @@
       if (Object.prototype.hasOwnProperty.call(track, "pendingSinceMs")) {
         result.pendingSinceMs = track.pendingSinceMs === null ? null : safeNonnegativeNumber(track.pendingSinceMs);
       }
+      if (Object.prototype.hasOwnProperty.call(track, "lastAppendAgoMs")) {
+        result.lastAppendAgoMs = safeNonnegativeNumber(track.lastAppendAgoMs);
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "attached")) {
+        result.attached = track.attached === true || track.attached === false ? track.attached : UNKNOWN_VALUE;
+      }
       if (Object.prototype.hasOwnProperty.call(track, "appends")) {
         result.appends = safeNonnegativeInteger(track.appends);
       }
@@ -335,6 +353,34 @@
         result.appendErrors = safeAppendErrors(track.appendErrors);
       }
       return result;
+    });
+  }
+  function safeInventoryResources(value) {
+    if (!Array.isArray(value)) return UNKNOWN_VALUE;
+    return value.map((resource) => {
+      if (resource === null || typeof resource !== "object" || Array.isArray(resource)) {
+        throw new Error("inventory resource structure is invalid");
+      }
+      const pathname = typeof resource.pathname === "string" && resource.pathname.startsWith("/") ? scrubPathname(resource.pathname) : UNKNOWN_VALUE;
+      const kind = ["video", "audio"].includes(resource.kind) ? resource.kind : UNKNOWN_VALUE;
+      const label = typeof resource.label === "string" ? resource.label : UNKNOWN_VALUE;
+      const codecs = typeof resource.codecs === "string" ? resource.codecs : UNKNOWN_VALUE;
+      const active = resource.active === true || resource.active === false ? resource.active : UNKNOWN_VALUE;
+      return {
+        pathname,
+        kind,
+        label,
+        height: safeNonnegativeInteger(resource.height),
+        codecs,
+        bandwidth: safeNonnegativeInteger(resource.bandwidth),
+        storedBytes: safeNonnegativeInteger(resource.storedBytes),
+        storedChunks: safeNonnegativeInteger(resource.storedChunks),
+        totalSize: safeNonnegativeInteger(resource.totalSize),
+        lastForegroundEnd: safeNonnegativeInteger(resource.lastForegroundEnd),
+        outstanding: safeNonnegativeInteger(resource.outstanding),
+        retrying: safeNonnegativeInteger(resource.retrying),
+        active
+      };
     });
   }
   function safeAppendErrors(value) {
@@ -399,6 +445,7 @@
     if (field === "source" || field === "previousSource" || field === "name") return scrubUrl(value);
     if (field === "bufferedRanges" || field === "seekableRanges" || field === "bufferedBefore" || field === "bufferedAfter") return safeRangeList(value);
     if (field === "sourceBufferRanges") return safeSourceBufferRanges(value);
+    if (field === "resources") return safeInventoryResources(value);
     if (field === "videoQuality") return safeVideoQuality(value);
     if (field === "appendErrors") return safeAppendErrors(value);
     if (field === "removeStats") return safeRemoveStats(value);
@@ -408,6 +455,18 @@
       return browserMetric(value);
     }
     if (field === "enabled") return value === true || value === false ? value : UNKNOWN_VALUE;
+    if (["disabled", "routeActive", "pairedAddressAvailable"].includes(field)) {
+      return value === true || value === false ? value : UNKNOWN_VALUE;
+    }
+    if ([
+      "sessionGeneration",
+      "storedBytes",
+      "storedChunks",
+      "maxBankBytes",
+      "queued",
+      "inflight",
+      "prefetchConcurrency"
+    ].includes(field)) return safeNonnegativeInteger(value);
     if (field === "code") return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
     if (field === "message") return scrubErrorText(value);
     if (field === "samples") return safeSampleList(value);
@@ -662,12 +721,116 @@
     };
   }
 
+  // src/diagnostics/cdn.js
+  var CDN_RESULT_VALUES = Object.freeze([
+    "fetched",
+    "lost_race",
+    "stalled",
+    "aborted",
+    "superseded",
+    "network_error",
+    "http_error",
+    "invalid_response",
+    "gave_up"
+  ]);
+  function chunkGroupKey(data) {
+    return JSON.stringify([new URL(data.source).pathname, data.chunkIndex, data.start]);
+  }
+  function finiteValue(value) {
+    if (!Number.isFinite(value)) throw new Error(`CDN 事件 bytes 无效: ${value}`);
+    return value;
+  }
+  function percentile(values, probability) {
+    if (values.length === 0) return void 0;
+    const ordered = [...values].sort((left, right) => left - right);
+    const index = (ordered.length - 1) * probability;
+    const lower = Math.floor(index);
+    const upper = Math.ceil(index);
+    if (lower === upper) return ordered[lower];
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower);
+  }
+  function mirrorStatsFor(mirrors, mirror) {
+    let stats = mirrors.get(mirror);
+    if (stats === void 0) {
+      stats = {
+        mirror,
+        racesEntered: 0,
+        wins: 0,
+        ttfbValues: [],
+        stalled: 0,
+        bytesDelivered: 0
+      };
+      mirrors.set(mirror, stats);
+    }
+    return stats;
+  }
+  function isPairedRace(legs) {
+    return new Set(legs.map((leg) => leg.slot)).size >= 2;
+  }
+  function aggregateCdnEvents(events) {
+    const chunks = /* @__PURE__ */ new Map();
+    const mirrors = /* @__PURE__ */ new Map();
+    const byResult = Object.fromEntries(CDN_RESULT_VALUES.map((result) => [result, 0]));
+    let fetchedBytes = 0;
+    let wastedBytes = 0;
+    for (const event of events) {
+      if (event.code !== "bank.fetch.chunk") continue;
+      const data = event.data;
+      const stats = mirrorStatsFor(mirrors, data.mirror);
+      const bytes = finiteValue(data.bytes);
+      if (Object.hasOwn(byResult, data.result)) byResult[data.result] += 1;
+      if (data.result === "fetched") {
+        stats.bytesDelivered += bytes;
+        fetchedBytes += bytes;
+      }
+      if (data.result === "lost_race") wastedBytes += bytes;
+      if (data.result === "stalled") stats.stalled += 1;
+      if (Number.isFinite(data.ttfbMs)) stats.ttfbValues.push(data.ttfbMs);
+      const key = chunkGroupKey(data);
+      const legs = chunks.get(key) || [];
+      legs.push(data);
+      chunks.set(key, legs);
+    }
+    let pairedChunks = 0;
+    for (const legs of chunks.values()) {
+      if (!isPairedRace(legs)) continue;
+      pairedChunks += 1;
+      for (const leg of legs) {
+        const stats = mirrorStatsFor(mirrors, leg.mirror);
+        stats.racesEntered += 1;
+        if (leg.result === "fetched") stats.wins += 1;
+      }
+    }
+    const rows = [...mirrors.values()].sort((left, right) => String(left.mirror).localeCompare(String(right.mirror))).map((stats) => ({
+      mirror: stats.mirror,
+      racesEntered: stats.racesEntered,
+      wins: stats.wins,
+      winRate: stats.racesEntered === 0 ? 0 : stats.wins / stats.racesEntered,
+      ttfbP50: percentile(stats.ttfbValues, 0.5),
+      ttfbP90: percentile(stats.ttfbValues, 0.9),
+      stalled: stats.stalled,
+      bytesDelivered: stats.bytesDelivered
+    }));
+    const totalChunks = chunks.size;
+    return {
+      totalChunks,
+      pairedChunks,
+      pairCoverage: totalChunks === 0 ? 0 : pairedChunks / totalChunks,
+      fetchedBytes,
+      wastedBytes,
+      wastedByteRatio: fetchedBytes === 0 ? 0 : wastedBytes / fetchedBytes,
+      byResult,
+      rows
+    };
+  }
+
   // src/diagnostics/worker.js
   var BATCH_TYPE = "diagnostic:events";
   var READ_TYPES = /* @__PURE__ */ new Set([
     "logs:max-event-id",
     "logs:sessions-page",
-    "logs:events-page"
+    "logs:events-page",
+    "logs:cdn-summary"
   ]);
   function storageError(code, message, cause) {
     return Object.assign(new Error(message, { cause }), { code });
@@ -846,7 +1009,8 @@
     const allowed = {
       "logs:max-event-id": ["type", "version", "sessionId"],
       "logs:sessions-page": ["type", "version", "limit", "afterSessionId", "maxEventId", "sessionId"],
-      "logs:events-page": ["type", "version", "limit", "afterEventId", "maxEventId", "sessionId"]
+      "logs:events-page": ["type", "version", "limit", "afterEventId", "maxEventId", "sessionId"],
+      "logs:cdn-summary": ["type", "version", "sessionId"]
     }[message.type];
     if (Object.keys(message).some((field) => !allowed.includes(field))) {
       throw storageError("MESSAGE_INVALID", "日志读取消息包含未允许字段");
@@ -855,6 +1019,9 @@
       if (message[field] !== void 0 && (typeof message[field] !== "string" || message[field].length === 0)) {
         throw storageError("MESSAGE_INVALID", `${field} 无效`);
       }
+    }
+    if (message.type === "logs:cdn-summary" && (typeof message.sessionId !== "string" || message.sessionId.length === 0)) {
+      throw storageError("MESSAGE_INVALID", "CDN summary sessionId 无效");
     }
     return message;
   }
@@ -991,10 +1158,39 @@
       transaction.onerror = () => reject(transaction.error || new Error("读取 event 分页事务失败"));
     });
   }
+  async function readCdnSummary(message, indexedDbObject) {
+    const database = await openLogDatabase(indexedDbObject);
+    return new Promise((resolve, reject) => {
+      const transaction = database.transaction(EVENT_STORE, "readonly");
+      const index = transaction.objectStore(EVENT_STORE).index(EVENT_INDEX);
+      const request = index.openCursor(
+        IDBKeyRange.bound([message.sessionId, 0], [message.sessionId, Number.MAX_SAFE_INTEGER])
+      );
+      const events = [];
+      let maxEventId = 0;
+      request.onerror = () => reject(request.error || new Error("读取 CDN summary 事件失败"));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor === null) {
+          const summary = aggregateCdnEvents(events);
+          resolve({ maxEventId, sampleCount: events.length, summary });
+          return;
+        }
+        const event = cursor.value;
+        const eventId = cursor.primaryKey ?? event.eventId;
+        if (Number.isInteger(eventId) && eventId > maxEventId) maxEventId = eventId;
+        if (event.code === "bank.fetch.chunk") events.push(event);
+        cursor.continue();
+      };
+      transaction.oncomplete = () => database.close();
+      transaction.onerror = () => reject(transaction.error || new Error("读取 CDN summary 事务失败"));
+    });
+  }
   async function readLogs(message, indexedDbObject) {
     validateReadMessage(message);
     if (message.type === "logs:max-event-id") return readMaxEventId(message, indexedDbObject);
     if (message.type === "logs:sessions-page") return readSessionsPage(message, indexedDbObject);
+    if (message.type === "logs:cdn-summary") return readCdnSummary(message, indexedDbObject);
     return readEventsPage(message, indexedDbObject);
   }
   async function handleMessage(message, sender, indexedDbObject = globalThis.indexedDB) {

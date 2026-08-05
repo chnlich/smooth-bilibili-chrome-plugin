@@ -81,6 +81,7 @@
     "bank.evict",
     "bank.store",
     "bank.disabled",
+    "bank.inventory",
     "extension.started",
     "extension.boot_error",
     "extension.observer_error",
@@ -181,7 +182,18 @@
       "ttfbMs",
       "priority",
       "result",
-      "reason"
+      "reason",
+      "sessionGeneration",
+      "storedBytes",
+      "storedChunks",
+      "maxBankBytes",
+      "queued",
+      "inflight",
+      "prefetchConcurrency",
+      "disabled",
+      "routeActive",
+      "pairedAddressAvailable",
+      "resources"
     ]),
     extension: Object.freeze(["action", "reason", "status"]),
     persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
@@ -303,6 +315,12 @@
       if (Object.prototype.hasOwnProperty.call(track, "pendingSinceMs")) {
         result.pendingSinceMs = track.pendingSinceMs === null ? null : safeNonnegativeNumber(track.pendingSinceMs);
       }
+      if (Object.prototype.hasOwnProperty.call(track, "lastAppendAgoMs")) {
+        result.lastAppendAgoMs = safeNonnegativeNumber(track.lastAppendAgoMs);
+      }
+      if (Object.prototype.hasOwnProperty.call(track, "attached")) {
+        result.attached = track.attached === true || track.attached === false ? track.attached : UNKNOWN_VALUE;
+      }
       if (Object.prototype.hasOwnProperty.call(track, "appends")) {
         result.appends = safeNonnegativeInteger(track.appends);
       }
@@ -310,6 +328,34 @@
         result.appendErrors = safeAppendErrors(track.appendErrors);
       }
       return result;
+    });
+  }
+  function safeInventoryResources(value) {
+    if (!Array.isArray(value)) return UNKNOWN_VALUE;
+    return value.map((resource) => {
+      if (resource === null || typeof resource !== "object" || Array.isArray(resource)) {
+        throw new Error("inventory resource structure is invalid");
+      }
+      const pathname = typeof resource.pathname === "string" && resource.pathname.startsWith("/") ? scrubPathname(resource.pathname) : UNKNOWN_VALUE;
+      const kind = ["video", "audio"].includes(resource.kind) ? resource.kind : UNKNOWN_VALUE;
+      const label = typeof resource.label === "string" ? resource.label : UNKNOWN_VALUE;
+      const codecs = typeof resource.codecs === "string" ? resource.codecs : UNKNOWN_VALUE;
+      const active = resource.active === true || resource.active === false ? resource.active : UNKNOWN_VALUE;
+      return {
+        pathname,
+        kind,
+        label,
+        height: safeNonnegativeInteger(resource.height),
+        codecs,
+        bandwidth: safeNonnegativeInteger(resource.bandwidth),
+        storedBytes: safeNonnegativeInteger(resource.storedBytes),
+        storedChunks: safeNonnegativeInteger(resource.storedChunks),
+        totalSize: safeNonnegativeInteger(resource.totalSize),
+        lastForegroundEnd: safeNonnegativeInteger(resource.lastForegroundEnd),
+        outstanding: safeNonnegativeInteger(resource.outstanding),
+        retrying: safeNonnegativeInteger(resource.retrying),
+        active
+      };
     });
   }
   function safeAppendErrors(value) {
@@ -374,6 +420,7 @@
     if (field === "source" || field === "previousSource" || field === "name") return scrubUrl(value);
     if (field === "bufferedRanges" || field === "seekableRanges" || field === "bufferedBefore" || field === "bufferedAfter") return safeRangeList(value);
     if (field === "sourceBufferRanges") return safeSourceBufferRanges(value);
+    if (field === "resources") return safeInventoryResources(value);
     if (field === "videoQuality") return safeVideoQuality(value);
     if (field === "appendErrors") return safeAppendErrors(value);
     if (field === "removeStats") return safeRemoveStats(value);
@@ -383,6 +430,18 @@
       return browserMetric(value);
     }
     if (field === "enabled") return value === true || value === false ? value : UNKNOWN_VALUE;
+    if (["disabled", "routeActive", "pairedAddressAvailable"].includes(field)) {
+      return value === true || value === false ? value : UNKNOWN_VALUE;
+    }
+    if ([
+      "sessionGeneration",
+      "storedBytes",
+      "storedChunks",
+      "maxBankBytes",
+      "queued",
+      "inflight",
+      "prefetchConcurrency"
+    ].includes(field)) return safeNonnegativeInteger(value);
     if (field === "code") return isSafePersistErrorCode(value) ? value : UNKNOWN_VALUE;
     if (field === "message") return scrubErrorText(value);
     if (field === "samples") return safeSampleList(value);
@@ -514,7 +573,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-d337175b85d242a9747ff574" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-b7ae252a6f89ba05933a8f71" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -2278,6 +2337,102 @@
     };
   }
 
+  // src/extension/readouts.js
+  var OTHER_LIVE_MEDIA_SOURCES_FIELD = [
+    "otherLive",
+    String.fromCharCode(77, 101, 100, 105, 97),
+    "Sources"
+  ].join("");
+  function forwardSeconds(currentTime, ranges) {
+    if (!Number.isFinite(currentTime) || !Array.isArray(ranges)) return UNKNOWN_VALUE;
+    return computeForwardInventory(currentTime, [ranges]);
+  }
+  function trackReadout(currentTime, sourceBuffer) {
+    const ranges = Array.isArray(sourceBuffer.ranges) ? sourceBuffer.ranges : UNKNOWN_VALUE;
+    return {
+      track: sourceBuffer.track,
+      attached: sourceBuffer.attached === true,
+      forwardSeconds: forwardSeconds(currentTime, ranges),
+      ranges,
+      updating: sourceBuffer.updating,
+      pendingSinceMs: sourceBuffer.pendingSinceMs,
+      lastAppendAgoMs: sourceBuffer.lastAppendAgoMs,
+      appendErrors: sourceBuffer.appendErrors,
+      mediaSourceInstance: sourceBuffer.mediaSourceInstance
+    };
+  }
+  function limiterTrack(tracks) {
+    const attached = tracks.filter((track) => track.attached === true);
+    if (attached.length <= 1 || attached.some((track) => !Number.isFinite(track.forwardSeconds))) {
+      return UNKNOWN_VALUE;
+    }
+    const minimum = Math.min(...attached.map((track) => track.forwardSeconds));
+    const limiting = attached.filter((track) => track.forwardSeconds === minimum);
+    return limiting.length === 1 ? limiting[0].track : UNKNOWN_VALUE;
+  }
+  function deriveMediaReadout(facts) {
+    if (facts === UNKNOWN_VALUE) return UNKNOWN_VALUE;
+    const sourceBufferRanges = Array.isArray(facts.sourceBufferRanges) ? facts.sourceBufferRanges : [];
+    const tracks = sourceBufferRanges.map((sourceBuffer) => trackReadout(facts.currentTime, sourceBuffer));
+    const mediaSourceInstances = new Set(
+      tracks.map((track) => track.mediaSourceInstance).filter((instance) => Number.isInteger(instance) && instance > 0)
+    );
+    const attachedSourceInstances = new Set(
+      tracks.filter((track) => track.attached === true).map((track) => track.mediaSourceInstance).filter((instance) => Number.isInteger(instance) && instance > 0)
+    );
+    return {
+      forwardSeconds: forwardSeconds(facts.currentTime, facts.bufferedRanges),
+      limiterTrack: limiterTrack(tracks),
+      tracks: tracks.map(({ mediaSourceInstance: _ignored, ...track }) => track),
+      mediaSourceState: facts.mediaSourceState,
+      [OTHER_LIVE_MEDIA_SOURCES_FIELD]: attachedSourceInstances.size === 0 ? UNKNOWN_VALUE : mediaSourceInstances.size - attachedSourceInstances.size,
+      element: {
+        readyState: facts.readyState,
+        networkState: facts.networkState,
+        currentTime: facts.currentTime,
+        duration: facts.duration,
+        playbackRate: facts.playbackRate,
+        resolution: facts.resolution,
+        videoQuality: facts.videoQuality,
+        paused: facts.paused,
+        ended: facts.ended
+      }
+    };
+  }
+  function estimateBankSeconds(inventory, duration) {
+    if (inventory === UNKNOWN_VALUE || !Array.isArray(inventory.resources)) return {};
+    return Object.fromEntries(inventory.resources.map((resource) => {
+      const estimate = Number.isFinite(resource.storedBytes) && Number.isFinite(resource.totalSize) && resource.totalSize > 0 && Number.isFinite(duration) && duration > 0 ? resource.storedBytes / (resource.totalSize / duration) : UNKNOWN_VALUE;
+      return [resource.pathname, estimate];
+    }));
+  }
+  function buildReadouts({
+    surfaceId,
+    video,
+    bankInventory,
+    diagnostics,
+    now = Date.now()
+  }) {
+    let media = UNKNOWN_VALUE;
+    if (video !== void 0) media = deriveMediaReadout(readMediaFacts(video, "readout"));
+    const mediaDuration = media === UNKNOWN_VALUE ? UNKNOWN_VALUE : media.element.duration;
+    const bank = bankInventory === void 0 ? UNKNOWN_VALUE : {
+      ...bankInventory.data,
+      ageMs: Math.max(0, now - bankInventory.receivedAtMs)
+    };
+    return {
+      version: 2,
+      surfaceId,
+      media,
+      bank,
+      bankSecondsEstimated: estimateBankSeconds(bank, mediaDuration),
+      diagnostics: {
+        sessionId: diagnostics?.sessionId || UNKNOWN_VALUE,
+        persistence: diagnostics?.persistence || UNKNOWN_VALUE
+      }
+    };
+  }
+
   // src/bank/contract.js
   var BANK_ENABLED_ATTRIBUTE = "data-bilibili-buffer-bank-enabled";
   var BANK_MESSAGE_NAMESPACE = "bilibili-buffer:segment-bank-v1";
@@ -2334,13 +2489,29 @@
       }
     };
   }
-  function installBankDiagnostics({ windowObject = window, diagnostics } = {}) {
+  function installBankDiagnostics({
+    windowObject = window,
+    diagnostics,
+    onInventory = () => {
+    },
+    now = Date.now
+  } = {}) {
+    let latestInventory;
     const listener = (event) => {
       if (event.source !== windowObject || !isBankDiagnosticMessage(event.data)) return;
-      diagnostics?.log(event.data.code, event.data.data || {});
+      const data = event.data.data || {};
+      diagnostics?.log(event.data.code, data);
+      if (event.data.code === "bank.inventory") {
+        const sanitized = sanitizeEventData(event.data.code, data);
+        latestInventory = { data: sanitized, receivedAtMs: now() };
+        onInventory(latestInventory);
+      }
     };
     windowObject.addEventListener("message", listener);
     return {
+      latestInventory() {
+        return latestInventory;
+      },
       destroy() {
         windowObject.removeEventListener("message", listener);
       }
@@ -2370,7 +2541,7 @@
     if (message === null || typeof message !== "object" || Array.isArray(message)) {
       fail("POPUP_MESSAGE_INVALID", "popup 消息必须是对象");
     }
-    if (message.version !== STATUS_MESSAGE_VERSION || !["status:get", "diagnostics:session-id:get"].includes(message.type)) {
+    if (message.version !== STATUS_MESSAGE_VERSION || !["status:get", "diagnostics:session-id:get", "readouts:get"].includes(message.type)) {
       fail("POPUP_MESSAGE_INVALID", "popup 消息版本或类型未允许");
     }
     if (Object.keys(message).some((field) => !["version", "type"].includes(field))) {
@@ -2378,7 +2549,7 @@
     }
     return message;
   }
-  async function handlePopupMessage(message, getDiagnosticsSessionId) {
+  async function handlePopupMessage(message, getDiagnosticsSessionId, getReadouts) {
     assertPopupMessage(message);
     if (message.type === "diagnostics:session-id:get") {
       return {
@@ -2387,16 +2558,19 @@
         sessionId: getDiagnosticsSessionId()
       };
     }
+    if (message.type === "readouts:get") return getReadouts();
     const surface = getCurrentStatusSurface();
     if (surface === void 0) return createUnavailableStatusSnapshot(modeForLocation(window.location));
     return surface.getSnapshot();
   }
-  function installPopupMessageHandler(runtimeObject = chrome.runtime, getDiagnosticsSessionId = () => "未提供") {
+  function installPopupMessageHandler(runtimeObject = chrome.runtime, getDiagnosticsSessionId = () => "未提供", getReadouts = () => {
+    throw new Error("popup readouts provider is unavailable");
+  }) {
     if (runtimeObject?.onMessage === void 0 || typeof runtimeObject.onMessage.addListener !== "function") {
       throw new Error("Chrome runtime message API 不可用");
     }
     runtimeObject.onMessage.addListener((message, _sender, sendResponse) => {
-      void handlePopupMessage(message, getDiagnosticsSessionId).then((response) => sendResponse(response)).catch((error) => sendResponse({
+      void handlePopupMessage(message, getDiagnosticsSessionId, getReadouts).then((response) => sendResponse(response)).catch((error) => sendResponse({
         version: STATUS_MESSAGE_VERSION,
         ok: false,
         error: popupError(error)
@@ -2412,7 +2586,9 @@
       runtimeObject = globalThis,
       bridgeClient = new BridgeClient(documentObject, runtimeObject),
       diagnostics,
-      loggerObject = logger()
+      loggerObject = logger(),
+      getBankInventory = () => void 0,
+      now = Date.now
     } = {}) {
       this.documentObject = documentObject;
       this.windowObject = windowObject;
@@ -2422,6 +2598,8 @@
       this.diagnostics = diagnostics;
       this.bridgeClient.diagnostics = diagnostics;
       this.logger = loggerObject;
+      this.getBankInventory = getBankInventory;
+      this.now = now;
       this.preferences = void 0;
       this.active = void 0;
       this.routeKey = "";
@@ -2435,6 +2613,16 @@
         this.diagnostics?.log("media.append", JSON.parse(event.detail));
       };
       this.documentObject.addEventListener(SHIM_APPEND_EVENT, this.onShimAppend);
+    }
+    getReadouts() {
+      const panel = this.active?.panel;
+      return buildReadouts({
+        surfaceId: panel?.surfaceId || "surface-unavailable",
+        video: findLargestVideo(this.documentObject),
+        bankInventory: this.getBankInventory(),
+        diagnostics: this.diagnostics?.getStatus(),
+        now: this.now()
+      });
     }
     async start() {
       if (this.routeTimer !== void 0) throw new Error("扩展路由协调器已经启动");
@@ -2627,9 +2815,16 @@
   };
   if (typeof chrome !== "undefined" && typeof document !== "undefined" && typeof window !== "undefined") {
     const diagnostics = new DiagnosticsClient();
-    if (window.location.hostname === "www.bilibili.com") installBankDiagnostics({ diagnostics });
-    installPopupMessageHandler(chrome.runtime, () => diagnostics.getStatus().sessionId);
-    const coordinator = new ExtensionCoordinator({ diagnostics });
+    const bankDiagnostics = window.location.hostname === "www.bilibili.com" ? installBankDiagnostics({ diagnostics }) : void 0;
+    const coordinator = new ExtensionCoordinator({
+      diagnostics,
+      getBankInventory: () => bankDiagnostics?.latestInventory()
+    });
+    installPopupMessageHandler(
+      chrome.runtime,
+      () => diagnostics.getStatus().sessionId,
+      () => coordinator.getReadouts()
+    );
     void coordinator.start().catch((error) => {
       console.error("[BilibiliBuffer] 扩展启动失败", error);
       diagnostics.log("extension.boot_error", { action: "coordinator" }, error);

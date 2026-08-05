@@ -1,6 +1,7 @@
 import { EXTENSION_PREFERENCES } from '../constants.js';
 import { DiagnosticsClient, createRouteIdentity } from '../diagnostics/client.js';
 import { PassiveMediaObserver } from '../diagnostics/passive-media-observer.js';
+import { sanitizeEventData } from '../diagnostics/privacy.js';
 import { VodBufferController } from '../vod/controller.js';
 import { fail, toBufferScriptError } from '../errors.js';
 import {
@@ -11,6 +12,7 @@ import {
 } from '../ui/panel.js';
 import { BridgeClient, createPageWindowAdapter } from './bridge-client.js';
 import { SHIM_APPEND_EVENT } from './bridge-contract.js';
+import { buildReadouts } from './readouts.js';
 import {
   isBankDiagnosticMessage,
   postBankControl,
@@ -59,13 +61,28 @@ function logger() {
   };
 }
 
-export function installBankDiagnostics({ windowObject = window, diagnostics } = {}) {
+export function installBankDiagnostics({
+  windowObject = window,
+  diagnostics,
+  onInventory = () => {},
+  now = Date.now,
+} = {}) {
+  let latestInventory;
   const listener = (event) => {
     if (event.source !== windowObject || !isBankDiagnosticMessage(event.data)) return;
-    diagnostics?.log(event.data.code, event.data.data || {});
+    const data = event.data.data || {};
+    diagnostics?.log(event.data.code, data);
+    if (event.data.code === 'bank.inventory') {
+      const sanitized = sanitizeEventData(event.data.code, data);
+      latestInventory = { data: sanitized, receivedAtMs: now() };
+      onInventory(latestInventory);
+    }
   };
   windowObject.addEventListener('message', listener);
   return {
+    latestInventory() {
+      return latestInventory;
+    },
     destroy() {
       windowObject.removeEventListener('message', listener);
     },
@@ -99,7 +116,8 @@ function assertPopupMessage(message) {
   if (message === null || typeof message !== 'object' || Array.isArray(message)) {
     fail('POPUP_MESSAGE_INVALID', 'popup 消息必须是对象');
   }
-  if (message.version !== STATUS_MESSAGE_VERSION || !['status:get', 'diagnostics:session-id:get'].includes(message.type)) {
+  if (message.version !== STATUS_MESSAGE_VERSION
+    || !['status:get', 'diagnostics:session-id:get', 'readouts:get'].includes(message.type)) {
     fail('POPUP_MESSAGE_INVALID', 'popup 消息版本或类型未允许');
   }
   if (Object.keys(message).some((field) => !['version', 'type'].includes(field))) {
@@ -108,7 +126,7 @@ function assertPopupMessage(message) {
   return message;
 }
 
-async function handlePopupMessage(message, getDiagnosticsSessionId) {
+async function handlePopupMessage(message, getDiagnosticsSessionId, getReadouts) {
   assertPopupMessage(message);
   if (message.type === 'diagnostics:session-id:get') {
     return {
@@ -117,17 +135,22 @@ async function handlePopupMessage(message, getDiagnosticsSessionId) {
       sessionId: getDiagnosticsSessionId(),
     };
   }
+  if (message.type === 'readouts:get') return getReadouts();
   const surface = getCurrentStatusSurface();
   if (surface === undefined) return createUnavailableStatusSnapshot(modeForLocation(window.location));
   return surface.getSnapshot();
 }
 
-export function installPopupMessageHandler(runtimeObject = chrome.runtime, getDiagnosticsSessionId = () => '未提供') {
+export function installPopupMessageHandler(
+  runtimeObject = chrome.runtime,
+  getDiagnosticsSessionId = () => '未提供',
+  getReadouts = () => { throw new Error('popup readouts provider is unavailable'); },
+) {
   if (runtimeObject?.onMessage === undefined || typeof runtimeObject.onMessage.addListener !== 'function') {
     throw new Error('Chrome runtime message API 不可用');
   }
   runtimeObject.onMessage.addListener((message, _sender, sendResponse) => {
-    void handlePopupMessage(message, getDiagnosticsSessionId)
+    void handlePopupMessage(message, getDiagnosticsSessionId, getReadouts)
       .then((response) => sendResponse(response))
       .catch((error) => sendResponse({
         version: STATUS_MESSAGE_VERSION,
@@ -147,6 +170,8 @@ export class ExtensionCoordinator {
     bridgeClient = new BridgeClient(documentObject, runtimeObject),
     diagnostics,
     loggerObject = logger(),
+    getBankInventory = () => undefined,
+    now = Date.now,
   } = {}) {
     this.documentObject = documentObject;
     this.windowObject = windowObject;
@@ -156,6 +181,8 @@ export class ExtensionCoordinator {
     this.diagnostics = diagnostics;
     this.bridgeClient.diagnostics = diagnostics;
     this.logger = loggerObject;
+    this.getBankInventory = getBankInventory;
+    this.now = now;
     this.preferences = undefined;
     this.active = undefined;
     this.routeKey = '';
@@ -169,6 +196,17 @@ export class ExtensionCoordinator {
       this.diagnostics?.log('media.append', JSON.parse(event.detail));
     };
     this.documentObject.addEventListener(SHIM_APPEND_EVENT, this.onShimAppend);
+  }
+
+  getReadouts() {
+    const panel = this.active?.panel;
+    return buildReadouts({
+      surfaceId: panel?.surfaceId || 'surface-unavailable',
+      video: findLargestVideo(this.documentObject),
+      bankInventory: this.getBankInventory(),
+      diagnostics: this.diagnostics?.getStatus(),
+      now: this.now(),
+    });
   }
 
   async start() {
@@ -383,9 +421,18 @@ export class ExtensionCoordinator {
 
 if (typeof chrome !== 'undefined' && typeof document !== 'undefined' && typeof window !== 'undefined') {
   const diagnostics = new DiagnosticsClient();
-  if (window.location.hostname === 'www.bilibili.com') installBankDiagnostics({ diagnostics });
-  installPopupMessageHandler(chrome.runtime, () => diagnostics.getStatus().sessionId);
-  const coordinator = new ExtensionCoordinator({ diagnostics });
+  const bankDiagnostics = window.location.hostname === 'www.bilibili.com'
+    ? installBankDiagnostics({ diagnostics })
+    : undefined;
+  const coordinator = new ExtensionCoordinator({
+    diagnostics,
+    getBankInventory: () => bankDiagnostics?.latestInventory(),
+  });
+  installPopupMessageHandler(
+    chrome.runtime,
+    () => diagnostics.getStatus().sessionId,
+    () => coordinator.getReadouts(),
+  );
   void coordinator.start().catch((error) => {
     console.error('[BilibiliBuffer] 扩展启动失败', error);
     diagnostics.log('extension.boot_error', { action: 'coordinator' }, error);

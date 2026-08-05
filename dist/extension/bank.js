@@ -79,6 +79,7 @@
     "bank.evict",
     "bank.store",
     "bank.disabled",
+    "bank.inventory",
     "extension.started",
     "extension.boot_error",
     "extension.observer_error",
@@ -169,7 +170,18 @@
       "ttfbMs",
       "priority",
       "result",
-      "reason"
+      "reason",
+      "sessionGeneration",
+      "storedBytes",
+      "storedChunks",
+      "maxBankBytes",
+      "queued",
+      "inflight",
+      "prefetchConcurrency",
+      "disabled",
+      "routeActive",
+      "pairedAddressAvailable",
+      "resources"
     ]),
     extension: Object.freeze(["action", "reason", "status"]),
     persist: Object.freeze(["status", "batchSize", "eventCount", "message", "code"])
@@ -217,6 +229,126 @@
       return { routeKind: "video", watchLaterItem: pathname.split("/")[3] || void 0, part };
     }
     return { routeKind: "other", part };
+  }
+
+  // src/bank/inventory.js
+  var INVENTORY_HEARTBEAT_FLOOR_MS = 5e3;
+  function nonnegativeIntegerOrUnknown(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : UNKNOWN_VALUE;
+  }
+  function stringOrUnknown(value) {
+    return typeof value === "string" && value.length > 0 ? value : UNKNOWN_VALUE;
+  }
+  function resourceKeyFromCacheKey(value) {
+    const separator = value.lastIndexOf("#");
+    if (separator <= 0) throw new Error(`库存 cacheKey 无效: ${value}`);
+    return value.slice(0, separator);
+  }
+  function representationFor(addressBook, resourceKey) {
+    const entry = addressBook.get(resourceKey);
+    if (entry === void 0) return {};
+    return entry.representation || {};
+  }
+  function labelFor(addressBook, resourceKey, representation) {
+    const entry = addressBook.get(resourceKey);
+    if (typeof entry?.label === "string" && entry.label.length > 0) return entry.label;
+    const parts = [];
+    if (Number.isSafeInteger(representation.height) && representation.height > 0) {
+      parts.push(`${representation.height}P`);
+    }
+    const frameRate = representation.frameRate ?? representation.frame_rate;
+    if (frameRate !== void 0 && frameRate !== null && String(frameRate).length > 0) {
+      parts.push(`${frameRate}fps`);
+    }
+    if (typeof representation.codecs === "string" && representation.codecs.length > 0) {
+      parts.push(representation.codecs);
+    }
+    if (parts.length === 0 && Number.isSafeInteger(representation.bandwidth) && representation.bandwidth > 0) {
+      parts.push(`${representation.bandwidth}bps`);
+    }
+    return parts.length === 0 ? UNKNOWN_VALUE : parts.join(" · ");
+  }
+  function resourceFrom({ resourceKey, stored, state, addressBook, recentResourceKeys }) {
+    const representation = representationFor(addressBook, resourceKey);
+    return {
+      pathname: resourceKey,
+      kind: typeof representation.mimeType === "string" && representation.mimeType.startsWith("video/") ? "video" : typeof representation.mimeType === "string" && representation.mimeType.startsWith("audio/") ? "audio" : UNKNOWN_VALUE,
+      label: labelFor(addressBook, resourceKey, representation),
+      height: nonnegativeIntegerOrUnknown(representation.height),
+      codecs: stringOrUnknown(representation.codecs),
+      bandwidth: nonnegativeIntegerOrUnknown(representation.bandwidth),
+      storedBytes: stored.bytes,
+      storedChunks: stored.chunks,
+      totalSize: state === void 0 ? UNKNOWN_VALUE : nonnegativeIntegerOrUnknown(state.totalSize),
+      lastForegroundEnd: state === void 0 ? UNKNOWN_VALUE : nonnegativeIntegerOrUnknown(state.lastForegroundEnd),
+      outstanding: state?.outstanding === void 0 ? 0 : state.outstanding.size,
+      retrying: state?.chunkAttempts === void 0 ? 0 : [...state.chunkAttempts.values()].filter((attempts) => attempts > 0).length,
+      active: recentResourceKeys.includes(resourceKey)
+    };
+  }
+  function storedByResource(chunks) {
+    const stored = /* @__PURE__ */ new Map();
+    for (const [cacheKey2, record] of chunks) {
+      if (!(record?.bytes instanceof ArrayBuffer)) {
+        throw new Error(`库存分片缺少 ArrayBuffer: ${cacheKey2}`);
+      }
+      const resourceKey = resourceKeyFromCacheKey(cacheKey2);
+      const current = stored.get(resourceKey) || { bytes: 0, chunks: 0 };
+      current.bytes += record.bytes.byteLength;
+      current.chunks += 1;
+      stored.set(resourceKey, current);
+    }
+    return stored;
+  }
+  function deriveBankInventory({
+    chunks,
+    resourceState,
+    addressBook,
+    recentResourceKeys,
+    maxBankBytes,
+    maxPrefetchConcurrency,
+    queueLength,
+    inflightCount,
+    disabled,
+    routeActive,
+    isPairedAddressAvailable,
+    sessionGeneration
+  }) {
+    const storedByKey = storedByResource(chunks);
+    const resourceKeys = /* @__PURE__ */ new Set([
+      ...resourceState.keys(),
+      ...addressBook.keys(),
+      ...storedByKey.keys()
+    ]);
+    const sortedResourceKeys = [...resourceKeys].sort((left, right) => left.localeCompare(right));
+    const resources = sortedResourceKeys.map((resourceKey) => resourceFrom({
+      resourceKey,
+      stored: storedByKey.get(resourceKey) || { bytes: 0, chunks: 0 },
+      state: resourceState.get(resourceKey),
+      addressBook,
+      recentResourceKeys
+    }));
+    const activeResourceKeys = recentResourceKeys.filter((resourceKey) => resourceKeys.has(resourceKey));
+    const pairedAddressAvailable = activeResourceKeys.some((resourceKey) => {
+      const state = resourceState.get(resourceKey);
+      return state?.latestUrl !== void 0 && isPairedAddressAvailable(state.latestUrl) === true;
+    });
+    return {
+      sessionGeneration: nonnegativeIntegerOrUnknown(sessionGeneration),
+      storedBytes: resources.reduce((total, resource) => total + resource.storedBytes, 0),
+      storedChunks: resources.reduce((total, resource) => total + resource.storedChunks, 0),
+      maxBankBytes: nonnegativeIntegerOrUnknown(maxBankBytes),
+      queued: nonnegativeIntegerOrUnknown(queueLength),
+      inflight: nonnegativeIntegerOrUnknown(inflightCount),
+      prefetchConcurrency: nonnegativeIntegerOrUnknown(maxPrefetchConcurrency),
+      disabled: disabled === true || disabled === false ? disabled : UNKNOWN_VALUE,
+      routeActive: routeActive === true || routeActive === false ? routeActive : UNKNOWN_VALUE,
+      pairedAddressAvailable,
+      resources
+    };
+  }
+  function sameInventoryPayload(left, right) {
+    return left !== void 0 && right !== void 0 && JSON.stringify(left) === JSON.stringify(right);
   }
 
   // src/bank/contract.js
@@ -957,10 +1089,48 @@
     const backupUrls = Array.isArray(value.backupUrl) ? value.backupUrl.filter((url) => typeof url === "string") : [];
     return [value.baseUrl, ...backupUrls].slice(0, 4);
   }
+  function playurlSupportFormats(value) {
+    if (value === null || typeof value !== "object") return [];
+    if (Array.isArray(value.support_formats)) return value.support_formats;
+    for (const child of Object.values(value)) {
+      const result = playurlSupportFormats(child);
+      if (result.length > 0) return result;
+    }
+    return [];
+  }
+  function representationLabel(value, supportFormats) {
+    const matchingFormat = supportFormats.find((format) => format?.quality === value.id);
+    if (typeof matchingFormat?.new_description === "string" && matchingFormat.new_description.length > 0) {
+      return matchingFormat.new_description;
+    }
+    const parts = [];
+    if (Number.isSafeInteger(value.height) && value.height > 0) parts.push(`${value.height}P`);
+    const frameRate = value.frameRate ?? value.frame_rate;
+    if (frameRate !== void 0 && frameRate !== null && String(frameRate).length > 0) {
+      parts.push(`${frameRate}fps`);
+    }
+    if (typeof value.codecs === "string" && value.codecs.length > 0) parts.push(value.codecs);
+    if (parts.length === 0 && Number.isSafeInteger(value.bandwidth) && value.bandwidth > 0) {
+      parts.push(`${value.bandwidth}bps`);
+    }
+    return parts.length === 0 ? void 0 : parts.join(" · ");
+  }
   function visitPlayurlRepresentations(value, callback) {
     if (value === null || typeof value !== "object") return;
     const urls = playurlRepresentationUrls(value);
-    if (urls !== void 0) callback(urls);
+    if (urls !== void 0) callback({
+      urls,
+      representation: {
+        id: value.id,
+        mimeType: value.mimeType,
+        codecs: value.codecs,
+        width: value.width,
+        height: value.height,
+        bandwidth: value.bandwidth,
+        frameRate: value.frameRate,
+        frame_rate: value.frame_rate
+      }
+    });
     for (const child of Object.values(value)) visitPlayurlRepresentations(child, callback);
   }
   function responseTypeConstructor(windowObject, name) {
@@ -1012,12 +1182,14 @@
       this.resourceState = /* @__PURE__ */ new Map();
       this.recentResourceKeys = [];
       this.addressBook = /* @__PURE__ */ new Map();
+      this.lastInventoryPayload = void 0;
+      this.lastInventoryPublishedAt = void 0;
       this.videoIdentity = videoIdentityFor(this.windowObject.location);
       this.chunks = chunks;
       this.lastRouteWasVideo = this.windowObject.location === void 0 || isVideoLocation(this.windowObject.location);
       this.observePlayurlData(this.windowObject.__playinfo__);
       this.prefetchTimer = this.windowObject.setInterval?.(() => {
-        void this.prefetch().catch((error) => {
+        void this.prefetchTick().catch((error) => {
           console.error("[BilibiliBuffer] 媒体分片预取失败", error);
         });
       }, 1e3);
@@ -1158,11 +1330,18 @@
         }
       }
       const observedAt = this.now();
-      visitPlayurlRepresentations(data, (urls) => {
+      const supportFormats = playurlSupportFormats(data);
+      visitPlayurlRepresentations(data, ({ urls, representation }) => {
         try {
           const parsedUrls = urls.map((url) => new URL(url));
           const pathname = parsedUrls[0].pathname;
-          this.addressBook.set(pathname, { urls, observedAt });
+          this.addressBook.set(pathname, {
+            urls,
+            observedAt,
+            representation,
+            supportFormats,
+            label: representationLabel(representation, supportFormats)
+          });
         } catch (error) {
           console.error("[BilibiliBuffer] playurl 地址簿 URL 无效");
         }
@@ -1829,6 +2008,31 @@
       if (leg.byteCount > 0) data.ttfbMs = leg.ttfbAt - leg.startedAt;
       this.emitDiagnostic("bank.fetch.chunk", data);
     }
+    publishInventory(routeActive = this.lastRouteWasVideo) {
+      const payload = deriveBankInventory({
+        chunks: this.chunks,
+        resourceState: this.resourceState,
+        addressBook: this.addressBook,
+        recentResourceKeys: this.recentResourceKeys,
+        maxBankBytes: this.config.maxBankBytes,
+        maxPrefetchConcurrency: this.maxPrefetchConcurrency,
+        queueLength: this.queue.length,
+        inflightCount: this.inflight.size,
+        disabled: !this.isEnabled(),
+        routeActive,
+        isPairedAddressAvailable: (url) => this.pairUrlFor(url) !== void 0,
+        sessionGeneration: this.sessionGeneration
+      });
+      const now = this.now();
+      const unchanged = sameInventoryPayload(this.lastInventoryPayload, payload);
+      if (unchanged && this.lastInventoryPublishedAt !== void 0 && now - this.lastInventoryPublishedAt < INVENTORY_HEARTBEAT_FLOOR_MS) {
+        return false;
+      }
+      this.emitDiagnostic("bank.inventory", payload);
+      this.lastInventoryPayload = payload;
+      this.lastInventoryPublishedAt = now;
+      return true;
+    }
     storeTask(task, result) {
       const previous = this.chunks.get(task.cacheKey);
       try {
@@ -1877,8 +2081,9 @@
         throw error;
       }
     }
-    async prefetch() {
-      if (!this.syncRouteLifecycle()) {
+    async prefetch(routeActive = this.syncRouteLifecycle(), inventoryPublished = false) {
+      if (!inventoryPublished) this.publishInventory(routeActive);
+      if (!routeActive) {
         this.abortPrefetchTasks();
         return;
       }
@@ -1890,6 +2095,11 @@
         if (!this.recentResourceKeys.includes(state.bankKey)) continue;
         this.scheduleResourceWindow(state);
       }
+    }
+    async prefetchTick() {
+      const routeActive = this.syncRouteLifecycle();
+      this.publishInventory(routeActive);
+      return this.prefetch(routeActive, true);
     }
     destroy() {
       if (this.prefetchTimer !== void 0) this.windowObject.clearInterval(this.prefetchTimer);

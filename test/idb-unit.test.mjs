@@ -145,3 +145,53 @@ test('realistic IDB transaction semantics preserve append-only isolation and res
   assert.equal(restartedEvents.events.length, 102);
   assert.equal(restartedEvents.events.some((stored) => stored.sessionId === firstSession.sessionId && stored.sequence === 2), false);
 });
+
+test('CDN summary scans one session through the composite index and reports an empty result', async () => {
+  const indexedDb = new FakeIndexedDB();
+  const first = session('session-cdn-first');
+  const second = session('session-cdn-second', '/200');
+  await appendBatch(message(first, [
+    event(first.sessionId, 1),
+    event(first.sessionId, 2, 'bank.fetch.chunk', {
+      source: 'https://cdn-a.example/video/segment.m4s?signature=secret',
+      mirror: 'cdn-a.example',
+      chunkIndex: 0,
+      start: 0,
+      end: 15,
+      bytes: 16,
+      slot: 0,
+      result: 'fetched',
+    }),
+  ]), sender(1), indexedDb);
+  await appendBatch(message(second, [event(second.sessionId, 1)]), sender(2, '/200'), indexedDb);
+
+  const summary = await readLogs({
+    type: 'logs:cdn-summary',
+    version: 1,
+    sessionId: first.sessionId,
+  }, indexedDb);
+  assert.equal(summary.maxEventId, 2);
+  assert.equal(summary.sampleCount, 1);
+  assert.equal(summary.summary.totalChunks, 1);
+  assert.equal(summary.summary.byResult.fetched, 1);
+
+  const empty = await readLogs({
+    type: 'logs:cdn-summary',
+    version: 1,
+    sessionId: second.sessionId,
+  }, indexedDb);
+  assert.equal(empty.maxEventId, 3);
+  assert.equal(empty.sampleCount, 0);
+  assert.equal(empty.summary.totalChunks, 0);
+  assert.deepEqual(empty.summary.byResult, {
+    fetched: 0,
+    lost_race: 0,
+    stalled: 0,
+    aborted: 0,
+    superseded: 0,
+    network_error: 0,
+    http_error: 0,
+    invalid_response: 0,
+    gave_up: 0,
+  });
+});

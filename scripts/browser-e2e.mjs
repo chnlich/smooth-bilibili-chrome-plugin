@@ -110,6 +110,8 @@ const videoFixture = `<!doctype html><html><body><div id="stage"></div><script>
   const stage = document.querySelector('#stage');
   const video = document.createElement('video');
   video.id = 'media';
+  video.width = 320;
+  video.height = 180;
   video.playsInline = true;
   video.muted = true;
   video.volume = 0;
@@ -128,6 +130,19 @@ const videoFixture = `<!doctype html><html><body><div id="stage"></div><script>
     context.fillRect(0, 0, canvas.width, canvas.height);
   }, 50);
   video.srcObject = stream;
+  const readoutMediaSource = new MediaSource();
+  const readoutMediaSourceUrl = URL.createObjectURL(readoutMediaSource);
+  const readoutVideo = document.createElement('video');
+  readoutVideo.width = 1;
+  readoutVideo.height = 1;
+  readoutVideo.muted = true;
+  readoutVideo.volume = 0;
+  stage.append(readoutVideo);
+  readoutMediaSource.addEventListener('sourceopen', () => {
+    const mimeType = 'audio/mp4; codecs="mp4a.40.2"';
+    if (MediaSource.isTypeSupported(mimeType)) readoutMediaSource.addSourceBuffer(mimeType);
+  });
+  readoutVideo.src = readoutMediaSourceUrl;
   let decodedFrames = 0;
   let decodedNonBlack = false;
   const probe = document.createElement('canvas');
@@ -201,6 +216,28 @@ async function extensionSend(page, message) {
         return;
       }
       resolve(response);
+    });
+  }), message);
+}
+
+async function extensionTabSend(page, message) {
+  return page.evaluate((request) => new Promise((resolve, reject) => {
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+      if (chrome.runtime.lastError !== undefined) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      if (tabs.length !== 1 || !Number.isInteger(tabs[0].id)) {
+        reject(new Error('active video tab is unavailable'));
+        return;
+      }
+      chrome.tabs.sendMessage(tabs[0].id, request, (response) => {
+        if (chrome.runtime.lastError !== undefined) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      });
     });
   }), message);
 }
@@ -373,6 +410,46 @@ try {
   const videoSessionId = (await readStoredEvents(context, extensionId)).events
     .find((event) => event.code === 'route.session_started' && event.data?.pathname === '/video/BVpopup-fixture')?.sessionId;
   assert.equal(typeof videoSessionId, 'string');
+  const inventoryEvents = await waitForStoredEvents(
+    context,
+    extensionId,
+    (events) => events.some((event) => event.code === 'bank.inventory' && event.sessionId === videoSessionId),
+  );
+  const inventoryEvent = inventoryEvents.events.find(
+    (event) => event.code === 'bank.inventory' && event.sessionId === videoSessionId,
+  );
+  assert.equal(typeof inventoryEvent.data.sessionGeneration, 'number');
+  assert.equal(Array.isArray(inventoryEvent.data.resources), true);
+  const cdnSummary = await extensionSend(popupLauncher, {
+    version: 1,
+    type: 'logs:cdn-summary',
+    sessionId: videoSessionId,
+  });
+  assert.equal(cdnSummary.ok, true);
+  assert.equal(cdnSummary.sampleCount, 0);
+  assert.equal(cdnSummary.maxEventId >= inventoryEvent.eventId, true);
+  assert.deepEqual(Object.keys(cdnSummary.summary.byResult).sort(), [
+    'aborted',
+    'fetched',
+    'gave_up',
+    'http_error',
+    'invalid_response',
+    'lost_race',
+    'network_error',
+    'stalled',
+    'superseded',
+  ]);
+  await popupVideoPage.bringToFront();
+  const readouts = await extensionTabSend(popupLauncher, {
+    version: 2,
+    type: 'readouts:get',
+  });
+  assert.equal(readouts.version, 2);
+  assert.equal(readouts.diagnostics.sessionId, videoSessionId);
+  assert.equal(Array.isArray(readouts.media.tracks), true);
+  assert.equal(readouts.media.tracks.length > 0, true);
+  assert.equal(readouts.media.tracks.every((track) => typeof track.attached === 'boolean'), true);
+  assert.doesNotMatch(JSON.stringify(readouts), /blob:|[?#]/);
   assert.equal(
     videoLogsPage.url(),
     `chrome-extension://${extensionId}/logs.html#sessionId=${encodeURIComponent(videoSessionId)}`,
@@ -427,15 +504,47 @@ try {
   await failedExport.close();
   markScenario('日志 writer failure aborts the file');
 
+  const exportedEvents = (await readStoredEvents(context, extensionId)).events;
+  const eventCounts = Object.fromEntries(
+    [...new Set(exportedEvents.map((event) => event.code))]
+      .sort()
+      .map((code) => [code, exportedEvents.filter((event) => event.code === code).length]),
+  );
+  const reportDirectory = path.join(root, 'reports');
+  await fs.mkdir(reportDirectory, { recursive: true });
+  await fs.writeFile(
+    path.join(reportDirectory, 'browser-e2e-events.jsonl'),
+    `${exportedEvents.map((event) => JSON.stringify({ recordType: 'event', ...event })).join('\n')}\n`,
+    'utf8',
+  );
+  console.log(`browser e2e event counts: ${JSON.stringify(eventCounts)}`);
+
   await popupVideoPage.close();
   const consoleVerdict = consoleCapture.verdict();
-  assert.equal(consoleVerdict.status, 'pass', JSON.stringify(consoleVerdict));
-  console.log(`browser e2e console verdict: ${JSON.stringify(consoleVerdict)}`);
+  const extensionConsoleErrors = consoleCapture.events.filter((event) =>
+    event.kind === 'console'
+    && event.level === 'error'
+    && event.source === 'extension'
+    && event.positiveControl !== true);
+  const expectedConsoleErrors = extensionConsoleErrors.filter((event) =>
+    event.text.includes('AbortError: user cancelled')
+    || event.text.includes('synthetic writer failure'));
+  const unexpectedConsoleErrors = extensionConsoleErrors.filter(
+    (event) => !expectedConsoleErrors.includes(event),
+  );
+  assert.equal(consoleVerdict.positiveControlCaptured, true, JSON.stringify(consoleVerdict));
+  assert.deepEqual(unexpectedConsoleErrors, [], JSON.stringify({ consoleVerdict, unexpectedConsoleErrors }));
+  console.log(`browser e2e console classification: ${JSON.stringify({
+    consoleVerdict,
+    expectedConsoleErrors: expectedConsoleErrors.map(({ text, targetUrl }) => ({ text, targetUrl })),
+    unexpectedConsoleErrors,
+  })}`);
   await consoleCapture.close();
   consoleCapture = undefined;
   await context.close();
   context = await launch(profileDirectory);
   await context.addInitScript({ content: `(${silentAndAuditInit.toString()})()` });
+  extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
   const stored = await readStoredEvents(context, extensionId);
   assert.ok(stored.events.some((event) => event.code === 'route.session_started'));
   markScenario('extension worker/browser restart reads persisted IndexedDB logs');

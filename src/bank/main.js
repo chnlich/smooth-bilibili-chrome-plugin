@@ -3,6 +3,11 @@ import { scrubUrl } from '../diagnostics/privacy.js';
 import { BankFallbackError, BankNetworkError } from './errors.js';
 import { routeIdentity } from '../route.js';
 import {
+  deriveBankInventory,
+  INVENTORY_HEARTBEAT_FLOOR_MS,
+  sameInventoryPayload,
+} from './inventory.js';
+import {
   BANK_ENABLED_ATTRIBUTE,
   BANK_DIAGNOSTIC_MESSAGE_TYPE,
   BANK_MESSAGE_NAMESPACE,
@@ -58,10 +63,50 @@ function playurlRepresentationUrls(value) {
   return [value.baseUrl, ...backupUrls].slice(0, 4);
 }
 
+function playurlSupportFormats(value) {
+  if (value === null || typeof value !== 'object') return [];
+  if (Array.isArray(value.support_formats)) return value.support_formats;
+  for (const child of Object.values(value)) {
+    const result = playurlSupportFormats(child);
+    if (result.length > 0) return result;
+  }
+  return [];
+}
+
+function representationLabel(value, supportFormats) {
+  const matchingFormat = supportFormats.find((format) => format?.quality === value.id);
+  if (typeof matchingFormat?.new_description === 'string' && matchingFormat.new_description.length > 0) {
+    return matchingFormat.new_description;
+  }
+  const parts = [];
+  if (Number.isSafeInteger(value.height) && value.height > 0) parts.push(`${value.height}P`);
+  const frameRate = value.frameRate ?? value.frame_rate;
+  if (frameRate !== undefined && frameRate !== null && String(frameRate).length > 0) {
+    parts.push(`${frameRate}fps`);
+  }
+  if (typeof value.codecs === 'string' && value.codecs.length > 0) parts.push(value.codecs);
+  if (parts.length === 0 && Number.isSafeInteger(value.bandwidth) && value.bandwidth > 0) {
+    parts.push(`${value.bandwidth}bps`);
+  }
+  return parts.length === 0 ? undefined : parts.join(' · ');
+}
+
 function visitPlayurlRepresentations(value, callback) {
   if (value === null || typeof value !== 'object') return;
   const urls = playurlRepresentationUrls(value);
-  if (urls !== undefined) callback(urls);
+  if (urls !== undefined) callback({
+    urls,
+    representation: {
+      id: value.id,
+      mimeType: value.mimeType,
+      codecs: value.codecs,
+      width: value.width,
+      height: value.height,
+      bandwidth: value.bandwidth,
+      frameRate: value.frameRate,
+      frame_rate: value.frame_rate,
+    },
+  });
   for (const child of Object.values(value)) visitPlayurlRepresentations(child, callback);
 }
 
@@ -121,13 +166,15 @@ export class SegmentBank {
     this.resourceState = new Map();
     this.recentResourceKeys = [];
     this.addressBook = new Map();
+    this.lastInventoryPayload = undefined;
+    this.lastInventoryPublishedAt = undefined;
     this.videoIdentity = videoIdentityFor(this.windowObject.location);
     this.chunks = chunks;
     this.lastRouteWasVideo = this.windowObject.location === undefined
       || isVideoLocation(this.windowObject.location);
     this.observePlayurlData(this.windowObject.__playinfo__);
     this.prefetchTimer = this.windowObject.setInterval?.(() => {
-      void this.prefetch().catch((error) => {
+      void this.prefetchTick().catch((error) => {
         console.error('[BilibiliBuffer] 媒体分片预取失败', error);
       });
     }, 1000);
@@ -285,11 +332,18 @@ export class SegmentBank {
       }
     }
     const observedAt = this.now();
-    visitPlayurlRepresentations(data, (urls) => {
+    const supportFormats = playurlSupportFormats(data);
+    visitPlayurlRepresentations(data, ({ urls, representation }) => {
       try {
         const parsedUrls = urls.map((url) => new URL(url));
         const pathname = parsedUrls[0].pathname;
-        this.addressBook.set(pathname, { urls, observedAt });
+        this.addressBook.set(pathname, {
+          urls,
+          observedAt,
+          representation,
+          supportFormats,
+          label: representationLabel(representation, supportFormats),
+        });
       } catch (error) {
         console.error('[BilibiliBuffer] playurl 地址簿 URL 无效');
       }
@@ -1000,6 +1054,33 @@ export class SegmentBank {
     this.emitDiagnostic('bank.fetch.chunk', data);
   }
 
+  publishInventory(routeActive = this.lastRouteWasVideo) {
+    const payload = deriveBankInventory({
+      chunks: this.chunks,
+      resourceState: this.resourceState,
+      addressBook: this.addressBook,
+      recentResourceKeys: this.recentResourceKeys,
+      maxBankBytes: this.config.maxBankBytes,
+      maxPrefetchConcurrency: this.maxPrefetchConcurrency,
+      queueLength: this.queue.length,
+      inflightCount: this.inflight.size,
+      disabled: !this.isEnabled(),
+      routeActive,
+      isPairedAddressAvailable: (url) => this.pairUrlFor(url) !== undefined,
+      sessionGeneration: this.sessionGeneration,
+    });
+    const now = this.now();
+    const unchanged = sameInventoryPayload(this.lastInventoryPayload, payload);
+    if (unchanged && this.lastInventoryPublishedAt !== undefined
+      && now - this.lastInventoryPublishedAt < INVENTORY_HEARTBEAT_FLOOR_MS) {
+      return false;
+    }
+    this.emitDiagnostic('bank.inventory', payload);
+    this.lastInventoryPayload = payload;
+    this.lastInventoryPublishedAt = now;
+    return true;
+  }
+
   storeTask(task, result) {
     const previous = this.chunks.get(task.cacheKey);
     try {
@@ -1049,8 +1130,9 @@ export class SegmentBank {
     }
   }
 
-  async prefetch() {
-    if (!this.syncRouteLifecycle()) {
+  async prefetch(routeActive = this.syncRouteLifecycle(), inventoryPublished = false) {
+    if (!inventoryPublished) this.publishInventory(routeActive);
+    if (!routeActive) {
       this.abortPrefetchTasks();
       return;
     }
@@ -1062,6 +1144,12 @@ export class SegmentBank {
       if (!this.recentResourceKeys.includes(state.bankKey)) continue;
       this.scheduleResourceWindow(state);
     }
+  }
+
+  async prefetchTick() {
+    const routeActive = this.syncRouteLifecycle();
+    this.publishInventory(routeActive);
+    return this.prefetch(routeActive, true);
   }
 
   destroy() {
