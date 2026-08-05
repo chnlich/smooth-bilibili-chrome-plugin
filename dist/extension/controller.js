@@ -573,7 +573,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-b7ae252a6f89ba05933a8f71" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-38a27c7d2259d92ef5bef24e" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -2358,7 +2358,8 @@
       pendingSinceMs: sourceBuffer.pendingSinceMs,
       lastAppendAgoMs: sourceBuffer.lastAppendAgoMs,
       appendErrors: sourceBuffer.appendErrors,
-      mediaSourceInstance: sourceBuffer.mediaSourceInstance
+      mediaSourceInstance: sourceBuffer.mediaSourceInstance,
+      mediaSourceState: sourceBuffer.mediaSourceState
     };
   }
   function limiterTrack(tracks) {
@@ -2370,6 +2371,13 @@
     const limiting = attached.filter((track) => track.forwardSeconds === minimum);
     return limiting.length === 1 ? limiting[0].track : UNKNOWN_VALUE;
   }
+  function attachedSourceState(tracks) {
+    if (tracks.length === 0 || tracks.some((track) => !["closed", "open", "ended"].includes(track.mediaSourceState))) {
+      return UNKNOWN_VALUE;
+    }
+    const states = new Set(tracks.map((track) => track.mediaSourceState));
+    return states.size === 1 ? [...states][0] : UNKNOWN_VALUE;
+  }
   function deriveMediaReadout(facts) {
     if (facts === UNKNOWN_VALUE) return UNKNOWN_VALUE;
     const sourceBufferRanges = Array.isArray(facts.sourceBufferRanges) ? facts.sourceBufferRanges : [];
@@ -2380,12 +2388,14 @@
     const attachedSourceInstances = new Set(
       tracks.filter((track) => track.attached === true).map((track) => track.mediaSourceInstance).filter((instance) => Number.isInteger(instance) && instance > 0)
     );
+    const attachmentResolved = attachedSourceInstances.size === 1;
+    const attachedTracks = attachmentResolved ? tracks.filter((track) => track.attached === true) : [];
     return {
       forwardSeconds: forwardSeconds(facts.currentTime, facts.bufferedRanges),
-      limiterTrack: limiterTrack(tracks),
-      tracks: tracks.map(({ mediaSourceInstance: _ignored, ...track }) => track),
-      mediaSourceState: facts.mediaSourceState,
-      [OTHER_LIVE_MEDIA_SOURCES_FIELD]: attachedSourceInstances.size === 0 ? UNKNOWN_VALUE : mediaSourceInstances.size - attachedSourceInstances.size,
+      limiterTrack: attachmentResolved ? limiterTrack(attachedTracks) : UNKNOWN_VALUE,
+      tracks: attachedTracks.map(({ mediaSourceInstance: _ignoredInstance, mediaSourceState: _ignoredState, ...track }) => track),
+      mediaSourceState: attachedSourceState(attachedTracks),
+      [OTHER_LIVE_MEDIA_SOURCES_FIELD]: attachmentResolved ? mediaSourceInstances.size - attachedSourceInstances.size : UNKNOWN_VALUE,
       element: {
         readyState: facts.readyState,
         networkState: facts.networkState,

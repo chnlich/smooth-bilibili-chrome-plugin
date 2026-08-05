@@ -133,14 +133,16 @@ const videoFixture = `<!doctype html><html><body><div id="stage"></div><script>
   const readoutMediaSource = new MediaSource();
   const readoutMediaSourceUrl = URL.createObjectURL(readoutMediaSource);
   const readoutVideo = document.createElement('video');
+  readoutVideo.id = 'readout-media';
   readoutVideo.width = 1;
   readoutVideo.height = 1;
   readoutVideo.muted = true;
   readoutVideo.volume = 0;
   stage.append(readoutVideo);
+  let readoutSourceBuffer;
   readoutMediaSource.addEventListener('sourceopen', () => {
     const mimeType = 'audio/mp4; codecs="mp4a.40.2"';
-    if (MediaSource.isTypeSupported(mimeType)) readoutMediaSource.addSourceBuffer(mimeType);
+    if (MediaSource.isTypeSupported(mimeType)) readoutSourceBuffer = readoutMediaSource.addSourceBuffer(mimeType);
   });
   readoutVideo.src = readoutMediaSourceUrl;
   let decodedFrames = 0;
@@ -171,7 +173,17 @@ const videoFixture = `<!doctype html><html><body><div id="stage"></div><script>
       core = { setStableBufferTime(seconds) { calls.push(seconds); } };
       window.__e2eAudit.reset();
     },
-    triggerUniqueMediaEvent() { video.dispatchEvent(new Event('ended')); },
+    activateReadoutVideo() {
+      readoutVideo.width = 321;
+      readoutVideo.height = 181;
+      readoutSourceBuffer.dispatchEvent(new Event('updateend'));
+    },
+    triggerUniqueMediaEvent() {
+      const selected = readoutVideo.width * readoutVideo.height > video.width * video.height
+        ? readoutVideo
+        : video;
+      selected.dispatchEvent(new Event('ended'));
+    },
   };
   window.__e2eAudit.reset();
 </script></body></html>`;
@@ -439,6 +451,11 @@ try {
     'stalled',
     'superseded',
   ]);
+  await popupVideoPage.evaluate(() => window.__fixture.activateReadoutVideo());
+  await waitFor(popupVideoPage, () => {
+    const raw = document.documentElement.getAttribute('data-bilibili-buffer-shim-diagnostics');
+    return raw !== null && JSON.parse(raw).sourceBufferRanges.some((track) => track.attached === true);
+  });
   await popupVideoPage.bringToFront();
   const readouts = await extensionTabSend(popupLauncher, {
     version: 2,
@@ -448,7 +465,7 @@ try {
   assert.equal(readouts.diagnostics.sessionId, videoSessionId);
   assert.equal(Array.isArray(readouts.media.tracks), true);
   assert.equal(readouts.media.tracks.length > 0, true);
-  assert.equal(readouts.media.tracks.every((track) => typeof track.attached === 'boolean'), true);
+  assert.equal(readouts.media.tracks.every((track) => track.attached === true), true);
   assert.doesNotMatch(JSON.stringify(readouts), /blob:|[?#]/);
   assert.equal(
     videoLogsPage.url(),

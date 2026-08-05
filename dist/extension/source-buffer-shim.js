@@ -211,7 +211,7 @@
     if (typeof document.querySelectorAll !== "function") return "";
     const videos = [...document.querySelectorAll("video")];
     const video = videos.sort((left, right) => (right.clientWidth || 0) * (right.clientHeight || 0) - (left.clientWidth || 0) * (left.clientHeight || 0))[0];
-    return video?.currentSrc || video?.src || "";
+    return video?.currentSrc || "";
   }
   function mediaSourceAttached(mediaSource) {
     const source = currentVideoSource();

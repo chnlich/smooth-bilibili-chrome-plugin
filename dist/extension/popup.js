@@ -379,7 +379,15 @@
       appendRow(readoutRaceElement, "成绩", `读取失败: ${raceError}`);
       return;
     }
-    if (raceSummary === void 0 || raceSummary.sampleCount === 0) {
+    if (raceSummary === void 0) {
+      appendRow(
+        readoutRaceElement,
+        "成绩",
+        raceSessionId === void 0 || raceSessionId === "未提供" ? "未提供" : "读取中"
+      );
+      return;
+    }
+    if (raceSummary.sampleCount === 0) {
       appendRow(readoutRaceElement, "成绩", "尚无竞速事件");
       return;
     }

@@ -25,7 +25,13 @@ function facts(sourceBufferRanges, bufferedRanges = [{ start: 0, end: 60 }]) {
   };
 }
 
-function track({ track, attached = true, ranges = [{ start: 0, end: 30 }], mediaSourceInstance = 1 }) {
+function track({
+  track,
+  attached = true,
+  ranges = [{ start: 0, end: 30 }],
+  mediaSourceInstance = 1,
+  mediaSourceState = 'open',
+}) {
   return {
     track,
     attached,
@@ -35,6 +41,7 @@ function track({ track, attached = true, ranges = [{ start: 0, end: 30 }], media
     lastAppendAgoMs: 12,
     appendErrors: {},
     mediaSourceInstance,
+    mediaSourceState,
   };
 }
 
@@ -64,6 +71,17 @@ test('panel derivation does not name a limiter for a tie, one track, or unresolv
   ]));
   assert.equal(unresolved.limiterTrack, '未提供');
   assert.equal(unresolved.otherLiveMediaSources, '未提供');
+});
+
+test('panel returns only tracks attached to the current MediaSource and counts the rest', () => {
+  const media = deriveMediaReadout(facts([
+    track({ track: 'video/mp4', mediaSourceInstance: 1, mediaSourceState: 'open' }),
+    track({ track: 'audio/mp4', mediaSourceInstance: 1, mediaSourceState: 'open' }),
+    track({ track: 'video/mp4', attached: false, mediaSourceInstance: 2, mediaSourceState: 'closed' }),
+  ]));
+  assert.deepEqual(media.tracks.map((entry) => entry.track), ['video/mp4', 'audio/mp4']);
+  assert.equal(media.mediaSourceState, 'open');
+  assert.equal(media.otherLiveMediaSources, 1);
 });
 
 test('bank seconds estimates stay unavailable when total size or duration is unavailable', () => {

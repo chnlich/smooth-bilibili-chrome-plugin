@@ -170,7 +170,15 @@ function renderRaceReadout(persistence) {
     appendRow(readoutRaceElement, '成绩', `读取失败: ${raceError}`);
     return;
   }
-  if (raceSummary === undefined || raceSummary.sampleCount === 0) {
+  if (raceSummary === undefined) {
+    appendRow(
+      readoutRaceElement,
+      '成绩',
+      raceSessionId === undefined || raceSessionId === '未提供' ? '未提供' : '读取中',
+    );
+    return;
+  }
+  if (raceSummary.sampleCount === 0) {
     appendRow(readoutRaceElement, '成绩', '尚无竞速事件');
     return;
   }
