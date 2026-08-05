@@ -407,6 +407,7 @@
       appendRow(readoutRaceElement, "交付字节", row.bytesDelivered);
     }
     for (const result of CDN_RESULT_VALUES) {
+      if (summary.byResult[result] === 0) continue;
       appendRow(readoutRaceElement, result, summary.byResult[result]);
     }
   }

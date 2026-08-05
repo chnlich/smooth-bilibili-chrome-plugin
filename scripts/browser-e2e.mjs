@@ -8,6 +8,7 @@ import { findAvailablePort, resolveChromeExecutablePath } from './browser-runtim
 import { startConsoleCapture, triggerExtensionPositiveControl } from './console-capture.mjs';
 import { readStoredEvents } from './extension-log-pull.mjs';
 import { installUnpackedExtension } from './install-unpacked-extension.mjs';
+import { readProvenance } from './provenance.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionDirectory = path.join(root, 'dist', 'extension');
@@ -106,6 +107,50 @@ const autoOpenPopupLogs = () => {
   document.addEventListener('DOMContentLoaded', clickWhenVideoStatusIsReady, { once: true });
 };
 
+const INVENTORY_VIDEO_URL = 'https://e2e-video.bilivideo.com/e2e/video-active.m4s?signature=video';
+const INVENTORY_ADDRESS_BOOK_ONLY_URL = 'https://e2e-video.bilivideo.com/e2e/video-address-book-only.m4s?signature=unused';
+const INVENTORY_AUDIO_URL = 'https://e2e-audio.bilivideo.com/e2e/audio-active.m4s?signature=audio';
+const INVENTORY_TOTAL_SIZE = 1024 ** 2;
+const INVENTORY_VIDEO_PATH = new URL(INVENTORY_VIDEO_URL).pathname;
+const INVENTORY_ADDRESS_BOOK_ONLY_PATH = new URL(INVENTORY_ADDRESS_BOOK_ONLY_URL).pathname;
+const INVENTORY_AUDIO_PATH = new URL(INVENTORY_AUDIO_URL).pathname;
+const INVENTORY_PLAYURL_BODY = {
+  code: 0,
+  data: {
+    dash: {
+      video: [
+        {
+          id: 64,
+          baseUrl: INVENTORY_VIDEO_URL,
+          backupUrl: [],
+          mimeType: 'video/mp4',
+          codecs: 'avc1.640028',
+          height: 720,
+          bandwidth: 1000000,
+        },
+        {
+          id: 32,
+          baseUrl: INVENTORY_ADDRESS_BOOK_ONLY_URL,
+          backupUrl: [],
+          mimeType: 'video/mp4',
+          codecs: 'avc1.4d401f',
+          height: 480,
+          bandwidth: 500000,
+        },
+      ],
+      audio: [{
+        id: 30280,
+        baseUrl: INVENTORY_AUDIO_URL,
+        backupUrl: [],
+        mimeType: 'audio/mp4',
+        codecs: 'mp4a.40.2',
+        bandwidth: 128000,
+      }],
+    },
+  },
+};
+const INVENTORY_ADVERTISED_REPRESENTATION_COUNT = 3;
+
 const videoFixture = `<!doctype html><html><body><div id="stage"></div><script>
   const stage = document.querySelector('#stage');
   const video = document.createElement('video');
@@ -184,6 +229,31 @@ const videoFixture = `<!doctype html><html><body><div id="stage"></div><script>
         : video;
       selected.dispatchEvent(new Event('ended'));
     },
+    async populateBankInventory() {
+      const playurlResponse = await fetch('https://api.bilibili.com/x/player/playurl?e2e=inventory');
+      if (!playurlResponse.ok) throw new Error('inventory playurl fixture request failed');
+      const playurl = await playurlResponse.json();
+      const advertised = [
+        ...playurl.data.dash.video,
+        ...playurl.data.dash.audio,
+      ].map((representation) => new URL(representation.baseUrl).pathname);
+      for (const url of [
+        playurl.data.dash.video[0].baseUrl,
+        playurl.data.dash.audio[0].baseUrl,
+      ]) {
+        const response = await fetch(url, { headers: { Range: 'bytes=0-15' } });
+        if (!response.ok) throw new Error('inventory segment fixture request failed');
+        const bytes = await response.arrayBuffer();
+        if (bytes.byteLength !== 16) throw new Error('inventory segment fixture length mismatch');
+      }
+      return {
+        advertised,
+        requested: [
+          new URL(playurl.data.dash.video[0].baseUrl).pathname,
+          new URL(playurl.data.dash.audio[0].baseUrl).pathname,
+        ],
+      };
+    },
   };
   window.__e2eAudit.reset();
 </script></body></html>`;
@@ -207,17 +277,72 @@ function assertNoForbiddenExtensionMediaWrites(entries) {
   );
 }
 
-async function openFixture(context, url, html) {
+async function openFixture(context, url, html, requestHandler) {
   const page = await context.newPage();
   await page.route('**/*', async (route) => {
     if (route.request().isNavigationRequest()) {
       await route.fulfill({ status: 200, contentType: 'text/html', body: html });
       return;
     }
+    if (requestHandler !== undefined) {
+      await requestHandler(route);
+      return;
+    }
     await route.fulfill({ status: 204, body: '' });
   });
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   return page;
+}
+
+const inventoryCorsHeaders = {
+  'Access-Control-Allow-Headers': 'Range, Content-Type',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Expose-Headers': 'Content-Range, Content-Length',
+};
+
+async function inventoryRequestHandler(route) {
+  const request = route.request();
+  const requestUrl = new URL(request.url());
+  if (request.method() === 'OPTIONS') {
+    await route.fulfill({ status: 204, headers: inventoryCorsHeaders, body: '' });
+    return;
+  }
+  if (requestUrl.hostname === 'api.bilibili.com' && requestUrl.pathname.endsWith('/playurl')) {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: inventoryCorsHeaders,
+      body: JSON.stringify(INVENTORY_PLAYURL_BODY),
+    });
+    return;
+  }
+  if (requestUrl.hostname.endsWith('.bilivideo.com')
+    && [INVENTORY_VIDEO_PATH, INVENTORY_ADDRESS_BOOK_ONLY_PATH, INVENTORY_AUDIO_PATH]
+      .includes(requestUrl.pathname)) {
+    const match = /^bytes=(\d+)-(\d+)$/.exec(request.headers().range || '');
+    assert.ok(match, `inventory segment request has no closed range: ${request.url()}`);
+    const start = Number(match[1]);
+    const requestedEnd = Number(match[2]);
+    if (start >= INVENTORY_TOTAL_SIZE) {
+      await route.fulfill({ status: 416, headers: inventoryCorsHeaders, body: '' });
+      return;
+    }
+    const end = Math.min(requestedEnd, INVENTORY_TOTAL_SIZE - 1);
+    const body = Buffer.alloc(end - start + 1, 0x2a);
+    await route.fulfill({
+      status: 206,
+      headers: {
+        ...inventoryCorsHeaders,
+        'Content-Length': String(body.byteLength),
+        'Content-Range': `bytes ${start}-${end}/${INVENTORY_TOTAL_SIZE}`,
+        'Content-Type': 'video/mp4',
+      },
+      body,
+    });
+    return;
+  }
+  await route.fulfill({ status: 204, body: '' });
 }
 
 async function extensionSend(page, message) {
@@ -332,6 +457,7 @@ async function clickExport(page) {
 
 const chromeExecutablePath = await resolveChromeExecutablePath();
 const cdpPort = await findAvailablePort();
+const provenance = await readProvenance({ rootDirectory: root, extensionDirectory });
 const profileDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-e2e-profile-'));
 const scenarios = [];
 const markScenario = (name) => {
@@ -353,6 +479,13 @@ try {
     ],
   });
   context = await launch(profileDirectory);
+  const browserVersion = context.browser().version();
+  console.log(`browser e2e provenance: ${JSON.stringify({
+    commitSha: process.env.BILIBILI_E2E_COMMIT_SHA ?? provenance.commitSha,
+    buildId: provenance.buildId,
+    profileDirectory,
+    browserVersion,
+  })}`);
   extensionId = await installUnpackedExtension(context.browser(), extensionDirectory);
   consoleCapture = await startConsoleCapture(cdpPort, extensionId);
   await triggerExtensionPositiveControl(context, extensionId, consoleCapture);
@@ -394,7 +527,12 @@ try {
   await unrelatedPage.close();
   markScenario('unrelated route remains untouched');
 
-  const popupVideoPage = await openFixture(context, 'https://www.bilibili.com/video/BVpopup-fixture', videoFixture);
+  const popupVideoPage = await openFixture(
+    context,
+    'https://www.bilibili.com/video/BVpopup-fixture',
+    videoFixture,
+    inventoryRequestHandler,
+  );
   await popupVideoPage.evaluate(() => window.__fixture.start());
   await waitFor(popupVideoPage, () => window.__fixture.decodedFrames() > 0 && window.__fixture.decodedNonBlack());
   assert.ok((await popupVideoPage.evaluate(() => window.__e2eAudit.silence())).every(({ muted, volume }) => muted && volume === 0));
@@ -422,23 +560,46 @@ try {
   const videoSessionId = (await readStoredEvents(context, extensionId)).events
     .find((event) => event.code === 'route.session_started' && event.data?.pathname === '/video/BVpopup-fixture')?.sessionId;
   assert.equal(typeof videoSessionId, 'string');
+  const inventoryFixture = await popupVideoPage.evaluate(() => window.__fixture.populateBankInventory());
+  assert.equal(inventoryFixture.advertised.length, INVENTORY_ADVERTISED_REPRESENTATION_COUNT);
+  assert.deepEqual(inventoryFixture.requested.sort(), [INVENTORY_AUDIO_PATH, INVENTORY_VIDEO_PATH].sort());
   const inventoryEvents = await waitForStoredEvents(
     context,
     extensionId,
-    (events) => events.some((event) => event.code === 'bank.inventory' && event.sessionId === videoSessionId),
+    (events) => events.some((event) => event.code === 'bank.inventory'
+      && event.sessionId === videoSessionId
+      && event.data?.resources?.some((resource) => resource.pathname === INVENTORY_VIDEO_PATH
+        && resource.kind === 'video'
+        && resource.active === true)
+      && event.data?.resources?.some((resource) => resource.pathname === INVENTORY_AUDIO_PATH
+        && resource.kind === 'audio'
+        && resource.active === true)
+      && !event.data.resources.some((resource) => resource.pathname === INVENTORY_ADDRESS_BOOK_ONLY_PATH)),
   );
   const inventoryEvent = inventoryEvents.events.find(
-    (event) => event.code === 'bank.inventory' && event.sessionId === videoSessionId,
+    (event) => event.code === 'bank.inventory'
+      && event.sessionId === videoSessionId
+      && event.data?.resources?.some((resource) => resource.pathname === INVENTORY_VIDEO_PATH
+        && resource.kind === 'video'
+        && resource.active === true)
+      && event.data?.resources?.some((resource) => resource.pathname === INVENTORY_AUDIO_PATH
+        && resource.kind === 'audio'
+        && resource.active === true)
+      && !event.data.resources.some((resource) => resource.pathname === INVENTORY_ADDRESS_BOOK_ONLY_PATH),
   );
   assert.equal(typeof inventoryEvent.data.sessionGeneration, 'number');
   assert.equal(Array.isArray(inventoryEvent.data.resources), true);
+  assert.equal(inventoryEvent.data.resources.length, 2);
+  assert.equal(inventoryEvent.data.resources.some((resource) => resource.pathname === INVENTORY_VIDEO_PATH), true);
+  assert.equal(inventoryEvent.data.resources.some((resource) => resource.pathname === INVENTORY_AUDIO_PATH), true);
+  assert.equal(inventoryEvent.data.resources.some((resource) => resource.pathname === INVENTORY_ADDRESS_BOOK_ONLY_PATH), false);
   const cdnSummary = await extensionSend(popupLauncher, {
     version: 1,
     type: 'logs:cdn-summary',
     sessionId: videoSessionId,
   });
   assert.equal(cdnSummary.ok, true);
-  assert.equal(cdnSummary.sampleCount, 0);
+  assert.equal(cdnSummary.sampleCount > 0, true);
   assert.equal(cdnSummary.maxEventId >= inventoryEvent.eventId, true);
   assert.deepEqual(Object.keys(cdnSummary.summary.byResult).sort(), [
     'aborted',
@@ -535,6 +696,20 @@ try {
     'utf8',
   );
   console.log(`browser e2e event counts: ${JSON.stringify(eventCounts)}`);
+  const measuredInventoryEvents = exportedEvents.filter((event) =>
+    event.code === 'bank.inventory' && event.sessionId === videoSessionId);
+  assert.ok(measuredInventoryEvents.length > 0);
+  const averageInventoryLineBytes = measuredInventoryEvents.reduce((total, event) => total
+    + Buffer.byteLength(`${JSON.stringify({ recordType: 'event', ...event })}\n`, 'utf8'), 0)
+    / measuredInventoryEvents.length;
+  const measuredInventoryEvent = measuredInventoryEvents.find((event) =>
+    event.data?.resources?.some((resource) => resource.pathname === INVENTORY_VIDEO_PATH)
+    && event.data?.resources?.some((resource) => resource.pathname === INVENTORY_AUDIO_PATH));
+  assert.ok(measuredInventoryEvent);
+  console.log(`bank.inventory volume: run=browser-e2e popupVideoPage session=${videoSessionId}`
+    + ` averageUtf8JsonlBytes=${averageInventoryLineBytes}`
+    + ` advertisedRepresentations=${INVENTORY_ADVERTISED_REPRESENTATION_COUNT}`
+    + ` admittedResources=${measuredInventoryEvent.data.resources.length}`);
 
   await popupVideoPage.close();
   const consoleVerdict = consoleCapture.verdict();

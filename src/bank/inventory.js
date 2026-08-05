@@ -103,7 +103,6 @@ export function deriveBankInventory({
   const storedByKey = storedByResource(chunks);
   const resourceKeys = new Set([
     ...resourceState.keys(),
-    ...addressBook.keys(),
     ...storedByKey.keys(),
   ]);
   const sortedResourceKeys = [...resourceKeys].sort((left, right) => left.localeCompare(right));

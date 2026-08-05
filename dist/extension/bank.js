@@ -317,7 +317,6 @@
     const storedByKey = storedByResource(chunks);
     const resourceKeys = /* @__PURE__ */ new Set([
       ...resourceState.keys(),
-      ...addressBook.keys(),
       ...storedByKey.keys()
     ]);
     const sortedResourceKeys = [...resourceKeys].sort((left, right) => left.localeCompare(right));

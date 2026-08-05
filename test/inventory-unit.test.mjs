@@ -111,6 +111,59 @@ test('inventory reports absent paired address, disabled state, and route-left re
   fixture.bank.destroy();
 });
 
+test('inventory excludes representations that exist only in the address book', () => {
+  const addressBookOnly = '/video/address-book-only.m4s';
+  const inventory = deriveBankInventory({
+    chunks: new Map(),
+    resourceState: new Map(),
+    addressBook: new Map([[addressBookOnly, {
+      representation: { mimeType: 'video/mp4', height: 360 },
+      label: '360P',
+    }]]),
+    recentResourceKeys: [],
+    maxBankBytes: 512,
+    maxPrefetchConcurrency: 4,
+    queueLength: 0,
+    inflightCount: 0,
+    disabled: false,
+    routeActive: true,
+    isPairedAddressAvailable: () => false,
+    sessionGeneration: 0,
+  });
+
+  assert.deepEqual(inventory.resources, []);
+});
+
+test('inventory keeps a requested representation with zero stored bytes', () => {
+  const inventory = deriveBankInventory({
+    chunks: new Map(),
+    resourceState: new Map([[RESOURCE, {
+      totalSize: undefined,
+      lastForegroundEnd: undefined,
+      outstanding: new Set(),
+      chunkAttempts: new Map(),
+    }]]),
+    addressBook: new Map([[RESOURCE, {
+      representation: { mimeType: 'video/mp4', height: 720 },
+      label: '720P',
+    }]]),
+    recentResourceKeys: [RESOURCE],
+    maxBankBytes: 512,
+    maxPrefetchConcurrency: 4,
+    queueLength: 0,
+    inflightCount: 0,
+    disabled: false,
+    routeActive: true,
+    isPairedAddressAvailable: () => false,
+    sessionGeneration: 0,
+  });
+
+  assert.equal(inventory.resources.length, 1);
+  assert.equal(inventory.resources[0].pathname, RESOURCE);
+  assert.equal(inventory.resources[0].storedBytes, 0);
+  assert.equal(inventory.resources[0].storedChunks, 0);
+});
+
 test('unchanged inventory is suppressed until the heartbeat floor republishes it', async () => {
   const fixture = bankFixture();
   await fixture.bank.prefetch();
