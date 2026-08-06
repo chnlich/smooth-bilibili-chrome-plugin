@@ -577,7 +577,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-92fffdd086037f337720f6ca" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-e465f55be6e01bcaba8f665c" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1289,8 +1289,8 @@
             bufferedRanges: facts.bufferedRanges,
             totalDelta,
             droppedDelta,
-            mediaStepMsMedian: this.intervalMediaSteps.length === 0 ? UNKNOWN_VALUE : median(this.intervalMediaSteps),
-            mediaStepMsMax: this.intervalMediaSteps.length === 0 ? UNKNOWN_VALUE : Math.max(...this.intervalMediaSteps)
+            mediaStepMsMedian: data.frameTiming.mediaStepMsMedian,
+            mediaStepMsMax: data.frameTiming.mediaStepMsMax
           })
         };
       }

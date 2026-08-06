@@ -284,12 +284,8 @@ export class MediaEventRecorder {
           bufferedRanges: facts.bufferedRanges,
           totalDelta,
           droppedDelta,
-          mediaStepMsMedian: this.intervalMediaSteps.length === 0
-            ? UNKNOWN_VALUE
-            : median(this.intervalMediaSteps),
-          mediaStepMsMax: this.intervalMediaSteps.length === 0
-            ? UNKNOWN_VALUE
-            : Math.max(...this.intervalMediaSteps),
+          mediaStepMsMedian: data.frameTiming.mediaStepMsMedian,
+          mediaStepMsMax: data.frameTiming.mediaStepMsMax,
         }),
       };
     }

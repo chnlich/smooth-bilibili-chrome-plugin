@@ -798,6 +798,30 @@ test('media waiting retains its classified last stall', () => {
   fixture.recorder.destroy();
 });
 
+test('media waiting compares the rounded frame timing values for its stall kind', () => {
+  const fixture = mediaRecorderFixture();
+  let quality = { total: 10, dropped: 0 };
+  fixture.video.getVideoPlaybackQuality = () => ({
+    totalVideoFrames: quality.total,
+    droppedVideoFrames: quality.dropped,
+    corruptedVideoFrames: 0,
+  });
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  fixture.emitFrame(0, { presentedFrames: 1, mediaTime: 1 });
+  fixture.emitFrame(33.6, { presentedFrames: 2, mediaTime: 1.0336 });
+  fixture.emitFrame(67.4, { presentedFrames: 3, mediaTime: 1.0674 });
+  quality = { total: 11, dropped: 0 };
+  fixture.video.emit('waiting');
+
+  const timing = fixture.events.at(-1).data.frameTiming;
+  assert.equal(timing.mediaStepMsMedian, 34);
+  assert.equal(timing.mediaStepMsMax, 34);
+  assert.equal(fixture.recorder.getLastStall().kind, '未判定');
+  fixture.recorder.destroy();
+});
+
 test('media frame gap keeps its full duration across record boundaries and locates recovery', () => {
   const fixture = mediaRecorderFixture();
   fixture.recorder.start();
