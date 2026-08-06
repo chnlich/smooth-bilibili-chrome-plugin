@@ -6,7 +6,7 @@ import { ExtensionCoordinator } from '../src/extension/controller.js';
 import { computeForwardInventory } from '../src/vod/buffer.js';
 import { VodBufferController } from '../src/vod/controller.js';
 import { DiagnosticsClient, createRouteIdentity } from '../src/diagnostics/client.js';
-import { MediaEventRecorder, readMediaFacts } from '../src/diagnostics/media.js';
+import { MediaEventRecorder, classifyStall, readMediaFacts } from '../src/diagnostics/media.js';
 import { MEDIA_EVENT_NAMES, EVENT_CODES } from '../src/diagnostics/catalog.js';
 import {
   browserMetric,
@@ -702,8 +702,99 @@ test('media frame aggregation reports presented deltas and resets each interval'
   const samples = fixture.events.filter((event) => event.code === 'media.sample');
   assert.equal(samples[0].data.presented, 3);
   assert.equal(samples[1].data.presented, 0);
-  assert.equal(Object.hasOwn(samples[0].data, 'stallDetail'), false);
+  assert.equal(Object.hasOwn(samples[0].data, 'frameTiming'), true);
   assert.equal(Object.hasOwn(samples[0].data, 'appends'), false);
+  fixture.recorder.destroy();
+});
+
+test('frame timing aggregates display lead and media steps in rounded milliseconds', () => {
+  const fixture = mediaRecorderFixture();
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  fixture.emitFrame(0, {
+    presentedFrames: 1,
+    expectedDisplayTime: 15.49,
+    presentationTime: 10,
+    mediaTime: 1,
+  });
+  fixture.emitFrame(100, {
+    presentedFrames: 2,
+    expectedDisplayTime: 30.51,
+    presentationTime: 20,
+    mediaTime: 1.04,
+  });
+  fixture.emitFrame(200, {
+    presentedFrames: 3,
+    expectedDisplayTime: 48.49,
+    presentationTime: 35,
+    mediaTime: 1.07,
+  });
+  fixture.emitFrame(300, {
+    presentedFrames: 4,
+    expectedDisplayTime: 54,
+    presentationTime: 40,
+    mediaTime: 1.12,
+  });
+  fixture.setTime(300);
+  fixture.sample();
+
+  const detail = fixture.events.at(-1).data.frameTiming;
+  assert.equal(detail.displayLeadMsMedian, 12);
+  assert.equal(detail.displayLeadMsMin, 5);
+  assert.equal(detail.mediaStepMsMedian, 40);
+  assert.equal(detail.mediaStepMsMax, 50);
+  fixture.recorder.destroy();
+});
+
+test('classifyStall short-circuits data and frame conditions in order', () => {
+  const bufferedRanges = [{ start: 0, end: 20 }];
+  const base = {
+    currentTime: 10,
+    bufferedRanges,
+    droppedDelta: 0,
+    mediaStepMsMedian: 33,
+    mediaStepMsMax: 33,
+  };
+  assert.equal(classifyStall({
+    ...base,
+    currentTime: 20,
+    totalDelta: 0,
+  }), '数据侧');
+  assert.equal(classifyStall({ ...base, totalDelta: 0 }), '帧未产出');
+  assert.equal(classifyStall({
+    ...base,
+    totalDelta: 4,
+    mediaStepMsMax: 66,
+  }), '帧未呈现');
+  assert.equal(classifyStall({ ...base, totalDelta: 4 }), '未判定');
+  assert.equal(classifyStall({ ...base, totalDelta: undefined, droppedDelta: undefined }), '未判定');
+  assert.equal(classifyStall({
+    ...base,
+    totalDelta: 4,
+    droppedDelta: 0,
+    mediaStepMsMedian: '未提供',
+    mediaStepMsMax: '未提供',
+  }), '未判定');
+});
+
+test('media waiting retains its classified last stall', () => {
+  const fixture = mediaRecorderFixture();
+  let quality = { total: 10, dropped: 0 };
+  fixture.video.getVideoPlaybackQuality = () => ({
+    totalVideoFrames: quality.total,
+    droppedVideoFrames: quality.dropped,
+    corruptedVideoFrames: 0,
+  });
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  quality = { total: 11, dropped: 1 };
+  fixture.video.emit('waiting');
+
+  const lastStall = fixture.recorder.getLastStall();
+  assert.equal(lastStall.kind, '帧未呈现');
+  assert.equal(Number.isFinite(lastStall.atMs), true);
   fixture.recorder.destroy();
 });
 
@@ -717,14 +808,14 @@ test('media frame gap keeps its full duration across record boundaries and locat
   fixture.sample();
   fixture.setTime(1000);
   fixture.sample();
-  const frameless = fixture.events.at(-1).data.stallDetail;
+  const frameless = fixture.events.at(-1).data.frameTiming;
   assert.equal(frameless.maxFrameGapMs, 1000);
   assert.equal(frameless.maxFrameGapEndedAgoMs, '未提供');
 
   fixture.emitFrame(1800, { presentedFrames: 2 });
   fixture.setTime(2000);
   fixture.sample();
-  const recovery = fixture.events.at(-1).data.stallDetail;
+  const recovery = fixture.events.at(-1).data.frameTiming;
   assert.equal(recovery.maxFrameGapMs, 1800);
   assert.equal(recovery.maxFrameGapEndedAgoMs, 200);
   assert.equal(2000 - recovery.maxFrameGapEndedAgoMs, 1800);
@@ -738,7 +829,7 @@ test('each stall predicate arm fires independently', () => {
   advancingClock.video.currentTime = 10.3;
   advancingClock.setTime(1000);
   advancingClock.sample();
-  assert.equal(typeof advancingClock.events.at(-1).data.stallDetail, 'object');
+  assert.equal(typeof advancingClock.events.at(-1).data.frameTiming, 'object');
   advancingClock.recorder.destroy();
 
   const lowReadyState = mediaRecorderFixture();
@@ -747,7 +838,7 @@ test('each stall predicate arm fires independently', () => {
   lowReadyState.video.readyState = 2;
   lowReadyState.setTime(1000);
   lowReadyState.sample();
-  assert.equal(typeof lowReadyState.events.at(-1).data.stallDetail, 'object');
+  assert.equal(typeof lowReadyState.events.at(-1).data.frameTiming, 'object');
   lowReadyState.recorder.destroy();
 
   const longGap = mediaRecorderFixture();
@@ -758,28 +849,57 @@ test('each stall predicate arm fires independently', () => {
   longGap.sample();
   longGap.setTime(600);
   longGap.sample();
-  assert.equal(longGap.events.at(-1).data.stallDetail.maxFrameGapMs, 600);
+  assert.equal(longGap.events.at(-1).data.frameTiming.maxFrameGapMs, 600);
   longGap.recorder.destroy();
 });
 
-test('normal intervals omit stallDetail and clear interval quantities before recovery', () => {
+test('normal intervals include frameTiming and clear interval quantities before recovery', () => {
   const fixture = mediaRecorderFixture();
   fixture.recorder.start();
   fixture.events.length = 0;
 
-  fixture.emitFrame(0, { presentedFrames: 1, processingDuration: 99 });
-  fixture.emitFrame(400, { presentedFrames: 2, processingDuration: 99 });
+  fixture.emitFrame(0, {
+    presentedFrames: 1,
+    processingDuration: 99,
+    expectedDisplayTime: 20,
+    presentationTime: 10,
+    mediaTime: 1,
+  });
+  fixture.emitFrame(400, {
+    presentedFrames: 2,
+    processingDuration: 99,
+    expectedDisplayTime: 40,
+    presentationTime: 20,
+    mediaTime: 1.04,
+  });
   fixture.setTime(400);
   fixture.sample();
-  assert.equal(Object.hasOwn(fixture.events.at(-1).data, 'stallDetail'), false);
+  const normalDetail = fixture.events.at(-1).data.frameTiming;
+  assert.equal(typeof normalDetail, 'object');
+  for (const field of [
+    'displayLeadMsMedian',
+    'displayLeadMsMin',
+    'mediaStepMsMedian',
+    'mediaStepMsMax',
+  ]) {
+    assert.ok(typeof normalDetail[field] === 'number' || normalDetail[field] === '未提供');
+  }
+  assert.equal(normalDetail.displayLeadMsMedian, 15);
+  assert.equal(normalDetail.displayLeadMsMin, 10);
+  assert.equal(normalDetail.mediaStepMsMedian, 40);
+  assert.equal(normalDetail.mediaStepMsMax, 40);
 
   fixture.video.readyState = 2;
   fixture.setTime(600);
   fixture.sample();
-  const detail = fixture.events.at(-1).data.stallDetail;
+  const detail = fixture.events.at(-1).data.frameTiming;
   assert.equal(detail.maxFrameGapMs, 200);
   assert.equal(detail.processingMsMax, '未提供');
   assert.equal(detail.processingMsMedian, '未提供');
+  assert.equal(detail.displayLeadMsMedian, '未提供');
+  assert.equal(detail.displayLeadMsMin, '未提供');
+  assert.equal(detail.mediaStepMsMedian, '未提供');
+  assert.equal(detail.mediaStepMsMax, '未提供');
   fixture.recorder.destroy();
 });
 
@@ -796,7 +916,7 @@ test('processing duration aggregation excludes missing values and computes the e
   fixture.video.readyState = 2;
   fixture.setTime(400);
   fixture.sample();
-  const detail = fixture.events.at(-1).data.stallDetail;
+  const detail = fixture.events.at(-1).data.frameTiming;
   assert.equal(detail.processingMsMax, 10);
   assert.equal(detail.processingMsMedian, 7);
   fixture.recorder.destroy();
@@ -811,8 +931,8 @@ test('missing requestVideoFrameCallback degrades presented without blocking read
   assert.doesNotThrow(() => fixture.sample());
   const data = fixture.events.at(-1).data;
   assert.equal(data.presented, '未提供');
-  assert.equal(typeof data.stallDetail, 'object');
-  assert.equal(data.stallDetail.presentedTotal, '未提供');
+  assert.equal(typeof data.frameTiming, 'object');
+  assert.equal(data.frameTiming.presentedTotal, '未提供');
   fixture.recorder.destroy();
 });
 
@@ -823,7 +943,7 @@ test('append diagnostics use cumulative count, latest success age, and one updat
   fixture.video.readyState = 2;
   fixture.setTime(100);
   fixture.sample();
-  let detail = fixture.events.at(-1).data.stallDetail;
+  let detail = fixture.events.at(-1).data.frameTiming;
   assert.equal(detail.appends, '未提供');
   assert.equal(detail.lastAppendAgoMs, '未提供');
   assert.equal(detail.updateEndMsMax, '未提供');
@@ -836,14 +956,14 @@ test('append diagnostics use cumulative count, latest success age, and one updat
   });
   fixture.setTime(1000);
   fixture.sample();
-  detail = fixture.events.at(-1).data.stallDetail;
+  detail = fixture.events.at(-1).data.frameTiming;
   assert.equal(detail.appends, 3);
   assert.equal(detail.lastAppendAgoMs, 100);
   assert.equal(detail.updateEndMsMax, 37);
 
   fixture.setTime(2000);
   fixture.sample();
-  detail = fixture.events.at(-1).data.stallDetail;
+  detail = fixture.events.at(-1).data.frameTiming;
   assert.equal(detail.appends, 3);
   assert.equal(detail.lastAppendAgoMs, 1100);
   assert.equal(detail.updateEndMsMax, '未提供');
@@ -954,10 +1074,10 @@ test('diagnostic catalog covers all required media events and preserves browser-
   );
 });
 
-test('stall detail survives its dedicated privacy sanitizer field by field', () => {
+test('frame timing survives its dedicated privacy sanitizer field by field', () => {
   const sanitized = sanitizeEventData('media.sample', {
     presented: 0,
-    stallDetail: {
+    frameTiming: {
       presentedTotal: { value: 0, reportedBy: 'browser' },
       maxFrameGapMs: 601,
       maxFrameGapEndedAgoMs: 12,
@@ -966,17 +1086,25 @@ test('stall detail survives its dedicated privacy sanitizer field by field', () 
       appends: 17,
       lastAppendAgoMs: 33,
       updateEndMsMax: 6.75,
+      displayLeadMsMedian: { value: 0, reportedBy: 'browser' },
+      displayLeadMsMin: 2.5,
+      mediaStepMsMedian: 4,
+      mediaStepMsMax: Number.NaN,
     },
   });
   assert.equal(sanitized.presented, 0);
-  assert.deepEqual(sanitized.stallDetail.presentedTotal, { value: 0, reportedBy: 'browser' });
-  assert.equal(sanitized.stallDetail.maxFrameGapMs, 601);
-  assert.equal(sanitized.stallDetail.maxFrameGapEndedAgoMs, 12);
-  assert.equal(sanitized.stallDetail.processingMsMax, 8.5);
-  assert.equal(sanitized.stallDetail.processingMsMedian, 4.25);
-  assert.equal(sanitized.stallDetail.appends, 17);
-  assert.equal(sanitized.stallDetail.lastAppendAgoMs, 33);
-  assert.equal(sanitized.stallDetail.updateEndMsMax, 6.75);
+  assert.deepEqual(sanitized.frameTiming.presentedTotal, { value: 0, reportedBy: 'browser' });
+  assert.equal(sanitized.frameTiming.maxFrameGapMs, 601);
+  assert.equal(sanitized.frameTiming.maxFrameGapEndedAgoMs, 12);
+  assert.equal(sanitized.frameTiming.processingMsMax, 8.5);
+  assert.equal(sanitized.frameTiming.processingMsMedian, 4.25);
+  assert.equal(sanitized.frameTiming.appends, 17);
+  assert.equal(sanitized.frameTiming.lastAppendAgoMs, 33);
+  assert.equal(sanitized.frameTiming.updateEndMsMax, 6.75);
+  assert.deepEqual(sanitized.frameTiming.displayLeadMsMedian, { value: 0, reportedBy: 'browser' });
+  assert.equal(sanitized.frameTiming.displayLeadMsMin, 2.5);
+  assert.equal(sanitized.frameTiming.mediaStepMsMedian, 4);
+  assert.equal(sanitized.frameTiming.mediaStepMsMax, '未提供');
 });
 
 test('legacy media records without the additive fields remain valid', () => {

@@ -125,7 +125,7 @@ export const DATA_ALLOWLIST = Object.freeze({
     'appendErrors',
     'removeStats',
     'presented',
-    'stallDetail',
+    'frameTiming',
     'mediaSourceInstance',
     'sourceBufferInstance',
     'appendSequence',

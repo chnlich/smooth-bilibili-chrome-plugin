@@ -108,9 +108,21 @@ test('inventory age past the heartbeat floor is explicitly stale', () => {
       data: { resources: [], storedBytes: 0 },
       receivedAtMs: 100,
     },
+    lastStall: { atMs: 100, kind: '帧未呈现' },
     diagnostics: { sessionId: 'session-test', persistence: 'PERSISTED' },
     now: 100 + INVENTORY_HEARTBEAT_FLOOR_MS + 1,
   });
   assert.equal(readouts.bank.ageMs, INVENTORY_HEARTBEAT_FLOOR_MS + 1);
   assert.equal(inventoryStoppedPublishing(readouts.bank.ageMs), true);
+  assert.deepEqual(readouts.lastStall, {
+    agoMs: INVENTORY_HEARTBEAT_FLOOR_MS + 1,
+    kind: '帧未呈现',
+  });
+  const withoutStall = buildReadouts({
+    surfaceId: 'surface-test',
+    video: undefined,
+    diagnostics: { sessionId: 'session-test', persistence: 'PERSISTED' },
+    now: 100,
+  });
+  assert.equal(withoutStall.lastStall, '未提供');
 });

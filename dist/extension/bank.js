@@ -133,7 +133,7 @@
       "appendErrors",
       "removeStats",
       "presented",
-      "stallDetail",
+      "frameTiming",
       "mediaSourceInstance",
       "sourceBufferInstance",
       "appendSequence",

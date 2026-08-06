@@ -192,7 +192,7 @@ function safeReportedMetric(value) {
   return browserMetric(value);
 }
 
-function safeStallDetail(value) {
+function safeFrameTiming(value) {
   if (value === UNKNOWN_VALUE) return value;
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return UNKNOWN_VALUE;
   return {
@@ -204,6 +204,10 @@ function safeStallDetail(value) {
     appends: finiteOrUnknown(value.appends),
     lastAppendAgoMs: finiteOrUnknown(value.lastAppendAgoMs),
     updateEndMsMax: finiteOrUnknown(value.updateEndMsMax),
+    displayLeadMsMedian: safeReportedMetric(value.displayLeadMsMedian),
+    displayLeadMsMin: safeReportedMetric(value.displayLeadMsMin),
+    mediaStepMsMedian: safeReportedMetric(value.mediaStepMsMedian),
+    mediaStepMsMax: safeReportedMetric(value.mediaStepMsMax),
   };
 }
 
@@ -239,7 +243,7 @@ function sanitizeField(field, value) {
   if (field === 'appendErrors') return safeAppendErrors(value);
   if (field === 'removeStats') return safeRemoveStats(value);
   if (field === 'resolution') return safeResolution(value);
-  if (field === 'stallDetail') return safeStallDetail(value);
+  if (field === 'frameTiming') return safeFrameTiming(value);
   if (
     field === 'transferSize' ||
     field === 'encodedBodySize' ||

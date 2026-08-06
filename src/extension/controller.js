@@ -200,10 +200,13 @@ export class ExtensionCoordinator {
 
   getReadouts() {
     const panel = this.active?.panel;
+    const recorder = this.active?.controller?.mediaRecorder
+      || this.active?.passiveObserver?.recorder;
     return buildReadouts({
       surfaceId: panel?.surfaceId || 'surface-unavailable',
       video: findLargestVideo(this.documentObject),
       bankInventory: this.getBankInventory(),
+      lastStall: recorder?.getLastStall(),
       diagnostics: this.diagnostics?.getStatus(),
       now: this.now(),
     });

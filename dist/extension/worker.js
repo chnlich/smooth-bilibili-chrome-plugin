@@ -144,7 +144,7 @@
       "appendErrors",
       "removeStats",
       "presented",
-      "stallDetail",
+      "frameTiming",
       "mediaSourceInstance",
       "sourceBufferInstance",
       "appendSequence",
@@ -407,7 +407,7 @@
     }
     return browserMetric(value);
   }
-  function safeStallDetail(value) {
+  function safeFrameTiming(value) {
     if (value === UNKNOWN_VALUE) return value;
     if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
     return {
@@ -418,7 +418,11 @@
       processingMsMedian: safeReportedMetric(value.processingMsMedian),
       appends: finiteOrUnknown(value.appends),
       lastAppendAgoMs: finiteOrUnknown(value.lastAppendAgoMs),
-      updateEndMsMax: finiteOrUnknown(value.updateEndMsMax)
+      updateEndMsMax: finiteOrUnknown(value.updateEndMsMax),
+      displayLeadMsMedian: safeReportedMetric(value.displayLeadMsMedian),
+      displayLeadMsMin: safeReportedMetric(value.displayLeadMsMin),
+      mediaStepMsMedian: safeReportedMetric(value.mediaStepMsMedian),
+      mediaStepMsMax: safeReportedMetric(value.mediaStepMsMax)
     };
   }
   function safeRemoveStats(value) {
@@ -450,7 +454,7 @@
     if (field === "appendErrors") return safeAppendErrors(value);
     if (field === "removeStats") return safeRemoveStats(value);
     if (field === "resolution") return safeResolution(value);
-    if (field === "stallDetail") return safeStallDetail(value);
+    if (field === "frameTiming") return safeFrameTiming(value);
     if (field === "transferSize" || field === "encodedBodySize" || field === "decodedBodySize" || field === "startTime" || field === "duration" || field === "responseStart" || field === "responseEnd") {
       return browserMetric(value);
     }

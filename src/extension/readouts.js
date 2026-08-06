@@ -111,6 +111,7 @@ export function buildReadouts({
   surfaceId,
   video,
   bankInventory,
+  lastStall,
   diagnostics,
   now = Date.now(),
 }) {
@@ -127,6 +128,12 @@ export function buildReadouts({
     version: 2,
     surfaceId,
     media,
+    lastStall: lastStall === undefined
+      ? UNKNOWN_VALUE
+      : {
+        agoMs: Math.max(0, now - lastStall.atMs),
+        kind: lastStall.kind,
+      },
     bank,
     bankSecondsEstimated: estimateBankSeconds(bank, mediaDuration),
     diagnostics: {

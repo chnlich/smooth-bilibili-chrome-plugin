@@ -153,7 +153,7 @@
       "appendErrors",
       "removeStats",
       "presented",
-      "stallDetail",
+      "frameTiming",
       "mediaSourceInstance",
       "sourceBufferInstance",
       "appendSequence",
@@ -295,10 +295,15 @@
     heading.textContent = text;
     element.append(heading);
   }
-  function renderMediaReadout(media) {
+  function lastStallText(lastStall) {
+    if (lastStall === void 0 || lastStall === "未提供") return "未提供";
+    return `${textValue(lastStall.kind)} · ${numberText(lastStall.agoMs, " ms 前")}`;
+  }
+  function renderMediaReadout(media, lastStall) {
     clearReadout(readoutMediaElement);
     if (media === "未提供") {
       appendRow(readoutMediaElement, "读数", "未提供");
+      appendRow(readoutMediaElement, "上次停顿", lastStallText(lastStall));
       return;
     }
     appendRow(readoutMediaElement, "交集前向秒数", numberText(media.forwardSeconds, " 秒"));
@@ -313,6 +318,7 @@
     appendRow(readoutMediaElement, "分辨率", media.element.resolution === "未提供" ? "未提供" : `${textValue(media.element.resolution?.width)}×${textValue(media.element.resolution?.height)}`);
     appendRow(readoutMediaElement, "暂停", media.element.paused);
     appendRow(readoutMediaElement, "结束", media.element.ended);
+    appendRow(readoutMediaElement, "上次停顿", lastStallText(lastStall));
     if (media.tracks.length === 0) {
       appendRow(readoutMediaElement, "轨道", "未提供");
       return;
@@ -419,7 +425,7 @@
   function renderReadouts(snapshot) {
     const values = snapshot || {};
     latestReadouts = snapshot;
-    renderMediaReadout(values.media || "未提供");
+    renderMediaReadout(values.media || "未提供", values.lastStall || "未提供");
     renderBankReadout(values.bank || "未提供", values.bankSecondsEstimated || {});
     renderRaceReadout(values.diagnostics?.persistence);
     renderDiagnosticsReadout(values.diagnostics);

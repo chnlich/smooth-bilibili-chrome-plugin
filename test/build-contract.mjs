@@ -367,6 +367,7 @@ for (const field of [
   'result',
   'errorName',
 ]) assert.equal(DATA_ALLOWLIST.media.includes(field), true);
+assert.equal(DATA_ALLOWLIST.media.includes('frameTiming'), true);
 assert.equal(SHIM_APPEND_EVENT, 'bilibili-buffer:shim-append-v1');
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.doesNotMatch(bridgeContractSource, /BRIDGE_LIVE|setChasingFrameThreshold|getLiveCapabilitySnapshot|disableLiveAutoCatchup/);

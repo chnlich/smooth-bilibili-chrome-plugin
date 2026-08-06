@@ -145,7 +145,7 @@
       "appendErrors",
       "removeStats",
       "presented",
-      "stallDetail",
+      "frameTiming",
       "mediaSourceInstance",
       "sourceBufferInstance",
       "appendSequence",
@@ -382,7 +382,7 @@
     }
     return browserMetric(value);
   }
-  function safeStallDetail(value) {
+  function safeFrameTiming(value) {
     if (value === UNKNOWN_VALUE) return value;
     if (value === null || typeof value !== "object" || Array.isArray(value)) return UNKNOWN_VALUE;
     return {
@@ -393,7 +393,11 @@
       processingMsMedian: safeReportedMetric(value.processingMsMedian),
       appends: finiteOrUnknown(value.appends),
       lastAppendAgoMs: finiteOrUnknown(value.lastAppendAgoMs),
-      updateEndMsMax: finiteOrUnknown(value.updateEndMsMax)
+      updateEndMsMax: finiteOrUnknown(value.updateEndMsMax),
+      displayLeadMsMedian: safeReportedMetric(value.displayLeadMsMedian),
+      displayLeadMsMin: safeReportedMetric(value.displayLeadMsMin),
+      mediaStepMsMedian: safeReportedMetric(value.mediaStepMsMedian),
+      mediaStepMsMax: safeReportedMetric(value.mediaStepMsMax)
     };
   }
   function safeRemoveStats(value) {
@@ -425,7 +429,7 @@
     if (field === "appendErrors") return safeAppendErrors(value);
     if (field === "removeStats") return safeRemoveStats(value);
     if (field === "resolution") return safeResolution(value);
-    if (field === "stallDetail") return safeStallDetail(value);
+    if (field === "frameTiming") return safeFrameTiming(value);
     if (field === "transferSize" || field === "encodedBodySize" || field === "decodedBodySize" || field === "startTime" || field === "duration" || field === "responseStart" || field === "responseEnd") {
       return browserMetric(value);
     }
@@ -573,7 +577,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-1f28e09e60cf004fe948fa40" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-92fffdd086037f337720f6ca" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1023,8 +1027,6 @@
   };
 
   // src/diagnostics/media.js
-  var CLOCK_ADVANCE_THRESHOLD_SECONDS = 0.2;
-  var MAX_FRAME_GAP_MILLISECONDS = 500;
   function readRanges(timeRanges) {
     if (timeRanges === void 0 || timeRanges === null) return UNKNOWN_VALUE;
     const result = [];
@@ -1162,11 +1164,36 @@
     if (!Number.isFinite(value) || !Number.isFinite(previous)) return 0;
     return Math.max(0, value - previous);
   }
+  function rawMetric(value) {
+    if (value !== null && typeof value === "object" && !Array.isArray(value) && value.value === 0 && value.reportedBy === "browser") return 0;
+    return value;
+  }
+  function qualityDelta(value, previous) {
+    if (!Number.isFinite(value) || !Number.isFinite(previous)) return void 0;
+    return value - previous;
+  }
   function median(values) {
     const ordered = [...values].sort((left, right) => left - right);
     const middle = Math.floor(ordered.length / 2);
     if (ordered.length % 2 === 1) return ordered[middle];
     return (ordered[middle - 1] + ordered[middle]) / 2;
+  }
+  function classifyStall({
+    currentTime,
+    bufferedRanges,
+    totalDelta,
+    droppedDelta,
+    mediaStepMsMedian,
+    mediaStepMsMax
+  }) {
+    const hasBufferedData = Number.isFinite(currentTime) && Array.isArray(bufferedRanges) && bufferedRanges.some((range) => Number.isFinite(range?.start) && Number.isFinite(range?.end) && range.start <= currentTime && range.end > currentTime);
+    if (!hasBufferedData) return "数据侧";
+    if (totalDelta === 0) return "帧未产出";
+    const mediaStepMedian = rawMetric(mediaStepMsMedian);
+    const mediaStepMax = rawMetric(mediaStepMsMax);
+    const mediaStepGap = Number.isFinite(mediaStepMedian) && Number.isFinite(mediaStepMax) && mediaStepMax > mediaStepMedian;
+    if (totalDelta > 0 && (droppedDelta > 0 || mediaStepGap)) return "帧未呈现";
+    return "未判定";
   }
   var MediaEventRecorder = class {
     constructor({
@@ -1178,7 +1205,8 @@
       },
       onFrame = () => {
       },
-      now = () => runtimeNow(runtimeObject)
+      now = () => runtimeNow(runtimeObject),
+      wallNow = () => Date.now()
     }) {
       this.video = video;
       this.logger = logger2 || {
@@ -1190,12 +1218,14 @@
       this.onEvent = onEvent;
       this.onFrame = onFrame;
       this.now = now;
+      this.wallNow = wallNow;
       this.listeners = [];
       this.sampleTimer = void 0;
       this.frameCallbackActive = false;
       this.destroyed = false;
-      this.previousCurrentTime = void 0;
       this.previousPresentedFrames = void 0;
+      this.previousMediaTime = void 0;
+      this.previousVideoQuality = void 0;
       this.presentedFramesTotal = void 0;
       this.frameCallbackSupported = typeof this.video.requestVideoFrameCallback === "function";
       this.intervalPresented = this.frameCallbackSupported ? 0 : UNKNOWN_VALUE;
@@ -1203,12 +1233,15 @@
       this.intervalMaxFrameGapMs = void 0;
       this.intervalMaxFrameGapEndedAt = void 0;
       this.intervalProcessingDurations = [];
+      this.intervalDisplayLeads = [];
+      this.intervalMediaSteps = [];
       this.lastFrameTimestamp = void 0;
       this.lastUpdateEndAt = void 0;
       this.updateEndBaselineEstablished = false;
       this.visibilityDocument = void 0;
       this.visibilityListener = void 0;
       this.visibilityState = UNKNOWN_VALUE;
+      this.lastStall = void 0;
     }
     start() {
       if (this.destroyed) throw new Error("媒体日志 recorder 已销毁");
@@ -1242,11 +1275,32 @@
         facts = emptyMediaFacts(name);
       }
       const recordNow = this.now();
-      const { data, currentTime } = this.mediaRecordData(facts, recordNow);
+      const {
+        data,
+        currentTime,
+        totalDelta,
+        droppedDelta
+      } = this.mediaRecordData(facts, recordNow);
+      if (name === "waiting") {
+        this.lastStall = {
+          atMs: this.wallNow(),
+          kind: classifyStall({
+            currentTime,
+            bufferedRanges: facts.bufferedRanges,
+            totalDelta,
+            droppedDelta,
+            mediaStepMsMedian: this.intervalMediaSteps.length === 0 ? UNKNOWN_VALUE : median(this.intervalMediaSteps),
+            mediaStepMsMax: this.intervalMediaSteps.length === 0 ? UNKNOWN_VALUE : Math.max(...this.intervalMediaSteps)
+          })
+        };
+      }
       try {
         this.writeLog(`media.${name}`, data, error);
       } finally {
-        this.previousCurrentTime = Number.isFinite(currentTime) ? currentTime : void 0;
+        this.previousVideoQuality = {
+          total: Number.isFinite(facts.videoQuality?.total) ? facts.videoQuality.total : void 0,
+          dropped: Number.isFinite(facts.videoQuality?.dropped) ? facts.videoQuality.dropped : void 0
+        };
         this.resetInterval();
       }
     }
@@ -1319,6 +1373,22 @@
       if (Number.isFinite(frameMetadata.processingDuration)) {
         this.intervalProcessingDurations.push(frameMetadata.processingDuration * 1e3);
       }
+      if (Number.isFinite(frameMetadata.expectedDisplayTime) && Number.isFinite(frameMetadata.presentationTime)) {
+        this.intervalDisplayLeads.push(
+          frameMetadata.expectedDisplayTime - frameMetadata.presentationTime
+        );
+      }
+      if (Number.isFinite(frameMetadata.mediaTime)) {
+        if (Number.isFinite(this.previousMediaTime)) {
+          const mediaStepSeconds = frameMetadata.mediaTime - this.previousMediaTime;
+          if (Number.isFinite(mediaStepSeconds) && mediaStepSeconds > 0) {
+            this.intervalMediaSteps.push(mediaStepSeconds * 1e3);
+          }
+        }
+        this.previousMediaTime = frameMetadata.mediaTime;
+      } else {
+        this.previousMediaTime = void 0;
+      }
     }
     mediaRecordData(facts, recordNow) {
       const {
@@ -1332,17 +1402,25 @@
       const maxFrameGapEndedAgoMs = Number.isFinite(this.intervalMaxFrameGapEndedAt) && Number.isFinite(recordNow) ? Math.max(0, recordNow - this.intervalMaxFrameGapEndedAt) : UNKNOWN_VALUE;
       const processingMsMax = this.intervalProcessingDurations.length === 0 ? UNKNOWN_VALUE : browserMetric(Math.max(...this.intervalProcessingDurations));
       const processingMsMedian = this.intervalProcessingDurations.length === 0 ? UNKNOWN_VALUE : browserMetric(median(this.intervalProcessingDurations));
+      const displayLeadMsMedian = this.intervalDisplayLeads.length === 0 ? UNKNOWN_VALUE : browserMetric(Math.round(median(this.intervalDisplayLeads)));
+      const displayLeadMsMin = this.intervalDisplayLeads.length === 0 ? UNKNOWN_VALUE : browserMetric(Math.round(Math.min(...this.intervalDisplayLeads)));
+      const mediaStepMsMedian = this.intervalMediaSteps.length === 0 ? UNKNOWN_VALUE : browserMetric(Math.round(median(this.intervalMediaSteps)));
+      const mediaStepMsMax = this.intervalMediaSteps.length === 0 ? UNKNOWN_VALUE : browserMetric(Math.round(Math.max(...this.intervalMediaSteps)));
       const updateEndMsMax = this.readUpdateEndMsMax({ updateEndAt, updateEndMsMax: rawUpdateEndMsMax });
       const presented = this.intervalPresented;
       const currentTime = loggedFacts.currentTime;
-      const currentTimeAdvanced = Number.isFinite(this.previousCurrentTime) && Number.isFinite(currentTime) && currentTime - this.previousCurrentTime > CLOCK_ADVANCE_THRESHOLD_SECONDS;
-      const anomalous = presented === 0 && currentTimeAdvanced || Number.isFinite(loggedFacts.readyState) && loggedFacts.readyState < 3 || typeof maxFrameGapMs === "number" && maxFrameGapMs > MAX_FRAME_GAP_MILLISECONDS;
+      const totalDelta = qualityDelta(
+        loggedFacts.videoQuality?.total,
+        this.previousVideoQuality?.total
+      );
+      const droppedDelta = qualityDelta(
+        loggedFacts.videoQuality?.dropped,
+        this.previousVideoQuality?.dropped
+      );
       const data = {
         ...loggedFacts,
-        presented
-      };
-      if (anomalous) {
-        data.stallDetail = {
+        presented,
+        frameTiming: {
           presentedTotal: Number.isFinite(this.presentedFramesTotal) ? browserMetric(this.presentedFramesTotal) : UNKNOWN_VALUE,
           maxFrameGapMs,
           maxFrameGapEndedAgoMs,
@@ -1350,10 +1428,17 @@
           processingMsMedian,
           appends: Number.isFinite(appends) ? appends : UNKNOWN_VALUE,
           lastAppendAgoMs: Number.isFinite(recordNow) && Number.isFinite(lastAppendAt) ? Math.max(0, recordNow - lastAppendAt) : UNKNOWN_VALUE,
-          updateEndMsMax
-        };
-      }
-      return { data, currentTime };
+          updateEndMsMax,
+          displayLeadMsMedian,
+          displayLeadMsMin,
+          mediaStepMsMedian,
+          mediaStepMsMax
+        }
+      };
+      return { data, currentTime, totalDelta, droppedDelta };
+    }
+    getLastStall() {
+      return this.lastStall === void 0 ? void 0 : { ...this.lastStall };
     }
     readUpdateEndMsMax(facts) {
       if (!this.updateEndBaselineEstablished) {
@@ -1373,6 +1458,8 @@
       this.intervalMaxFrameGapMs = void 0;
       this.intervalMaxFrameGapEndedAt = void 0;
       this.intervalProcessingDurations = [];
+      this.intervalDisplayLeads = [];
+      this.intervalMediaSteps = [];
     }
     destroy() {
       if (this.destroyed) return;
@@ -2420,6 +2507,7 @@
     surfaceId,
     video,
     bankInventory,
+    lastStall,
     diagnostics,
     now = Date.now()
   }) {
@@ -2434,6 +2522,10 @@
       version: 2,
       surfaceId,
       media,
+      lastStall: lastStall === void 0 ? UNKNOWN_VALUE : {
+        agoMs: Math.max(0, now - lastStall.atMs),
+        kind: lastStall.kind
+      },
       bank,
       bankSecondsEstimated: estimateBankSeconds(bank, mediaDuration),
       diagnostics: {
@@ -2626,10 +2718,12 @@
     }
     getReadouts() {
       const panel = this.active?.panel;
+      const recorder = this.active?.controller?.mediaRecorder || this.active?.passiveObserver?.recorder;
       return buildReadouts({
         surfaceId: panel?.surfaceId || "surface-unavailable",
         video: findLargestVideo(this.documentObject),
         bankInventory: this.getBankInventory(),
+        lastStall: recorder?.getLastStall(),
         diagnostics: this.diagnostics?.getStatus(),
         now: this.now()
       });
