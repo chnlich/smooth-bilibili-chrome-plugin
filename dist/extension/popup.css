@@ -122,16 +122,11 @@ dd {
 }
 
 .hint,
-.status,
-.message {
+.status {
   margin: 8px 0 0;
   color: #a7b1c2;
   font-size: 11px;
   line-height: 1.4;
-}
-
-.message {
-  color: #ffd38b;
 }
 
 button {
