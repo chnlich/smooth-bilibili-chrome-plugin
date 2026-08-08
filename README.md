@@ -20,10 +20,19 @@
 ## 下载层
 
 - 识别为媒体分片且带闭合单段 `Range` 的请求一律由下载层拦截。命中时从内存中的完整分片切片回应，未命中时由扩展用同一 URL 和凭据取回覆盖范围的完整分片，入库后再回应播放器的原始 Range；播放器不会为这类媒体分片另行发起网络请求。非媒体请求、缺少 `Range`、非闭合 `Range`、同步 XHR，以及下载层自身的 `internal_fallback`/`internal_error` 路径仍按原样放行，并由 `bank.serve` 记录 `pass` 和原因（包括 `range_missing`、`range_not_closed`、`sync_xhr`）。`bank.serve` 的命中事件记录 `mirror` 与 `durationMs`，`bank.fetch.chunk` 记录 `mirror`。
-- 预取窗口按媒体资源分别锚定在仍未供数完成的播放器请求所需的最小块号；没有在途请求时使用最近一次播放器请求的起始块。窗口最多覆盖 48 个块，并发上限 2，只选择窗口内尚未入库且连续失败未达 3 次的前两个块。失败块下一轮自然重新进入窗口，达到上限后向需要它的播放器请求报告错误。
+- 预取窗口按媒体资源分别锚定在仍未供数完成的播放器请求所需的最小块号；没有在途请求时使用最近一次播放器请求的起始块。窗口最多覆盖 48 个块，并发上限 4，只选择窗口内尚未入库且连续失败未达 3 次的前四个块。失败块下一轮自然重新进入窗口，达到上限后向需要它的播放器请求报告错误。
+- 每个块的扩展取数按 `raceLegs=2` 同时向 Bilibili 返回的主/备媒体地址发起双腿竞速，first-finish 的完整响应入库并返回播放器，败选腿已读字节是竞速固有成本；配对地址簿来自网络 playurl 响应，未配对时会按需读取页面内联 `window.__playinfo__`。
 - 前台取数失败和下载层无法供数的异常会向 `console.error` 报告；预取失败由下一轮重试吸收并保留 `bank.fetch.chunk`，不输出 console；正常的停滞取消也不输出 console。
 - 取数按 1 MiB 完整分片流式读取。连续 10 秒没有收到字节时取消并丢弃本次已读的半块；单纯耗时不会取消。文件总长度只从扩展自己的取数响应的 `Content-Range` 学习，不读取让路响应的 body 或 header。
 - 分片只存在 `Map` 里，不落盘；内存上限 512 MiB。
+
+## 面板与日志页可见行为
+
+- popup 实时媒体读数展示当前 `video.buffered` 前向秒数、短板轨、媒体源状态、各轨 ranges 与追加等待等只读事实（`src/extension/popup.js:90-165`、`src/extension/readouts.js:110-144`）。
+- popup「上次停顿」行仅在 `waiting` 事件时按缓冲区与帧数据分类为「数据侧」「帧未产出」「帧未呈现」或「未判定」（`src/diagnostics/media.js:168-191`、`src/diagnostics/media.js:279-291`），并在 popup 中显示类别与距今毫秒数（`src/extension/popup.js:85-111`）。
+- 所有 `media.*` 事件都附带同一帧周期聚合的 `frameTiming`，包括 presentedTotal、maxFrameGapMs、processingMs、displayLead、mediaStep 与 append 相关指标（`src/diagnostics/media.js:445-466`、`src/diagnostics/privacy.js:195-212`）。
+- 下载层库存只列出本次播放实际参与的分轨（`resourceState` 或 `chunks` 中出现过的资源），不展示地址簿里的所有表示（`src/bank/inventory.js:103-107`）。
+- 日志页与 popup 均提供 CDN 竞速面板，按镜像统计竞速进入、胜出、TTFB P50/P90、停滞与交付字节，并给出配对覆盖率与浪费字节率（`src/diagnostics/logs.js:113-138`、`src/diagnostics/logs.js:187-202`、`src/extension/popup.js:167-211`、`src/diagnostics/worker.js:369-396`）。
 
 ## 安装
 

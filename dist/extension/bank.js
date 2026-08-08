@@ -63,11 +63,9 @@
     "video.source_replaced",
     "video.visibility_changed",
     "video.core_replaced",
-    "video.no_video",
     "media.sample",
     "media.append",
     ...MEDIA_EVENT_NAMES.map((name) => `media.${name}`),
-    "resource.observer_unavailable",
     "video.buffer_hint.attempt",
     "video.buffer_hint.applied",
     "video.buffer_hint.unsupported",
@@ -125,7 +123,6 @@
       "networkState",
       "resolution",
       "playbackRate",
-      "estimatedDelay",
       "source",
       "videoQuality",
       "sourceBufferRanges",
@@ -411,7 +408,7 @@
     return hostname.endsWith(".bilivideo.com") || hostname.endsWith(".akamaized.net");
   }
   function classifyRequest({ url, headers, enabled = true, locationObject }) {
-    if (enabled !== true) return { intercepted: false, reason: "disabled" };
+    if (enabled !== true) return { intercepted: false };
     if (locationObject !== void 0 && !isVideoLocation(locationObject)) {
       return { intercepted: false, reason: "not_video_route" };
     }
@@ -1460,6 +1457,8 @@
         this.emitDiagnostic("bank.serve", {
           source: scrubUrl(request.url),
           mirror: mirrorForUrl2(request.url),
+          start: classification.range.start,
+          end: classification.range.end,
           result: "pass",
           reason: "internal_error"
         });

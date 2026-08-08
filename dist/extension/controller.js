@@ -65,11 +65,9 @@
     "video.source_replaced",
     "video.visibility_changed",
     "video.core_replaced",
-    "video.no_video",
     "media.sample",
     "media.append",
     ...MEDIA_EVENT_NAMES.map((name) => `media.${name}`),
-    "resource.observer_unavailable",
     "video.buffer_hint.attempt",
     "video.buffer_hint.applied",
     "video.buffer_hint.unsupported",
@@ -137,7 +135,6 @@
       "networkState",
       "resolution",
       "playbackRate",
-      "estimatedDelay",
       "source",
       "videoQuality",
       "sourceBufferRanges",
@@ -577,7 +574,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-e465f55be6e01bcaba8f665c" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-0d451b251fd9700101736c81" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1097,11 +1094,6 @@
     const bufferedRanges = readRanges(video.buffered);
     const seekableRanges = readRanges(video.seekable);
     const shimDiagnostics = readShimDiagnostics(video);
-    let estimatedDelay = UNKNOWN_VALUE;
-    if (Array.isArray(seekableRanges) && seekableRanges.length > 0 && Number.isFinite(video.currentTime)) {
-      const end = seekableRanges[seekableRanges.length - 1].end;
-      estimatedDelay = Number.isFinite(end) ? Math.max(0, end - video.currentTime) : UNKNOWN_VALUE;
-    }
     return {
       eventType,
       bufferedRanges,
@@ -1117,7 +1109,6 @@
         height: readNumber(video.videoHeight)
       },
       playbackRate: readNumber(video.playbackRate),
-      estimatedDelay,
       source: video.currentSrc || video.src || UNKNOWN_VALUE,
       videoQuality: readVideoQuality(video),
       sourceBufferRanges: shimDiagnostics.sourceBufferRanges,
@@ -1143,7 +1134,6 @@
       networkState: UNKNOWN_VALUE,
       resolution: { width: UNKNOWN_VALUE, height: UNKNOWN_VALUE },
       playbackRate: UNKNOWN_VALUE,
-      estimatedDelay: UNKNOWN_VALUE,
       source: UNKNOWN_VALUE,
       videoQuality: UNKNOWN_VALUE,
       sourceBufferRanges: UNKNOWN_VALUE,
