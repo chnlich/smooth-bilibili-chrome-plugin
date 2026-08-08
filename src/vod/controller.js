@@ -251,13 +251,11 @@ export class VodBufferController {
     this.clearBufferSampler();
     const intervalMs = 1000;
     const maxSamples = 30;
-    let elapsed = 0;
     this.bufferSamplerTimer = this.runtimeObject.setInterval(() => {
       if (this.destroyed || !this.started) {
         this.clearBufferSampler();
         return;
       }
-      elapsed += intervalMs;
       let forward;
       try {
         forward = this.readForwardBuffer();

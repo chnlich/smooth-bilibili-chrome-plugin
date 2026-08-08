@@ -574,7 +574,7 @@
   }
 
   // src/build-id.js
-  var BUILT_BUILD_ID = true ? "src-89fc86542f59208880d26f36" : "source-build";
+  var BUILT_BUILD_ID = true ? "src-87c960e97edc6a712de25783" : "source-build";
   function readBuildId() {
     return BUILT_BUILD_ID;
   }
@@ -1871,13 +1871,11 @@
       this.clearBufferSampler();
       const intervalMs = 1e3;
       const maxSamples = 30;
-      let elapsed = 0;
       this.bufferSamplerTimer = this.runtimeObject.setInterval(() => {
         if (this.destroyed || !this.started) {
           this.clearBufferSampler();
           return;
         }
-        elapsed += intervalMs;
         let forward;
         try {
           forward = this.readForwardBuffer();
