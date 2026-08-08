@@ -44,6 +44,24 @@
     return `#sessionId=${encodeURIComponent(sessionId)}`;
   }
 
+  // src/ui/panel.js
+  var STATUS_MESSAGE_VERSION = 2;
+  var MODE_LABELS = Object.freeze({ video: "视频" });
+  var VIDEO_FIELDS = Object.freeze([
+    "mode",
+    "state",
+    "buffered",
+    "target",
+    "effective",
+    "error"
+  ]);
+  var VIDEO_STATE_LABELS = Object.freeze({
+    WAITING: "等待",
+    APPLIED: "已应用",
+    UNSUPPORTED: "不支持",
+    FAILED: "失败"
+  });
+
   // src/diagnostics/catalog.js
   var MEDIA_EVENT_NAMES = Object.freeze([
     "loadstart",
@@ -225,9 +243,7 @@
   }
 
   // src/extension/popup.js
-  var MESSAGE_VERSION = 2;
   var PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
-  var VIDEO_FIELDS = Object.freeze(["mode", "state", "buffered", "target", "effective", "error"]);
   var OTHER_LIVE_MEDIA_SOURCES_FIELD2 = [
     "otherLive",
     String.fromCharCode(77, 101, 100, 105, 97),
@@ -450,7 +466,7 @@
         return;
       }
       const response = await chrome.tabs.sendMessage(tab.id, {
-        version: MESSAGE_VERSION,
+        version: STATUS_MESSAGE_VERSION,
         type: "status:get"
       });
       if (response?.ok === false) throw new Error(response.error?.message || "当前页面拒绝状态请求");
@@ -507,7 +523,7 @@
         return;
       }
       const response = await chrome.tabs.sendMessage(tab.id, {
-        version: MESSAGE_VERSION,
+        version: STATUS_MESSAGE_VERSION,
         type: "readouts:get"
       });
       if (response?.ok === false) throw new Error(response.error?.message || "当前页面拒绝实时读数请求");
@@ -540,7 +556,7 @@
         const tab = await activeTab();
         if (tab !== void 0) {
           const response = await chrome.tabs.sendMessage(tab.id, {
-            version: MESSAGE_VERSION,
+            version: STATUS_MESSAGE_VERSION,
             type: "diagnostics:session-id:get"
           });
           if (response?.ok !== true) throw new Error(response?.error?.message || "当前页面拒绝日志 session 请求");

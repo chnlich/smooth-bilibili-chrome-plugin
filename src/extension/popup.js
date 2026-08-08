@@ -1,11 +1,10 @@
 import { EXTENSION_PREFERENCES } from '../constants.js';
 import { CDN_RESULT_VALUES } from '../diagnostics/cdn.js';
 import { logSessionFragment } from '../diagnostics/log-session.js';
+import { STATUS_MESSAGE_VERSION, VIDEO_FIELDS } from '../ui/panel.js';
 import { inventoryStoppedPublishing } from './readouts.js';
 
-const MESSAGE_VERSION = 2;
 const PREFERENCES = Object.freeze(Object.values(EXTENSION_PREFERENCES));
-const VIDEO_FIELDS = Object.freeze(['mode', 'state', 'buffered', 'target', 'effective', 'error']);
 const OTHER_LIVE_MEDIA_SOURCES_FIELD = [
   'otherLive',
   String.fromCharCode(77, 101, 100, 105, 97),
@@ -250,7 +249,7 @@ async function pollStatus() {
       return;
     }
     const response = await chrome.tabs.sendMessage(tab.id, {
-      version: MESSAGE_VERSION,
+      version: STATUS_MESSAGE_VERSION,
       type: 'status:get',
     });
     if (response?.ok === false) throw new Error(response.error?.message || '当前页面拒绝状态请求');
@@ -309,7 +308,7 @@ async function pollReadouts() {
       return;
     }
     const response = await chrome.tabs.sendMessage(tab.id, {
-      version: MESSAGE_VERSION,
+      version: STATUS_MESSAGE_VERSION,
       type: 'readouts:get',
     });
     if (response?.ok === false) throw new Error(response.error?.message || '当前页面拒绝实时读数请求');
@@ -345,7 +344,7 @@ document.querySelector('[data-open-logs]').addEventListener('click', () => {
       const tab = await activeTab();
       if (tab !== undefined) {
         const response = await chrome.tabs.sendMessage(tab.id, {
-          version: MESSAGE_VERSION,
+          version: STATUS_MESSAGE_VERSION,
           type: 'diagnostics:session-id:get',
         });
         if (response?.ok !== true) throw new Error(response?.error?.message || '当前页面拒绝日志 session 请求');
