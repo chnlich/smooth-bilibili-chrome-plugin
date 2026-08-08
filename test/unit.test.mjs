@@ -798,6 +798,30 @@ test('media waiting retains its classified last stall', () => {
   fixture.recorder.destroy();
 });
 
+test('media events other than waiting never set or replace the last stall', () => {
+  const fixture = mediaRecorderFixture();
+  let quality = { total: 10, dropped: 0 };
+  fixture.video.getVideoPlaybackQuality = () => ({
+    totalVideoFrames: quality.total,
+    droppedVideoFrames: quality.dropped,
+    corruptedVideoFrames: 0,
+  });
+  fixture.recorder.start();
+  fixture.events.length = 0;
+
+  fixture.video.emit('stalled');
+  assert.equal(fixture.recorder.getLastStall(), undefined);
+
+  quality = { total: 11, dropped: 1 };
+  fixture.video.emit('waiting');
+  assert.equal(fixture.recorder.getLastStall().kind, '帧未呈现');
+
+  quality = { total: 12, dropped: 2 };
+  fixture.video.emit('stalled');
+  assert.equal(fixture.recorder.getLastStall().kind, '帧未呈现');
+  fixture.recorder.destroy();
+});
+
 test('media waiting compares the rounded frame timing values for its stall kind', () => {
   const fixture = mediaRecorderFixture();
   let quality = { total: 10, dropped: 0 };
