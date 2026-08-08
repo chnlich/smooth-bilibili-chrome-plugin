@@ -213,7 +213,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       if (typeof bank.syncRouteLifecycle === 'function' && !bank.syncRouteLifecycle()) {
         return this._native.send(body);
       }
-      const method = this._openArgs?.[0];
       const url = new URL(this._openArgs?.[1], windowObject.location.href).href;
       const asyncFlag = this._openArgs?.[2] !== false;
       const generation = this._generation;
@@ -275,7 +274,6 @@ export function createBankXMLHttpRequestClass({ windowObject, nativeConstructor,
       void Promise.resolve()
         .then(() => bank.serveRequest({
           url,
-          method,
           headers: this._headers,
           credentials: this.withCredentials ? 'include' : 'same-origin',
           signal: this._abortController.signal,

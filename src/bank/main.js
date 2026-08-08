@@ -433,7 +433,6 @@ export class SegmentBank {
     try {
       const served = await this.serveRequest({
         url: request.url,
-        method: request.method,
         headers: request.headers,
         credentials: request.credentials,
         signal: request.signal,
@@ -496,7 +495,7 @@ export class SegmentBank {
     return response;
   }
 
-  async serveRequest({ url, method, headers, credentials, signal }) {
+  async serveRequest({ url, headers, credentials, signal }) {
     const startedAt = performanceNow(this.windowObject);
     const classification = this.requestClassification(url, headers);
     if (!classification.intercepted) return { intercepted: false };

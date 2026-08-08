@@ -876,7 +876,6 @@
         if (typeof bank.syncRouteLifecycle === "function" && !bank.syncRouteLifecycle()) {
           return this._native.send(body);
         }
-        const method = this._openArgs?.[0];
         const url = new URL(this._openArgs?.[1], windowObject.location.href).href;
         const asyncFlag = this._openArgs?.[2] !== false;
         const generation = this._generation;
@@ -935,7 +934,6 @@
         }
         void Promise.resolve().then(() => bank.serveRequest({
           url,
-          method,
           headers: this._headers,
           credentials: this.withCredentials ? "include" : "same-origin",
           signal: this._abortController.signal
@@ -1423,7 +1421,6 @@
       try {
         const served = await this.serveRequest({
           url: request.url,
-          method: request.method,
           headers: request.headers,
           credentials: request.credentials,
           signal: request.signal
@@ -1482,7 +1479,7 @@
       Object.defineProperty(response, "type", { configurable: true, value: "basic" });
       return response;
     }
-    async serveRequest({ url, method, headers, credentials, signal }) {
+    async serveRequest({ url, headers, credentials, signal }) {
       const startedAt = performanceNow(this.windowObject);
       const classification = this.requestClassification(url, headers);
       if (!classification.intercepted) return { intercepted: false };
