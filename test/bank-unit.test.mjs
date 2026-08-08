@@ -11,12 +11,10 @@ import {
   bankKey,
   cacheKey,
   classifyRequest,
-  estimateBitrate,
   parseContentRange,
   parseRangeHeader,
   partialResponseHeaders,
   planFetchRanges,
-  prefetchRange,
   selectEvictions,
 } from '../src/bank/logic.js';
 import { BankFallbackError } from '../src/bank/errors.js';
@@ -255,9 +253,6 @@ test('response headers, content-range parser, fetch plans and bitrate estimate a
   });
   assert.deepEqual(parseContentRange('bytes 4-9/100'), { start: 4, end: 9, totalSize: 100 });
   assert.equal(parseContentRange('bytes 4-9/*'), undefined);
-  assert.equal(estimateBitrate([{ time: 1, bytes: 100 }, { time: 3, bytes: 300 }]), 100);
-  assert.deepEqual(prefetchRange({ start: 10, bitrate: 2, aheadSeconds: 5, totalSize: 100 }), { start: 10, end: 19 });
-  assert.equal(prefetchRange({ start: 100, bitrate: 2, aheadSeconds: 5, totalSize: 100 }), undefined);
   assert.deepEqual(planFetchRanges(5, 20, {
     chunkBytes: 16,
     totalSize: 100,

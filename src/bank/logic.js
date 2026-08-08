@@ -137,30 +137,6 @@ export function planFetchRanges(start, end, {
   return result;
 }
 
-export function estimateBitrate(samples) {
-  if (!Array.isArray(samples)) throw new Error('码率样本必须是数组');
-  let latest;
-  for (let index = 1; index < samples.length; index += 1) {
-    const previous = samples[index - 1];
-    const current = samples[index];
-    const elapsed = current.time - previous.time;
-    const bytes = current.bytes - previous.bytes;
-    if (Number.isFinite(elapsed) && elapsed > 0 && Number.isFinite(bytes) && bytes > 0) {
-      latest = bytes / elapsed;
-    }
-  }
-  return latest || 0;
-}
-
-export function prefetchRange({ start, bitrate, aheadSeconds, totalSize }) {
-  if (!Number.isSafeInteger(start) || start < 0 || !Number.isFinite(bitrate) || bitrate <= 0) return undefined;
-  if (!Number.isFinite(aheadSeconds) || aheadSeconds <= 0) throw new Error('预取秒数无效');
-  const rawEnd = start + Math.ceil(bitrate * aheadSeconds) - 1;
-  const end = totalSize === undefined ? rawEnd : Math.min(rawEnd, totalSize - 1);
-  if (end < start) return undefined;
-  return { start, end };
-}
-
 function entryBytes(entry) {
   if (Number.isSafeInteger(entry.byteLength) && entry.byteLength >= 0) return entry.byteLength;
   if (entry.bytes instanceof ArrayBuffer) return entry.bytes.byteLength;
