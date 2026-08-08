@@ -1301,7 +1301,7 @@
       try {
         this.observePlayurlData(JSON.parse(responseText));
       } catch (error) {
-        console.error("[BilibiliBuffer] playurl 地址簿解析失败");
+        console.error("[BilibiliBuffer] playurl 地址簿解析失败", error);
       }
     }
     readInlinePlayinfo() {
@@ -1319,7 +1319,7 @@
         try {
           data = JSON.parse(data);
         } catch (error) {
-          console.error("[BilibiliBuffer] __playinfo__ 地址簿解析失败");
+          console.error("[BilibiliBuffer] __playinfo__ 地址簿解析失败", error);
           return;
         }
       }
@@ -1337,7 +1337,7 @@
             label: representationLabel(representation, supportFormats)
           });
         } catch (error) {
-          console.error("[BilibiliBuffer] playurl 地址簿 URL 无效");
+          console.error("[BilibiliBuffer] playurl 地址簿 URL 无效", error);
         }
       });
     }
@@ -1413,7 +1413,7 @@
         const response = await originalFetch.apply(thisArg, args);
         if (this.isPlayurlUrl(request.url)) {
           await this.observePlayurlResponse(response).catch((error) => {
-            console.error("[BilibiliBuffer] playurl 地址簿读取失败");
+            console.error("[BilibiliBuffer] playurl 地址簿读取失败", error);
           });
         }
         return response;
