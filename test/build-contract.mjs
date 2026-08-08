@@ -371,6 +371,21 @@ assert.equal(DATA_ALLOWLIST.media.includes('frameTiming'), true);
 assert.equal(DATA_ALLOWLIST.media.includes('estimatedDelay'), false);
 assert.equal(EVENT_CODES.includes('video.no_video'), false);
 assert.equal(EVENT_CODES.includes('resource.observer_unavailable'), false);
+const mediaRecorderSource = await fs.readFile(path.join(root, 'src/diagnostics/media.js'), 'utf8');
+assert.match(mediaRecorderSource, /writeLog\(`media\.\$\{name\}`/);
+assert.match(mediaRecorderSource, /logMediaEvent\('sample'\)/);
+const sourceOutsideCatalog = sourceFiles
+  .filter(({ relativePath }) => relativePath !== 'diagnostics/catalog.js')
+  .map(({ content }) => content)
+  .join('\n');
+for (const code of EVENT_CODES) {
+  const mediaName = code.startsWith('media.') ? code.slice('media.'.length) : undefined;
+  if (MEDIA_EVENT_NAMES.includes(mediaName) || mediaName === 'sample') continue;
+  assert.ok(
+    sourceOutsideCatalog.includes(`'${code}'`),
+    `catalog 事件 ${code} 在 catalog.js 之外的 src/ 中没有发射点或消费点，请删除或补发射点`,
+  );
+}
 assert.match(readme, /并发上限\s*4/);
 assert.match(readme, /前四个块/);
 assert.match(readme, /raceLegs=2|双腿竞速/);
@@ -380,6 +395,26 @@ assert.match(readme, /上次停顿/);
 assert.match(readme, /frameTiming/);
 assert.match(readme, /库存只列出本次播放实际参与的分轨/);
 assert.match(readme, /CDN 竞速面板/);
+const readmeSourceAnchors = [
+  ['src/extension/popup.js', ['renderMediaReadout', 'lastStallText', 'renderRaceReadout']],
+  ['src/extension/readouts.js', ['buildReadouts']],
+  ['src/diagnostics/media.js', ['classifyStall', "name === 'waiting'", 'frameTiming']],
+  ['src/diagnostics/privacy.js', ['safeFrameTiming']],
+  ['src/bank/inventory.js', ['storedByResource']],
+  ['src/diagnostics/logs.js', ['renderCdnPanel']],
+  ['src/diagnostics/worker.js', ['readCdnSummary']],
+];
+for (const [file, anchors] of readmeSourceAnchors) {
+  const content = await fs.readFile(path.join(root, file), 'utf8');
+  for (const anchor of anchors) {
+    assert.ok(content.includes(anchor), `${file} 缺少 README 列举行为对应的源码锚点 ${anchor}`);
+  }
+}
+const bankMainSource = await fs.readFile(path.join(root, 'src/bank/main.js'), 'utf8');
+assert.match(bankMainSource, /MAX_PREFETCH_CONCURRENCY\s*=\s*4\b/);
+assert.match(bankMainSource, /slice\(0,\s*this\.maxPrefetchConcurrency\)/);
+assert.match(bankMainSource, /this\.config\.raceLegs\s*>\s*1/);
+assert.match(bankMainSource, /__playinfo__/);
 assert.equal(SHIM_APPEND_EVENT, 'bilibili-buffer:shim-append-v1');
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.doesNotMatch(bridgeContractSource, /BRIDGE_LIVE|setChasingFrameThreshold|getLiveCapabilitySnapshot|disableLiveAutoCatchup/);
