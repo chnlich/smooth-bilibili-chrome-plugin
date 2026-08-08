@@ -467,6 +467,8 @@ export class SegmentBank {
       this.emitDiagnostic('bank.serve', {
         source: scrubUrl(request.url),
         mirror: mirrorForUrl(request.url),
+        start: classification.range.start,
+        end: classification.range.end,
         result: 'pass',
         reason: 'internal_error',
       });
