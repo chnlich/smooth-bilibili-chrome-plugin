@@ -244,7 +244,7 @@ test('closed single Range and video media hosts are the only intercepted shape',
   }).intercepted, false);
 });
 
-test('response headers, content-range parser, fetch plans and bitrate estimate are exact', () => {
+test('response headers, content-range parser, and fetch plans are exact', () => {
   assert.deepEqual(partialResponseHeaders(4, 9, 100), {
     'Accept-Ranges': 'bytes',
     'Content-Length': '6',
