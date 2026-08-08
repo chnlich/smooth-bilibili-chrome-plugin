@@ -1,4 +1,0 @@
-{"type":"timeupdate","elapsedMs":0,"currentTime":0,"readyState":4,"paused":false,"playbackRate":2,"bufferedRanges":[{"start":0,"end":120}],"videoQuality":null}
-{"type":"playing","elapsedMs":0,"currentTime":0,"readyState":4,"paused":false,"playbackRate":2,"bufferedRanges":[{"start":0,"end":120}],"videoQuality":null}
-{"type":"timeupdate","elapsedMs":1000,"currentTime":2,"readyState":4,"paused":false,"playbackRate":2,"bufferedRanges":[{"start":0,"end":120}],"videoQuality":null}
-{"type":"timeupdate","elapsedMs":2000,"currentTime":4,"readyState":4,"paused":false,"playbackRate":2,"bufferedRanges":[{"start":0,"end":120}],"videoQuality":null}
