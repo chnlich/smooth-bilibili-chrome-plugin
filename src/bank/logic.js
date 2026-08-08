@@ -62,7 +62,7 @@ export function parseRangeHeader(value) {
   return { start, end };
 }
 
-export function isMediaHost(hostname) {
+function isMediaHost(hostname) {
   return hostname.endsWith('.bilivideo.com') || hostname.endsWith('.akamaized.net');
 }
 

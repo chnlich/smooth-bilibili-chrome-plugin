@@ -5,5 +5,3 @@ const BUILT_BUILD_ID = typeof __BILIBILI_BUILD_ID_LITERAL__ === 'string'
 export function readBuildId() {
   return BUILT_BUILD_ID;
 }
-
-export { BUILT_BUILD_ID };

@@ -64,7 +64,7 @@ export const EVENT_CODES = Object.freeze([
 ]);
 
 const EXACT_CODES = new Set(EVENT_CODES);
-export const PERSIST_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+const PERSIST_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 export function isSafePersistErrorCode(code) {
   return typeof code === 'string' && PERSIST_ERROR_CODE_PATTERN.test(code);

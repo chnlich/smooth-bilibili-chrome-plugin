@@ -1169,7 +1169,7 @@ export class SegmentBank {
   }
 }
 
-export function installSegmentBank(windowObject = window) {
+function installSegmentBank(windowObject = window) {
   if (!windowObject.location) throw new Error('媒体分片页面位置不可用');
   if (windowObject.__smoothSegmentBank !== undefined) return windowObject.__smoothSegmentBank;
   if (!windowObject.fetch || !windowObject.XMLHttpRequest) throw new Error('页面网络 API 不可用');

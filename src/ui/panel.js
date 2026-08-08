@@ -36,7 +36,7 @@ function createSurfaceId() {
   return `surface-${globalThis.crypto.randomUUID()}`;
 }
 
-export class StatusPanel {
+class StatusPanel {
   constructor(_documentObject, mode) {
     fieldsForMode(mode);
     this.surfaceId = createSurfaceId();

@@ -47,7 +47,7 @@ function senderUrl(sender) {
   return new URL(sender.url);
 }
 
-export function assertSenderMatchesSession(session, sender) {
+function assertSenderMatchesSession(session, sender) {
   const pageUrl = senderUrl(sender);
   if (pageUrl.origin !== session.origin) {
     throw storageError('SESSION_ROUTE_CONFLICT', 'sender URL 与 session origin 不一致');
@@ -420,7 +420,7 @@ async function handleMessage(message, sender, indexedDbObject = globalThis.index
   throw storageError('MESSAGE_OPERATION_DENIED', '日志消息操作未允许');
 }
 
-export { appendBatch, handleMessage, readLogs, stableStringify };
+export { appendBatch, handleMessage, readLogs };
 
 if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage?.addListener) {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

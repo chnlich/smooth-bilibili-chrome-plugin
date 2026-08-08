@@ -58,7 +58,7 @@ export function sessionWithTabId(identity, tabId) {
   return { ...identity, tabId };
 }
 
-export const SESSION_FIELDS = Object.freeze([
+const SESSION_FIELDS = Object.freeze([
   'schemaVersion',
   'sessionId',
   'startedAt',
