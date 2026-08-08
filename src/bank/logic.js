@@ -67,7 +67,7 @@ export function isMediaHost(hostname) {
 }
 
 export function classifyRequest({ url, headers, enabled = true, locationObject }) {
-  if (enabled !== true) return { intercepted: false, reason: 'disabled' };
+  if (enabled !== true) return { intercepted: false };
   if (locationObject !== undefined && !isVideoLocation(locationObject)) {
     return { intercepted: false, reason: 'not_video_route' };
   }
