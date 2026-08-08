@@ -76,11 +76,6 @@ export function readMediaFacts(video, eventType = 'sample') {
   const bufferedRanges = readRanges(video.buffered);
   const seekableRanges = readRanges(video.seekable);
   const shimDiagnostics = readShimDiagnostics(video);
-  let estimatedDelay = UNKNOWN_VALUE;
-  if (Array.isArray(seekableRanges) && seekableRanges.length > 0 && Number.isFinite(video.currentTime)) {
-    const end = seekableRanges[seekableRanges.length - 1].end;
-    estimatedDelay = Number.isFinite(end) ? Math.max(0, end - video.currentTime) : UNKNOWN_VALUE;
-  }
   return {
     eventType,
     bufferedRanges,
@@ -96,7 +91,6 @@ export function readMediaFacts(video, eventType = 'sample') {
       height: readNumber(video.videoHeight),
     },
     playbackRate: readNumber(video.playbackRate),
-    estimatedDelay,
     source: video.currentSrc || video.src || UNKNOWN_VALUE,
     videoQuality: readVideoQuality(video),
     sourceBufferRanges: shimDiagnostics.sourceBufferRanges,
@@ -123,7 +117,6 @@ function emptyMediaFacts(eventType) {
     networkState: UNKNOWN_VALUE,
     resolution: { width: UNKNOWN_VALUE, height: UNKNOWN_VALUE },
     playbackRate: UNKNOWN_VALUE,
-    estimatedDelay: UNKNOWN_VALUE,
     source: UNKNOWN_VALUE,
     videoQuality: UNKNOWN_VALUE,
     sourceBufferRanges: UNKNOWN_VALUE,

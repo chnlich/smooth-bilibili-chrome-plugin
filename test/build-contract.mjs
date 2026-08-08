@@ -368,6 +368,18 @@ for (const field of [
   'errorName',
 ]) assert.equal(DATA_ALLOWLIST.media.includes(field), true);
 assert.equal(DATA_ALLOWLIST.media.includes('frameTiming'), true);
+assert.equal(DATA_ALLOWLIST.media.includes('estimatedDelay'), false);
+assert.equal(EVENT_CODES.includes('video.no_video'), false);
+assert.equal(EVENT_CODES.includes('resource.observer_unavailable'), false);
+assert.match(readme, /并发上限\s*4/);
+assert.match(readme, /前四个块/);
+assert.match(readme, /raceLegs=2|双腿竞速/);
+assert.match(readme, /window\.__playinfo__/);
+assert.match(readme, /popup 实时媒体读数/);
+assert.match(readme, /上次停顿/);
+assert.match(readme, /frameTiming/);
+assert.match(readme, /库存只列出本次播放实际参与的分轨/);
+assert.match(readme, /CDN 竞速面板/);
 assert.equal(SHIM_APPEND_EVENT, 'bilibili-buffer:shim-append-v1');
 const bridgeContractSource = await fs.readFile(path.join(root, 'src/extension/bridge-contract.js'), 'utf8');
 assert.doesNotMatch(bridgeContractSource, /BRIDGE_LIVE|setChasingFrameThreshold|getLiveCapabilitySnapshot|disableLiveAutoCatchup/);

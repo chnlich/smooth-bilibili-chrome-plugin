@@ -243,7 +243,7 @@ test('closed single Range and video media hosts are the only intercepted shape',
     headers: { Range: 'bytes=4-9' },
     enabled: false,
     locationObject,
-  }).reason, 'disabled');
+  }).intercepted, false);
 });
 
 test('response headers, content-range parser, fetch plans and bitrate estimate are exact', () => {
