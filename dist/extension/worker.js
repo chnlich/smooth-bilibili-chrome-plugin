@@ -222,12 +222,13 @@
       request.onerror = () => reject(request.error || new Error("打开日志数据库失败"));
       request.onupgradeneeded = () => {
         const database = request.result;
-        const sessions = database.objectStoreNames.contains(SESSION_STORE) ? request.transaction.objectStore(SESSION_STORE) : database.createObjectStore(SESSION_STORE, { keyPath: "sessionId" });
+        if (!database.objectStoreNames.contains(SESSION_STORE)) {
+          database.createObjectStore(SESSION_STORE, { keyPath: "sessionId" });
+        }
         if (!database.objectStoreNames.contains(EVENT_STORE)) {
           const events = database.createObjectStore(EVENT_STORE, { keyPath: "eventId", autoIncrement: true });
           events.createIndex(EVENT_INDEX, ["sessionId", "sequence"], { unique: true });
         }
-        if (!sessions) throw new Error("sessions store 创建失败");
       };
       request.onsuccess = () => resolve(request.result);
     });
